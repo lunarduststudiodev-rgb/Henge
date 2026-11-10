@@ -20,7 +20,7 @@ RAW = "https://raw.githubusercontent.com/Leviidev/Henge/main"
 KEEP = 10
 
 # release tag -> (CFBundleShortVersionString, CFBundleVersion) of that release's app
-BUILDS = {"0.2": ("0.2.0", "100"), "0.1": ("0.1", "1")}
+BUILDS = {"0.3": ("0.3.0", "101"), "0.2": ("0.2.0", "100"), "0.1": ("0.1", "1")}
 
 
 def gh(path):
@@ -94,6 +94,7 @@ def main():
             ],
             "privacy": {
                 "NSLocalNetworkUsageDescription": "Henge uses the local network to pair with this iPhone for JIT, without a computer.",
+                "NSCameraUsageDescription": "Henge can use the volume buttons as the trackpad's mouse buttons. Receiving those presses needs the camera active; no video is recorded, saved or shown.",
             },
         },
     }
