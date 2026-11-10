@@ -22,7 +22,7 @@ struct MacOSRelease: Identifiable, Hashable {
                      bytes: 12_297 << 20, note: "The smallest download (and about 35 GB in all), for devices short on storage.", macBytes: 23 << 30),
         MacOSRelease(id: "23G93", name: "macOS Sonoma 14.6.1",
                      url: URL(string: "https://updates.cdn-apple.com/2024SummerFCS/fullrestores/062-52859/932E0A8F-6644-4759-82DA-F8FA8DEA806A/UniversalMac_14.6.1_23G93_Restore.ipsw")!,
-                     bytes: 14_106 << 20, note: "A smaller download than Sequoia. For now its login screen and menu bar draw green.", macBytes: 26 << 30),
+                     bytes: 14_106 << 20, note: "A smaller download than Sequoia. If its login screen is green, choose the wallpaper again in System Settings.", macBytes: 26 << 30),
         MacOSRelease(id: "24G90", name: "macOS Sequoia 15.6.1",
                      url: URL(string: "https://updates.cdn-apple.com/2025SummerFCS/fullrestores/093-10809/CFD6DD38-DAF0-40DA-854F-31AAD1294C6F/UniversalMac_15.6.1_24G90_Restore.ipsw")!,
                      bytes: 16_035 << 20, note: "Recommended: the version Henge is tested with."),

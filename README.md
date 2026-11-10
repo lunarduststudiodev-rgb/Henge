@@ -54,7 +54,7 @@ Then a Henge folder in the Mac's home folder is the same folder as Files › Hen
 
 - Signing in to an Apple Account inside macOS fails with a verification error.
 - Graphics are tested on macOS's own apps, Chrome, Firefox, VS Code and Discord. Other apps may draw wrongly.
-- On macOS Sonoma, the login screen after a start, the menu bar and a strip down the left edge draw green, and switching to a dynamic wallpaper (such as Sonoma) can stop the screen updating. On Ventura, the Calendar icon in the Dock is missing its date.
+- On macOS Sonoma, the login screen and the account picture can be green: choose the wallpaper again in System Settings › Wallpaper (another one, then yours) and the picture in Users & Groups. Switching to a dynamic wallpaper (such as Sonoma) can stop the screen updating. On Ventura, the Calendar icon in the Dock is missing its date.
 - For the first few minutes after you log in, macOS is busy starting up in the background, so apps open more slowly.
 - Only one Mac can start per launch. Quit Henge and open it again to start another, and to start one again after restarting or shutting down macOS.
 - iPadOS keeps some keyboard shortcuts for itself, such as Command-Tab.

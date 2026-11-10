@@ -99,6 +99,9 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     /* Each plane's sampled guest bytes when last copied: only the planes the guest changed are copied, so a CPU
        write to one plane (a decoder refilling luma) does not wipe what the GPU drew into another (chroma, alpha). */
     uint64_t plane_hash[4];
+    /* For a host IOSurface shared by several mappings (see planar): the same four hashes, kept once for all of
+       them, since they describe what the one host surface holds. */
+    NSMutableData *shared_hashes;
     /* A heap: private memory, a buffer over all of it. */
     id<MTLBuffer> heap_whole;
     /* A heap's or a private texture's copy in guest memory, and which side has the newest bytes. */
@@ -136,6 +139,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
        process) has to be what another reads (WindowServer). */
     NSMutableDictionary<NSString *, id> *planar;
     NSMutableDictionary<NSString *, NSNumber *> *planar_uses; /* mappings using each: the entry goes with the last one */
+    NSMutableDictionary<NSString *, NSMutableData *> *planar_hashes; /* and what its planes held when last copied */
     NSMutableSet<NSString *> *complaints;
     uint64_t execs, draws, failed, heap_bytes, synced, remaps;
     /* Work the GPU has not finished. Stamps are given back in the order they came: the
@@ -765,9 +769,15 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
         uint16_t bpe;
         if (compact) {
             const uint8_t *cp = desc + 0x40 + i * 0x40;
-            uint32_t v[6];
+            uint32_t v[6], base;
             memcpy(v, cp + 0x0c, sizeof v); /* offset, size, width << 8, height << 8, row, bytes per element */
             off = v[0], size = v[1], w = v[2] >> 8, h = v[3] >> 8, row = v[4], bpe = (uint16_t)v[5];
+            /* +0x08: where the plane's first visible pixel is. A video decoder's buffers carry extended pixels
+               around the picture (Sonoma's 10-bit HEVC: 96 columns and 71 rows before it), and the guest's
+               GPU reads the plane from there; from the allocation's start, every converted frame came out
+               moved right and down with a green band at the top and left (the menu bar and left strip). */
+            memcpy(&base, cp + 0x08, 4);
+            if (base > off && base - off < size) size -= base - off, off = base;
         } else
         memcpy(&off, pl + 8, 8), memcpy(&size, pl + 0x18, 8), memcpy(&w, pl + 0x20, 8), memcpy(&h, pl + 0x28, 8), memcpy(&row, pl + 0x30, 8), memcpy(&bpe, pl + 0x38, 2);
         [info addObject:@{(__bridge id)kIOSurfacePlaneWidth: @(w), (__bridge id)kIOSurfacePlaneHeight: @(h), (__bridge id)kIOSurfacePlaneBytesPerRow: @(row),
@@ -820,12 +830,6 @@ static uint64_t plane_bytes(HvObject *s, uint32_t i) {
     return row * s->plane_h[i];
 }
 
-/* Every plane's hash as the guest has it now, for a host surface already holding those pixels. */
-static void note_plane_hashes(HvObject *s) {
-    for (uint32_t i = 0; i < s->plane_count && i < 4; i++)
-        s->plane_hash[i] = hash_bytes(s->mapped + s->first + s->plane_from[i], plane_bytes(s, i));
-}
-
 /* Guest pixels into its IOSurface, when they changed. */
 static void sync_iosurface(HvObject *s) {
     if (!s->iosurface) return;
@@ -833,10 +837,11 @@ static void sync_iosurface(HvObject *s) {
     BOOL by_plane = s->plane_count && IOSurfaceGetPlaneCount(s->iosurface) >= s->plane_count;
     uint64_t hashes[4] = {0};
     uint32_t changed = 0;
+    uint64_t *have = s->shared_hashes ? (uint64_t *)s->shared_hashes.mutableBytes : s->plane_hash;
     if (by_plane) {
         for (uint32_t i = 0; i < s->plane_count && i < 4; i++) {
             hashes[i] = hash_bytes(from + s->plane_from[i], plane_bytes(s, i));
-            if (hashes[i] != s->plane_hash[i]) changed |= 1u << i;
+            if (hashes[i] != have[i]) changed |= 1u << i;
         }
         if (!changed) return;
     } else {
@@ -873,7 +878,7 @@ static void sync_iosurface(HvObject *s) {
            requested. Copy each changed video plane through its actual host layout. */
         for (uint32_t i = 0; i < s->plane_count && i < 4; i++) {
             if (!(changed & 1u << i)) continue;
-            s->plane_hash[i] = hashes[i];
+            have[i] = hashes[i];
             uint8_t *dst = IOSurfaceGetBaseAddressOfPlane(s->iosurface, i);
             size_t dst_row = IOSurfaceGetBytesPerRowOfPlane(s->iosurface, i);
             size_t rows = MIN((size_t)s->plane_h[i], IOSurfaceGetHeightOfPlane(s->iosurface, i));
@@ -915,6 +920,11 @@ static void sync_iosurface(HvObject *s) {
        macOS 14's driver writes a compact one: u32 allocation at 0x10, width and height << 8 at 0x14 and 0x18, u32 row
        at 0x1c, bytes per pixel at 0x20 (BGRA 1920x1080: 007ec000 00078080 00043880 00001e00 00000004); one plane. */
     BOOL compact = hv_pvg_lite_old_driver(lite) != 0;
+    if (getenv("HV_PVG_DESC_DUMP")) {
+        fprintf(stderr, "surface-desc %llu:", mapping);
+        for (int i = 0; i < 0x200; i += 4) fprintf(stderr, "%s%08x", i % 32 ? " " : "\n  ", *(const uint32_t *)(desc + i));
+        fprintf(stderr, "\n");
+    }
     uint32_t compact_planes = 1;
     if (compact) memcpy(&compact_planes, desc + 0x24, 4);
     uint8_t planes = compact ? (uint8_t)MIN(MAX(compact_planes, 1u), 4u) : desc[0x3e];
@@ -961,8 +971,10 @@ static void sync_iosurface(HvObject *s) {
         surface->alloc = alloc;
         IOSurfaceRef made = make_iosurface(surface, desc, alloc, compact);
         /* The same guest memory, format and size under another mapping id (another process): the same host
-           IOSurface, or what that process drew is not what this one sees. Its pixels are already there (or
-           drawn over since), so they are not copied again now. */
+           IOSurface, or what that process drew is not what this one sees. Whether its pixels are there is in
+           the hashes it shares: a video decoder's process writes frames with the CPU and never uses the GPU, so
+           nothing had copied them, and the first process to draw with one (the wallpaper's lock-screen image
+           during Setup) read an empty frame: solid green. */
         NSString *pk = [NSString stringWithFormat:@"%x/%08x/%llux%llu/%llu", pages[0] & ~1u, surface->fourcc,
                         (unsigned long long)sw, (unsigned long long)sh, (unsigned long long)alloc];
         id shared = planar[pk];
@@ -970,7 +982,7 @@ static void sync_iosurface(HvObject *s) {
             CFRelease(made);
             surface->iosurface = (IOSurfaceRef)CFRetain((__bridge CFTypeRef)shared);
             surface->content_hash = guest_hash(surface);
-            note_plane_hashes(surface);
+            surface->shared_hashes = planar_hashes[pk];
             surface->planar_key = pk;
             planar_uses[pk] = @(planar_uses[pk].unsignedIntValue + 1);
             static int told;
@@ -978,9 +990,11 @@ static void sync_iosurface(HvObject *s) {
         } else {
             surface->iosurface = made;
             if (made) {
-                if (planar.count >= 512) [planar removeAllObjects], [planar_uses removeAllObjects]; /* old ones only lose their sharing */
+                if (planar.count >= 512) [planar removeAllObjects], [planar_uses removeAllObjects], [planar_hashes removeAllObjects]; /* old ones only lose their sharing */
                 planar[pk] = (__bridge id)made;
                 planar_uses[pk] = @1;
+                surface->shared_hashes = [NSMutableData dataWithLength:sizeof surface->plane_hash];
+                planar_hashes[pk] = surface->shared_hashes;
                 surface->planar_key = pk;
             }
             if (!surface->iosurface) {
@@ -1023,6 +1037,11 @@ static void sync_iosurface(HvObject *s) {
     }
     HvObject *surface = [self currentSurface:h.mapping];
     o->on_mapping = h.mapping;
+    if (hv_pvg_trace_on()) {
+        fprintf(stderr, "trace: mapped texture ref %u tag %#x size %u mapping %llu:", h.ref, h.tag, h.size, h.mapping);
+        for (int i = 0; i < 64; i += 4) fprintf(stderr, " %08x", *(uint32_t *)(h.d + i));
+        fprintf(stderr, "\n");
+    }
     MTLTextureDescriptor *t = h.tag == 0x39 ? descriptor_v2(h.d) : descriptor_v1(h.d);
     if (!surface) surface = [self newSurface:h.mapping];
     if (!surface) return;
@@ -1807,10 +1826,21 @@ typedef struct {
             buffers[i] = strong[i];
             offsets[i] = (NSUInteger)U64(12 + i * 12);
         }
+        if (tracing) for (uint32_t i = 0; i < count; i++) {
+            id<MTLBuffer> x = strong[i];
+            fprintf(stderr, "trace:  cbuf %u ref %u off %lu len %lu:", index + i, U32(8 + i * 12), (unsigned long)offsets[i], (unsigned long)x.length);
+            if (x && x.storageMode != MTLStorageModePrivate && offsets[i] < x.length)
+                for (NSUInteger k = 0; k < 96 && offsets[i] + k + 4 <= x.length; k += 4)
+                    fprintf(stderr, " %08x", *(uint32_t *)((uint8_t *)x.contents + offsets[i] + k));
+            fprintf(stderr, "\n");
+        }
         [e setBuffers:buffers offsets:offsets withRange:NSMakeRange(index, count)];
         break;
     }
-    case 207: [e setBufferOffset:(NSUInteger)U64(4) atIndex:U32(0)]; break;
+    case 207:
+        if (tracing) fprintf(stderr, "trace:  cbuf %u offset now %llu\n", U32(0), (unsigned long long)U64(4));
+        [e setBufferOffset:(NSUInteger)U64(4) atIndex:U32(0)];
+        break;
     case 206: {
         uint32_t index = U32(0), count = U32(4);
         if (count > 128) break;
@@ -2647,6 +2677,7 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
         r->surfaces = [NSMutableDictionary new];
         r->planar = [NSMutableDictionary new];
         r->planar_uses = [NSMutableDictionary new];
+        r->planar_hashes = [NSMutableDictionary new];
         r->complaints = [NSMutableSet new];
         r->shot = getenv("HV_PVG_SHOT");
         cp_start(r);
@@ -2826,6 +2857,7 @@ void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {
                 else {
                     [r->planar removeObjectForKey:pk];
                     [r->planar_uses removeObjectForKey:pk];
+                    [r->planar_hashes removeObjectForKey:pk];
                 }
             }
         }
