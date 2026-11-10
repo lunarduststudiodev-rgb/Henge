@@ -92,6 +92,7 @@ typedef struct HvCpu {
     uint64_t xjump_thunk;    /* 0x4e0: hv_xjump_thunk */
     uint64_t tcr_el1;        /* 0x4e8: here, in reach of one load, for translated MRS (xnu reads it ~17K times a second at login) */
     uint64_t par_el1;        /* 0x4f0: likewise, read after each AT */
+    uint64_t cntvoff;        /* 0x4f8: the virtual counter is the host's less this (m->cntvoff), read inline */
     /* 0x500: what tags in the return tables (ret_tab) are xored with, [0] user, [1] kernel.
        Bits 63..48, as ijc_salt; a new value empties that half of the tables. */
     uint64_t ret_salt[2] __attribute__((aligned(128)));
@@ -161,7 +162,6 @@ typedef struct HvCpu {
     /* Generic timer: physical and virtual. The counter is host time scaled to 24 MHz. */
     uint64_t cntv_ctl, cntv_cval;
     uint64_t cntp_ctl, cntp_cval;
-    uint64_t cntvoff;
 
     uint64_t mpidr;
     uint32_t index;          /* which CPU: m->percpu[index] holds its caches and interrupt lines */
@@ -219,6 +219,7 @@ typedef struct HvCpu {
 #define HV_CPU_XJUMP_THUNK 0x4e0
 #define HV_CPU_TCR_EL1     0x4e8
 #define HV_CPU_PAR_EL1     0x4f0
+#define HV_CPU_CNTVOFF     0x4f8
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
    indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
@@ -241,6 +242,7 @@ _Static_assert(offsetof(HvCpu, helper_ret) == HV_CPU_HELPER_RET, "HvCpu layout")
 _Static_assert(offsetof(HvCpu, tlb) == HV_CPU_TLB, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, ret_salt) == HV_CPU_RET_SALT, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, tcr_el1) == HV_CPU_TCR_EL1, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, cntvoff) == HV_CPU_CNTVOFF, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, par_el1) == HV_CPU_PAR_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, ret_tab) == HV_CPU_RET_TAB, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, gaddend) == HV_CPU_GADDEND, "HvCpu layout");

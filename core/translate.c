@@ -1441,9 +1441,10 @@ static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
     return 0;
 }
 
-/* The guest's counter is the host's mach_absolute_time (CNTVOFF is 0): the
-   counter register the commpage names plus the commpage's offset, read the way
-   libsystem does. EL0 reads check CNTKCTL_EL1's enables and trap through the
+/* The guest's physical counter is the host's mach_absolute_time: the counter
+   register the commpage names plus the commpage's offset, read the way libsystem
+   does; its virtual counter is that less the CPU's CNTVOFF (the count when the
+   machine started). EL0 reads check CNTKCTL_EL1's enables and trap through the
    helper when they are off. */
 #define COMMPAGE_TIMEBASE_OFFSET 0xfffffc088ull
 #define COMMPAGE_TIMEBASE_TYPE   0xfffffc090ull
@@ -1466,6 +1467,10 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical) 
     put_lit(e, 6, COMMPAGE_TIMEBASE_OFFSET);
     put(e, LDR_X(6, 6, 0));
     put(e, ADD_LSL(r, r, 6, 0));
+    if (!physical) {
+        put(e, LDR_X(6, 28, HV_CPU_CNTVOFF));
+        put(e, SUB_X(r, r, 6));
+    }
     if (r != rt) put(e, STR_X(r, 28, slot_of(rt)));
     if (el0) e->ool[slow].join = e->n;
     return 1;

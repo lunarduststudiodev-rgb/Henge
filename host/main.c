@@ -679,12 +679,14 @@ static void *input_thread(void *unused) {
             }
             fprintf(stderr, "hengevm: find: %d places\n", n);
         }
-        else if (!strncmp(line, "grep ", 5)) { /* lines of text in guest RAM (the kernel's log) */
+        else if (!strncmp(line, "grep ", 5) || !strncmp(line, "grepall ", 8)) { /* lines of text in guest RAM (the kernel's
+                                                                                   log, launchd's); grep stops at 40 */
             HvVmapple *bd = hv_vm_board();
-            const char *word = line + 5;
+            int all = line[4] == 'a';
+            const char *word = line + (all ? 8 : 5);
             size_t wn = strlen(word);
             uint64_t hits = 0;
-            for (uint64_t i = 0; i + wn < bd->ram_size && hits < 40; i++) {
+            for (uint64_t i = 0; i + wn < bd->ram_size && (all || hits < 40); i++) {
                 if (bd->ram[i] != (uint8_t)word[0] || memcmp(bd->ram + i, word, wn)) continue;
                 uint64_t from = i;
                 while (from > 0 && i - from < 200 && bd->ram[from - 1] >= 32 && bd->ram[from - 1] < 127) from--;
