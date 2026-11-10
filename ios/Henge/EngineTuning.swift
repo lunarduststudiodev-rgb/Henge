@@ -8,6 +8,7 @@ enum EngineTuning {
     static let superblocksKey = "henge.perf.superblocks"
     static let wfiSpinKey = "henge.perf.wfiSpin"
     static let fastFlushKey = "henge.perf.fastFlush"
+    static let highPriorityKey = "henge.perf.highPriority"
 
     static let defaults: [String: String] = [
         // 60, not 120: every frame macOS draws is emulated and replayed, so 120 Hz
@@ -24,6 +25,8 @@ enum EngineTuning {
         if [30, 120].contains(d.integer(forKey: refreshKey)) { env["HV_HZ"] = String(d.integer(forKey: refreshKey)) }
         if d.bool(forKey: superblocksKey) { env["HV_SUPERBLOCKS"] = "1" } else { unsetenv("HV_SUPERBLOCKS") }
         if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
+        // The Mac's CPU threads at the user-interactive class instead of user-initiated (host/vm.c hv_vm_cpu_qos).
+        if d.bool(forKey: highPriorityKey) { env["HV_QOS"] = "ui" } else { unsetenv("HV_QOS") }
         // The Mac's sound card gets an input stream only while the microphone setting is on (Microphone.swift).
         if Microphone.isOn { env["HV_MIC"] = "1" } else { unsetenv("HV_MIC") }
         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }
