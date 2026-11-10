@@ -6,6 +6,7 @@ struct SettingsView: View {
     @AppStorage(HardwareMouse.speedKey) private var mouseSpeed = 1.0
     @AppStorage(HardwareMouse.reverseKey) private var reverseScrolling = false
     @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = 0.3
+    @AppStorage(HardwareMouse.holdWhileScrollingKey) private var holdWhileScrolling = true
     @AppStorage(VolumeClicks.inputModeKey) private var inputMode = VolumeClicks.InputMode.touchscreen
     @AppStorage(VolumeClicks.modeKey) private var volumeMode = VolumeClicks.Mode.delayHold
     @AppStorage(VolumeClicks.swapKey) private var swapButtons = false
@@ -67,6 +68,7 @@ struct SettingsView: View {
                             Slider(value: $mouseSpeed, in: 0.5...3)
                         }
                         Toggle("Reverse scrolling", isOn: $reverseScrolling)
+                        Toggle("Hold the pointer still while scrolling", isOn: $holdWhileScrolling)
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Scroll speed")
                             Slider(value: $scrollSpeed, in: 0.1...1.5)

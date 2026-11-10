@@ -152,6 +152,9 @@ final class HardwareMouse {
     static let speedKey = "henge.mouse.speed"
     static let reverseKey = "henge.mouse.reverse"
     static let scrollSpeedKey = "henge.mouse.scrollSpeed"
+    static let holdWhileScrollingKey = "henge.mouse.holdWhileScrolling"
+    /// How long after a scroll event pointer motion still counts as part of the scroll gesture.
+    private static let scrollQuiet: TimeInterval = 0.12
 
     private var observers: [NSObjectProtocol] = []
     private var mice: [GCMouse] = []
@@ -162,6 +165,9 @@ final class HardwareMouse {
     private var reverse = false
     private var scrollsLogged = 0 // the first few, to see what a device's raw values look like
     private var lastScrollFirst: Float = 0, lastScrollSecond: Float = 0
+    private var holdWhileScrolling = true
+    private var lastScrollAt: TimeInterval = 0
+    private var movesHeld = 0 // the first few are logged, to see what a pad reports during a scroll
 
     func start() {
         let defaults = UserDefaults.standard
@@ -174,6 +180,9 @@ final class HardwareMouse {
         HengeLog.log("input", "physical mouse: swap right/middle \(swapButtons ? "on" : "off")")
         lastScrollFirst = 0
         lastScrollSecond = 0
+        holdWhileScrolling = defaults.object(forKey: Self.holdWhileScrollingKey) == nil || defaults.bool(forKey: Self.holdWhileScrollingKey)
+        lastScrollAt = 0
+        movesHeld = 0
         GCMouse.mice().forEach(attach)
         observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { [weak self] note in
             if let mouse = note.object as? GCMouse { self?.attach(mouse) }
@@ -225,6 +234,17 @@ final class HardwareMouse {
 
     /// GameController's Y runs upward. What doesn't make a whole step yet waits for the next move.
     private func moved(_ dx: Float, _ dy: Float) {
+        // A two-finger scroll on a trackpad can also report the fingers' travel as pointer motion, and the
+        // Mac's pointer then drifts as you scroll (#62). While scroll events are arriving, motion is the gesture's.
+        if holdWhileScrolling, ProcessInfo.processInfo.systemUptime - lastScrollAt < Self.scrollQuiet {
+            restX = 0
+            restY = 0
+            if movesHeld < 24 {
+                movesHeld += 1
+                HengeLog.log("input", "pointer held while scrolling: \(dx), \(dy)")
+            }
+            return
+        }
         restX += dx * speed
         restY -= dy * speed
         let x = restX.rounded(), y = restY.rounded()
@@ -251,6 +271,7 @@ final class HardwareMouse {
         // GameController reports both axis states when either one changes. On a
         // Magic Keyboard it calls us twice per movement, with one stale axis in
         // each call; sending both values doubles the scroll and adds sideways drift.
+        if first != 0 || second != 0 { lastScrollAt = ProcessInfo.processInfo.systemUptime }
         let verticalChanged = first != lastScrollFirst
         let horizontalChanged = second != lastScrollSecond
         lastScrollFirst = first
