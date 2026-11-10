@@ -130,7 +130,10 @@ IOS_SDK = $(shell xcrun --sdk iphoneos --show-sdk-path)
 IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot $(IOS_SDK)
 # ios/deps/include/slirp first when it holds libslirp's headers (they are all the engine takes from there).
 IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
-IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
+# Henge needs an A14 or M1 or newer (ios/README.md), so the engine's own C code is built for that core, not for
+# the oldest arm64: atomics become single instructions (LSE) instead of load/store-exclusive loops. IOS_TUNE= turns it off.
+IOS_TUNE ?= -mcpu=apple-a14
+IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g $(IOS_TUNE) -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
 IB = build/ios
 IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
