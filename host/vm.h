@@ -82,6 +82,15 @@ void hv_vm_mouse_hwheel(int dx);
 void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms);
 void hv_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger that moved */
 void hv_vm_touch_button(int down); /* the pad's full press (a click) */
+/* The absolute pointing device (HV_TABLET=1): the pointer is at px, py in display pixels. The host
+   draws the pointer there at once, and the guest is told the place rather than a movement. */
+int hv_vm_tablet_on(void);
+void hv_vm_tablet_move(int px, int py);
+void hv_vm_tablet_button(int button, int down); /* 0 left, 1 right, 2 middle */
+/* Another device has the pointer now: buttons up, and the pointer is drawn where the guest has it. */
+void hv_vm_tablet_release(void);
+/* The size macOS was told its screen is, in display pixels. */
+void hv_vm_screen(int *w, int *h);
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int hv_vm_pointer(int *x, int *y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */

@@ -28,6 +28,8 @@ enum EngineTuning {
         if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
         // The Mac's CPU threads at the user-interactive class instead of user-initiated (host/vm.c hv_vm_cpu_qos).
         if d.bool(forKey: highPriorityKey) { env["HV_QOS"] = "ui" } else { unsetenv("HV_QOS") }
+        // Instant pointer: an absolute pointing device beside the mouse (devices/xhci.c), used by HardwareMouse.
+        if d.bool(forKey: HardwareMouse.instantKey) { env["HV_TABLET"] = "1" } else { unsetenv("HV_TABLET") }
         // The Mac's sound card gets an input stream only while the microphone setting is on (Microphone.swift).
         if Microphone.isOn { env["HV_MIC"] = "1" } else { unsetenv("HV_MIC") }
         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }

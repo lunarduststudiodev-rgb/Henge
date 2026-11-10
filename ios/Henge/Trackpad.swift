@@ -79,6 +79,7 @@ struct Trackpad: UIViewRepresentable {
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
             let touches = touches.filter { $0.type != .indirectPointer }
             guard !touches.isEmpty else { return }
+            henge_vm_tablet_release() // a finger moves the Mac's pointer now: draw it where the Mac has it
             if fingers.isEmpty {
                 started = Date()
                 travelled = 0

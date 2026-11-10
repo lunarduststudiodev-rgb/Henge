@@ -76,6 +76,16 @@ void henge_vm_mouse_scroll(int dx, int dy);
 void henge_vm_touch(int finger, int phase, int x, int y, uint32_t ts_ms);
 void henge_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger that moved */
 void henge_vm_touch_button(int down); /* the pad's full press (a click) */
+/* Instant pointer (HV_TABLET=1, set before the Mac starts): 1 while the running Mac has the absolute
+   pointing device. Then a hardware mouse or trackpad says where the pointer is, in display pixels, and
+   Henge draws it there at once; its buttons go the same way. Release hands the pointer back (a finger
+   on the screen moved it). */
+int henge_vm_tablet_on(void);
+void henge_vm_tablet_move(int px, int py);
+void henge_vm_tablet_button(int button, int down);
+void henge_vm_tablet_release(void);
+/* The Mac's screen size in display pixels. 0, or -1 when no Mac is running. */
+int henge_vm_screen(int *w, int *h);
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int henge_vm_pointer(int *x, int *y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */

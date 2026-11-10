@@ -13,8 +13,13 @@
    any thread (hv_xhci_key, hv_xhci_touch); the CPU thread delivers them
    (hv_xhci_poll). */
 #define HV_XHCI_SLOTS 8
-#define HV_XHCI_PORTS 2
-#define HV_XHCI_DEVICES 2
+#define HV_XHCI_PORTS 2     /* the keyboard and the trackpad; HV_TABLET=1 adds port 3 */
+#define HV_XHCI_MAX_PORTS 3
+#define HV_XHCI_DEVICES 3
+/* Port 3 (HV_TABLET=1): an absolute pointing device. Its reports say where on the screen the
+   pointer is (0..HV_TAB_MAX on each axis), so the host can draw the pointer itself at once. */
+#define HV_TAB_MAX 0x7fff
+#define HV_TAB_REPORTS 32
 #define HV_XHCI_INTRS 4
 #define HV_XHCI_EPS 32 /* device context index 1..31 */
 #define HV_XHCI_REPORTS 256
@@ -40,7 +45,8 @@ typedef struct HvXhci {
     uint64_t dcbaap;
     HvXhciRing cmd;
     int cmd_running;
-    uint32_t portsc[HV_XHCI_PORTS];
+    uint32_t portsc[HV_XHCI_MAX_PORTS];
+    int nports;        /* HV_XHCI_PORTS, or one more with the tablet */
     /* interrupters and their event rings (macOS's driver wants at least three) */
     struct HvXhciIntr {
         uint32_t iman, imod, erstsz;
@@ -83,6 +89,11 @@ typedef struct HvXhci {
     uint32_t tp_multi_logs; /* multi-finger deliveries logged, capped */
     uint8_t tp_f1[8];   /* feature report 1: the header for the selected sensor register */
     int tp_f1_len;
+    /* the tablet's reports waiting for an IN transfer: buttons, x, y (16 bits each, little-endian), wheel */
+    uint8_t tab_reports[HV_TAB_REPORTS][6];
+    uint32_t tab_rhead, tab_rtail;
+    uint8_t tab_state[6];
+    uint64_t tab_delivered;
 } HvXhci;
 
 HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus);
@@ -102,6 +113,11 @@ void hv_xhci_touch(HvXhci *x, int id, int phase, int px, int py, uint32_t ts_ms)
 void hv_xhci_touch_frame(HvXhci *x, uint32_t ts_ms);
 /* Any thread: the pad's full press (a click), down or up. */
 void hv_xhci_touch_button(HvXhci *x, int down);
+/* Whether the tablet is on the bus (HV_TABLET=1 when the machine was made). */
+int hv_xhci_has_tablet(HvXhci *x);
+/* Any thread: the tablet's pointer is at px, py (0..HV_TAB_MAX) with these buttons down
+   (bit 0 left, 1 right, 2 middle). Positions the guest has not taken yet are replaced, not queued. */
+void hv_xhci_tablet(HvXhci *x, int px, int py, int buttons);
 /* CPU thread: hand waiting reports to the guest. */
 void hv_xhci_poll(HvXhci *x);
 

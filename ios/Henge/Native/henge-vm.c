@@ -291,6 +291,33 @@ void henge_vm_mouse_scroll(int dx, int dy) {
     if (dx) hv_vm_mouse_hwheel(dx);
     pthread_rwlock_unlock(&api_lock);
 }
+int henge_vm_tablet_on(void) {
+    if (!lock_running()) return 0;
+    int on = hv_vm_tablet_on();
+    pthread_rwlock_unlock(&api_lock);
+    return on;
+}
+void henge_vm_tablet_move(int px, int py) {
+    if (!lock_running()) return;
+    hv_vm_tablet_move(px, py);
+    pthread_rwlock_unlock(&api_lock);
+}
+void henge_vm_tablet_button(int button, int down) {
+    if (!lock_running()) return;
+    hv_vm_tablet_button(button, down);
+    pthread_rwlock_unlock(&api_lock);
+}
+void henge_vm_tablet_release(void) {
+    if (!lock_running()) return;
+    hv_vm_tablet_release();
+    pthread_rwlock_unlock(&api_lock);
+}
+int henge_vm_screen(int *w, int *h) {
+    if (!lock_running()) return -1;
+    hv_vm_screen(w, h);
+    pthread_rwlock_unlock(&api_lock);
+    return 0;
+}
 int henge_vm_pointer(int *x, int *y) {
     if (!lock_running()) return -1;
     int result = hv_vm_pointer(x, y);

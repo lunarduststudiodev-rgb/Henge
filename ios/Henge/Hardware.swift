@@ -153,6 +153,11 @@ final class HardwareMouse {
     static let reverseKey = "henge.mouse.reverse"
     static let scrollSpeedKey = "henge.mouse.scrollSpeed"
     static let holdWhileScrollingKey = "henge.mouse.holdWhileScrolling"
+    /// Settings > Instant pointer: the Mac gets an absolute pointing device (HV_TABLET) and Henge draws the pointer itself.
+    static let instantKey = "henge.mouse.instant"
+    /// After this long without a move or click of ours, the Mac's own pointer position is taken again:
+    /// a finger on the screen, or the Mac itself, may have moved it.
+    private static let positionAge: TimeInterval = 0.35
     /// How long after a scroll event pointer motion still counts as part of the scroll gesture.
     private static let scrollQuiet: TimeInterval = 0.12
 
@@ -168,6 +173,10 @@ final class HardwareMouse {
     private var holdWhileScrolling = true
     private var lastScrollAt: TimeInterval = 0
     private var movesHeld = 0 // the first few are logged, to see what a pad reports during a scroll
+    private var posX: Double = 0, posY: Double = 0 // instant pointer: where it is, in the Mac's display pixels
+    private var havePos = false
+    private var lastAbsoluteAt: TimeInterval = 0
+    private var absoluteLogged = 0
 
     func start() {
         let defaults = UserDefaults.standard
@@ -183,6 +192,9 @@ final class HardwareMouse {
         holdWhileScrolling = defaults.object(forKey: Self.holdWhileScrollingKey) == nil || defaults.bool(forKey: Self.holdWhileScrollingKey)
         lastScrollAt = 0
         movesHeld = 0
+        havePos = false
+        lastAbsoluteAt = 0
+        absoluteLogged = 0
         GCMouse.mice().forEach(attach)
         observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { [weak self] note in
             if let mouse = note.object as? GCMouse { self?.attach(mouse) }
@@ -203,6 +215,7 @@ final class HardwareMouse {
 
     func stop() {
         PointerLock.set(false)
+        henge_vm_tablet_release()
         releaseButtons()
         observers.forEach(NotificationCenter.default.removeObserver)
         observers.removeAll()
@@ -219,6 +232,7 @@ final class HardwareMouse {
 
     func releaseButtons() {
         for button in buttons.releaseAll() { henge_vm_mouse_button(button, 0) }
+        henge_vm_tablet_release() // its buttons too, and the pointer goes back to where the Mac has it
     }
 
     private func attach(_ mouse: GCMouse) {
@@ -245,6 +259,7 @@ final class HardwareMouse {
             }
             return
         }
+        if henge_vm_tablet_on() != 0, movedAbsolute(dx, dy) { return }
         restX += dx * speed
         restY -= dy * speed
         let x = restX.rounded(), y = restY.rounded()
@@ -254,13 +269,50 @@ final class HardwareMouse {
         henge_vm_mouse_move(Int32(x), Int32(y))
     }
 
+    /// Instant pointer: the position is kept here and the Mac is told the place, not the movement, so Henge
+    /// draws the pointer at once and the Mac catches up. The Mac no longer accelerates the movement, so a
+    /// simple curve does: slow moves are precise, fast ones cross the screen. False if the place isn't known yet.
+    private func movedAbsolute(_ dx: Float, _ dy: Float) -> Bool {
+        var w: Int32 = 0, h: Int32 = 0
+        guard henge_vm_screen(&w, &h) == 0, w > 1, h > 1, syncPosition() else { return false }
+        let distance = Double((dx * dx + dy * dy).squareRoot())
+        let gain = Double(speed) * (1 + min(distance, 40) / 10)
+        posX = min(max(posX + Double(dx) * gain, 0), Double(w - 1))
+        posY = min(max(posY - Double(dy) * gain, 0), Double(h - 1))
+        lastAbsoluteAt = ProcessInfo.processInfo.systemUptime
+        if absoluteLogged < 8 {
+            absoluteLogged += 1
+            HengeLog.log("input", "instant pointer: \(dx), \(dy) gain \(gain) -> \(Int(posX)), \(Int(posY)) of \(w)x\(h)")
+        }
+        henge_vm_tablet_move(Int32(posX.rounded()), Int32(posY.rounded()))
+        return true
+    }
+
+    /// Our place is good while it is recent; otherwise start from where the Mac has its pointer.
+    private func syncPosition() -> Bool {
+        if havePos, ProcessInfo.processInfo.systemUptime - lastAbsoluteAt < Self.positionAge { return true }
+        var x: Int32 = 0, y: Int32 = 0
+        guard henge_vm_pointer(&x, &y) == 0 else { return havePos }
+        posX = Double(x)
+        posY = Double(y)
+        havePos = true
+        return true
+    }
+
     private func button(_ physicalButton: Int32, _ pressed: Bool) {
         guard let guestButton = buttons.event(physicalButton, pressed: pressed) else { return }
         if buttonsLogged < 32 {
             buttonsLogged += 1
             HengeLog.log("input", "physical mouse button: raw=\(physicalButton) guest=\(guestButton) \(pressed ? "down" : "up")")
         }
-        henge_vm_mouse_button(guestButton, pressed ? 1 : 0)
+        if henge_vm_tablet_on() != 0, syncPosition() {
+            // The click carries a place: say where the pointer is first, in case it moved without us.
+            lastAbsoluteAt = ProcessInfo.processInfo.systemUptime
+            henge_vm_tablet_move(Int32(posX.rounded()), Int32(posY.rounded()))
+            henge_vm_tablet_button(guestButton, pressed ? 1 : 0)
+        } else {
+            henge_vm_mouse_button(guestButton, pressed ? 1 : 0)
+        }
         if !pressed { StickyKeys.shared.releaseAll() }
     }
 

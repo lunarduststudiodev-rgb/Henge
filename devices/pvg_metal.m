@@ -256,6 +256,14 @@ static double now_seconds(void) {
    which is what this code did before (and was only right for a linear display profile such as ACES CG Linear: with every other profile
    it encodes twice and the screen looks pale). HV_PVG_HALF=linear selects mode 1 at start; with the colour probe on, a file named
    mode-linear or mode-encoded in its folder switches it while running. */
+/* Where the host says the pointer is (hv_pvg_metal_cursor_override), or 0xffffffff: the guest's own place. */
+static _Atomic uint32_t hv_cursor_override = 0xffffffff;
+static uint32_t cursor_where(const uint8_t *page) {
+    uint32_t over = atomic_load_explicit(&hv_cursor_override, memory_order_relaxed);
+    if (over != 0xffffffff) return over;
+    return __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE);
+}
+
 static _Atomic int hv_half_mode = -1;
 static int hv_half_mode_get(void) {
     int m = atomic_load(&hv_half_mode);
@@ -2270,7 +2278,7 @@ static const uint8_t *half_to_byte(void) {
     drawn_w = drawn_h = 0;
     const uint8_t *page = hv_pvg_lite_display_page(lite);
     if (!page || !cursor || !(cursor_shown || page[0xe04])) return;
-    uint32_t where = __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE);
+    uint32_t where = cursor_where(page);
     if (getenv("HV_PVG_CURSOR_LOG")) {
         static uint32_t last;
         if (where != last) fprintf(stderr, "pvgcursor at %u,%u shown %d flag %d\n", where & 0xffff, where >> 16, cursor_shown, page[0xe04]);
@@ -2521,7 +2529,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         }
         [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         const uint8_t *page = hv_pvg_lite_display_page(lite);
-        uint32_t where = page ? __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE) : 0xffffffff;
+        uint32_t where = page ? cursor_where(page) : 0xffffffff;
         if (ctex && where != 0xffffffff && (shown || page[0xe04])) {
             const float scale = cursor_scale();
             float x = (float)(where & 0xffff) - hx * scale, y = (float)(where >> 16) - hy * scale;
@@ -2840,6 +2848,10 @@ void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
         atomic_store(&queued, 0);
         [r drawCursor];
     });
+}
+
+void hv_pvg_metal_cursor_override(HvPvgMetal *m, uint32_t where) {
+    if (atomic_exchange(&hv_cursor_override, where) != where) hv_pvg_metal_cursor_moved(m);
 }
 
 void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {

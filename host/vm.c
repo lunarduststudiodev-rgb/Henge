@@ -457,6 +457,7 @@ void hv_vm_stop(void) {
 static os_unfair_lock rctrl_lock = OS_UNFAIR_LOCK_INIT;
 static int rctrl_user, rctrl_click;
 static int left_user, left_click, left_sent; /* only the pointer queue touches these */
+static int tab_x, tab_y, tab_buttons, tab_valid; /* the tablet's place (display pixels) and buttons: the pointer queue's too */
 
 static dispatch_queue_t pointer_queue(void) {
     static dispatch_queue_t q;
@@ -467,10 +468,12 @@ static dispatch_queue_t pointer_queue(void) {
 
 static void stop_pointer(void) {
     atomic_store(&input_stopping, 1);
+    hv_pvg_lite_cursor_override(NULL, 0xffffffff); /* the next Mac draws its pointer where it has it */
     /* The bridge excludes new input. Finish a click already in progress and
        discard queued input before releasing the keyboard and mouse. */
     dispatch_sync(pointer_queue(), ^{
         left_user = left_click = left_sent = 0;
+        tab_buttons = tab_valid = 0;
         os_unfair_lock_lock(&rctrl_lock);
         rctrl_user = rctrl_click = 0;
         os_unfair_lock_unlock(&rctrl_lock);
@@ -557,6 +560,83 @@ static void wheel(uint16_t axis, int amount) {
 
 void hv_vm_mouse_wheel(int dy) { wheel(HV_REL_WHEEL, dy); }
 void hv_vm_mouse_hwheel(int dx) { wheel(HV_REL_HWHEEL, dx); }
+
+/* ---- the absolute pointing device (HV_TABLET) ---- */
+
+int hv_vm_tablet_on(void) { return hv_xhci_has_tablet(board.usb); }
+
+void hv_vm_screen(int *w, int *h) {
+    uint32_t dw = 0, dh = 0;
+    hv_pvg_lite_get_mode(&dw, &dh);
+    *w = (int)dw, *h = (int)dh;
+}
+
+static void tablet_send(void) {
+    int w, h;
+    hv_vm_screen(&w, &h);
+    if (w < 2 || h < 2) return;
+    hv_xhci_tablet(board.usb, (int)((int64_t)tab_x * HV_TAB_MAX / (w - 1)), (int)((int64_t)tab_y * HV_TAB_MAX / (h - 1)), tab_buttons);
+}
+
+static void tablet_move_now(void *ctx) {
+    if (atomic_load(&input_stopping)) return;
+    intptr_t v = (intptr_t)ctx;
+    tab_x = (int)(v >> 16) & 0xffff;
+    tab_y = (int)(v & 0xffff);
+    tab_valid = 1;
+    tablet_send();
+}
+
+void hv_vm_tablet_move(int px, int py) {
+    if (!hv_vm_tablet_on()) return;
+    int w, h;
+    hv_vm_screen(&w, &h);
+    if (w < 2 || h < 2) return;
+    if (px < 0) px = 0;
+    if (px > w - 1) px = w - 1;
+    if (py < 0) py = 0;
+    if (py > h - 1) py = h - 1;
+    /* Drawn here and now, on the caller's thread: this is what makes the pointer keep up with the hand. */
+    hv_pvg_lite_cursor_override(atomic_load_explicit(&display_pvg, memory_order_acquire), (uint32_t)px | (uint32_t)py << 16);
+    dispatch_async_f(pointer_queue(), (void *)(intptr_t)((intptr_t)px << 16 | py), tablet_move_now);
+}
+
+static void tablet_button_now(void *ctx) {
+    if (atomic_load(&input_stopping)) return;
+    if (!tab_valid) { /* no place sent yet: the click goes where the guest's pointer is, through the mouse */
+        button_now(ctx);
+        return;
+    }
+    intptr_t v = (intptr_t)ctx;
+    int bit = 1 << (int)(v >> 1), down = (int)(v & 1);
+    tab_buttons = down ? tab_buttons | bit : tab_buttons & ~bit;
+    tablet_send();
+}
+
+void hv_vm_tablet_button(int button, int down) {
+    if (button < 0 || button > 2) return;
+    if (!hv_vm_tablet_on()) {
+        hv_vm_mouse_button(button, down);
+        return;
+    }
+    dispatch_async_f(pointer_queue(), (void *)(intptr_t)(button << 1 | !!down), tablet_button_now);
+}
+
+static void tablet_release_now(void *ctx) {
+    (void)ctx;
+    if (atomic_load(&input_stopping)) return;
+    if (tab_valid && tab_buttons) {
+        tab_buttons = 0;
+        tablet_send();
+    }
+    tab_valid = 0;
+}
+
+void hv_vm_tablet_release(void) {
+    if (!hv_vm_tablet_on()) return;
+    hv_pvg_lite_cursor_override(atomic_load_explicit(&display_pvg, memory_order_acquire), 0xffffffff);
+    dispatch_async_f(pointer_queue(), NULL, tablet_release_now);
+}
 
 void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
     if (x < 0) x = 0;

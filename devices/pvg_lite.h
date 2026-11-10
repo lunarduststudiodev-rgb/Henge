@@ -44,6 +44,13 @@ void hv_pvg_lite_task_pages(HvPvgLite *p, uint32_t task, uint64_t first, uint64_
 void hv_pvg_lite_set_layer(HvPvgLite *p, void *layer);
 uint64_t hv_pvg_lite_gpu_frames(HvPvgLite *p);
 void hv_pvg_lite_barrier_stats(HvPvgLite *p, uint64_t out[4]);
+/* The size macOS was told its screen is (hv_pvg_lite_set_mode). */
+void hv_pvg_lite_get_mode(uint32_t *width, uint32_t *height);
+/* Draw the pointer at this place (x | y << 16, display pixels) instead of where the guest says it is;
+   0xffffffff goes back to the guest's. The host knows where an absolute pointing device is before the
+   guest has worked it out. Any thread; p may be NULL. */
+void hv_pvg_lite_cursor_override(HvPvgLite *p, uint32_t where);
+void hv_pvg_metal_cursor_override(HvPvgMetal *m, uint32_t where);
 /* The display's shared state page, or NULL before the guest named it. */
 uint8_t *hv_pvg_lite_display_page(HvPvgLite *p);
 void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *command, uint32_t length);
