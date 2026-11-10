@@ -9,6 +9,7 @@ enum EngineTuning {
     static let wfiSpinKey = "henge.perf.wfiSpin"
     static let fastFlushKey = "henge.perf.fastFlush"
     static let highPriorityKey = "henge.perf.highPriority"
+    static let statsKey = "henge.perf.stats"
 
     static let defaults: [String: String] = [
         // 60, not 120: every frame macOS draws is emulated and replayed, so 120 Hz
@@ -30,6 +31,8 @@ enum EngineTuning {
         // The Mac's sound card gets an input stream only while the microphone setting is on (Microphone.swift).
         if Microphone.isOn { env["HV_MIC"] = "1" } else { unsetenv("HV_MIC") }
         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }
+        // Off: no stats lines in the log, and none of the timing the engine does to make them.
+        if d.object(forKey: statsKey) as? Bool == false { env["HV_STATS"] = "0" }
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         // GPU command trace: on while Documents/trace-on exists (it is checked every frame, so it can be toggled live).
         env["HV_PVG_TRACE_FILE"] = docs.appendingPathComponent("trace-on").path

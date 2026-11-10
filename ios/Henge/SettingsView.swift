@@ -16,6 +16,7 @@ struct SettingsView: View {
     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
     @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
     @AppStorage(EngineTuning.highPriorityKey) private var highPriority = false
+    @AppStorage(EngineTuning.statsKey) private var engineStats = true
     @AppStorage(Microphone.key) private var microphone = false
     @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
 
@@ -128,6 +129,7 @@ struct SettingsView: View {
                     Toggle("Quicker wake from idle", isOn: $wfiSpin)
                     Toggle("Superblocks (experimental)", isOn: $superblocks)
                     Toggle("High-priority CPUs (experimental)", isOn: $highPriority)
+                    Toggle("Engine statistics in the log", isOn: $engineStats)
                     Picker("Code cache", selection: $codeCacheMB) {
                         Text("1 GB").tag(1024)
                         Text("1.5 GB").tag(1536)
