@@ -1,21 +1,75 @@
 import SwiftUI
 import UIKit
 
-/// The Desk: a dark, quiet page, cards on it with a hairline edge, and one blue for what you press.
-/// A Mac's screen is the only colourful thing here.
+/// The Desk: a quiet page, cards on it with a hairline edge, and one blue for what you press.
+/// A Mac's screen is the only colourful thing here. Dark, or light (Settings › Appearance);
+/// a running Mac's session is always dark.
 enum Desk {
-    static let page = Color(red: 11 / 255, green: 12 / 255, blue: 16 / 255)
-    static let card = Color(red: 22 / 255, green: 24 / 255, blue: 31 / 255)
-    static let raised = Color(red: 35 / 255, green: 38 / 255, blue: 47 / 255)
-    static let text = Color(red: 242 / 255, green: 243 / 255, blue: 247 / 255)
-    static let dim = Color(red: 144 / 255, green: 149 / 255, blue: 164 / 255)
-    static let faint = Color(red: 106 / 255, green: 111 / 255, blue: 126 / 255)
+    static let page = tone(light: (242, 243, 247), dark: (11, 12, 16))
+    static let card = tone(light: (255, 255, 255), dark: (22, 24, 31))
+    static let raised = tone(light: (228, 230, 236), dark: (35, 38, 47))
+    static let text = tone(light: (17, 19, 24), dark: (242, 243, 247))
+    static let dim = tone(light: (92, 97, 112), dark: (144, 149, 164))
+    static let faint = tone(light: (138, 143, 157), dark: (106, 111, 126))
     static let accent = Color(red: 46 / 255, green: 107 / 255, blue: 1)
-    static let accentLight = Color(red: 91 / 255, green: 141 / 255, blue: 1)
-    static let good = Color(red: 57 / 255, green: 217 / 255, blue: 138 / 255)
-    static let warn = Color(red: 1, green: 188 / 255, blue: 46 / 255)
-    static let bad = Color(red: 1, green: 122 / 255, blue: 112 / 255)
-    static let hairline = Color.white.opacity(0.1)
+    /// Blue for tints and text: lighter on the dark page, deeper on the light one.
+    static let accentLight = tone(light: (31, 91, 235), dark: (91, 141, 255))
+    static let good = tone(light: (20, 145, 90), dark: (57, 217, 138))
+    static let warn = tone(light: (184, 119, 0), dark: (255, 188, 46))
+    static let bad = tone(light: (210, 56, 43), dark: (255, 122, 112))
+    static let hairline = Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 1, alpha: 0.1) : UIColor(white: 0, alpha: 0.1) })
+
+    private static func tone(light: (Int, Int, Int), dark: (Int, Int, Int)) -> Color {
+        func ui(_ c: (Int, Int, Int)) -> UIColor {
+            UIColor(red: CGFloat(c.0) / 255, green: CGFloat(c.1) / 255, blue: CGFloat(c.2) / 255, alpha: 1)
+        }
+        let l = ui(light), d = ui(dark)
+        return Color(UIColor { $0.userInterfaceStyle == .dark ? d : l })
+    }
+}
+
+/// Settings › Appearance.
+enum DeskAppearance: String, CaseIterable, Identifiable {
+    case system, light, dark
+    static let key = "appearance"
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .system: return "System"
+        case .light: return "Light"
+        case .dark: return "Dark"
+        }
+    }
+    var style: UIUserInterfaceStyle {
+        switch self {
+        case .system: return .unspecified
+        case .light: return .light
+        case .dark: return .dark
+        }
+    }
+}
+
+/// Sets its own window's style directly, so System follows iOS's setting as it changes and a
+/// running Mac's session (in the same window) can stay dark over a light page.
+struct WindowStyle: UIViewRepresentable {
+    let style: UIUserInterfaceStyle
+
+    final class Probe: UIView {
+        var style = UIUserInterfaceStyle.unspecified { didSet { apply() } }
+        override func didMoveToWindow() { super.didMoveToWindow(); apply() }
+        private func apply() {
+            if let window, window.overrideUserInterfaceStyle != style { window.overrideUserInterfaceStyle = style }
+        }
+    }
+
+    func makeUIView(context: Context) -> Probe {
+        let probe = Probe()
+        probe.isUserInteractionEnabled = false
+        probe.style = style
+        return probe
+    }
+
+    func updateUIView(_ probe: Probe, context: Context) { probe.style = style }
 }
 
 extension View {
