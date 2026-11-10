@@ -159,6 +159,8 @@ int main(int argc, char **argv) {
     CHECK(hv_vm_create(NULL));
     map_ram();
     CHECK(hv_vcpu_create(&vcpu, &vexit, NULL));
+    /* The virtual counter starts with the machine, as under the JIT: the timer model subtracts m.cntvoff. */
+    CHECK(hv_vcpu_set_vtimer_offset(vcpu, m.cntvoff));
     CHECK(hv_vcpu_set_reg(vcpu, HV_REG_PC, VMAPPLE_FIRMWARE));
     CHECK(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c5)); /* EL1h, DAIF masked */
     CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MPIDR_EL1, 0x80000000));
