@@ -163,6 +163,15 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         m->stats.translate_ticks += mach_absolute_time() - t0;
         m->stats.translated_insns += nb.ninsns;
     }
+    /* Another CPU may have made this block while we translated it (after a full flush they all want the
+       same code at once): take theirs before ours takes any room. A duplicate that is placed stays in the
+       region until the next full flush, which it brings nearer. The lookup is the lock-free one above. */
+    b = find(m, h, va, pa, flags, gen);
+    if (b) {
+        m->stats.dup_skipped++;
+        jc[j].va = va, jc[j].b = b;
+        return b;
+    }
     /* ...and place it in the region (space is reserved atomically, so no lock either)... */
     size_t used0 = m->jit.used;
     if (hv_translate_place(m, &nb) != 0) { /* JIT region full: start over */
@@ -184,6 +193,8 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     }
     b = find(m, h, va, pa, flags, gen); /* another CPU may have just made it: ours is dropped (its space stays used until a flush) */
     if (b) {
+        m->stats.dup_placed++;
+        m->stats.dup_placed_words += hv_translate_last_words();
         pthread_mutex_unlock(&m->tr_mu);
         jc[j].va = va, jc[j].b = b;
         return b;
@@ -666,6 +677,8 @@ static void print_stats(HvCpu *cpu, int force) {
             fprintf(stderr, "  code words: inline %.0f%% out of line %.0f%% literals %.0f%%\n", 100 * RATE(words_inline) / tw,
                     100 * RATE(words_ool) / tw, 100 * RATE(words_pool) / tw);
         }
+        fprintf(stderr, "  duplicate translations/s: given up before placing %.0f, placed and dropped %.0f (%.2f MB/s of hot code left in the region)\n",
+                RATE(dup_skipped), RATE(dup_placed), RATE(dup_placed_words) * 4 / (1 << 20));
         fprintf(stderr, "  new code pages %.0f/s; waits: tlbi acks %.0f/s %.1f%%, device lock %.0f/s %.1f%%, translation lock %.0f/s %.1f%% (of one CPU)\n",
                 RATE(code_protects), RATE(syncs), RATE(sync_ticks) / 240000.0, RATE(dev_waits), RATE(dev_wait_ticks) / 240000.0,
                 RATE(tr_waits), RATE(tr_wait_ticks) / 240000.0);
