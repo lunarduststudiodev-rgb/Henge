@@ -500,4 +500,17 @@ void hv_virtio_snd_resume(HvVirtioSnd *d) {
     d->clock_start_consumed = atomic_load(&d->consumed);
     if (d->running && d->backend.start && d->backend.start(d->backend.opaque, d->channels, d->format, d->rate_hz) != 0)
         d->backend.start = NULL;
+    /* The input stream: the host's recorder stopped with the pause (or this is another process, resuming a
+       saved Mac), so it starts again if the guest was recording, from an empty ring. A Mac saved with the
+       microphone and resumed without it has no input stream to carry on. */
+    d->in_live = 0;
+    atomic_store(&d->in_consumed, atomic_load(&d->in_written));
+    if (!d->mic) {
+        d->in_prepared = d->in_running = 0;
+        d->in_head = d->in_tail = 0;
+    } else if (d->in_running) {
+        d->in_live = d->backend.in_start &&
+                     d->backend.in_start(d->backend.opaque, d->in_channels, d->in_format, d->in_rate_hz) == 0;
+        d->in_clock_ns = now_ns();
+    }
 }
