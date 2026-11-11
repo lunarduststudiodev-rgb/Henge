@@ -15,6 +15,7 @@ struct SettingsView: View {
     @AppStorage(EngineTuning.fastFlushKey) private var fastFlush = true
     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
     @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
+    @AppStorage(EngineTuning.highPriorityKey) private var highPriority = false
     @AppStorage(MacPause.autoPauseKey) private var autoPause = true
     @AppStorage(MacPause.autoResumeKey) private var autoResume = true
     @AppStorage(GuestMemory.saveAheadKey) private var quickSuspend = false
@@ -110,6 +111,7 @@ struct SettingsView: View {
                 Toggle("Faster disk writes", isOn: $fastFlush)
                 Toggle("Quicker wake from idle", isOn: $wfiSpin)
                 Toggle("Superblocks (experimental)", isOn: $superblocks)
+                Toggle("High-priority CPUs (experimental)", isOn: $highPriority)
                 Picker("Code cache", selection: $codeCacheMB) {
                     Text("1 GB").tag(1024)
                     Text("1.5 GB").tag(1536)
