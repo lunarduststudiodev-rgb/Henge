@@ -18,6 +18,7 @@
 #include "dns_proxy.h"
 #include "vm.h"
 #include "install.h"
+#include "snapshot.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -31,6 +32,9 @@ static _Atomic uint64_t generation;
 static int installer_session;
 static uint64_t stopped_blocks, stopped_tx, stopped_rx;
 static const char *exit_description(void);
+static int lock_running(void);
+/* A Mac app ran through the translation layer in this launch (henge-tl.c): it may have remapped part of the JIT region. */
+_Atomic int henge_tl_ran;
 
 static void on_exit(int reason) {
     pthread_rwlock_wrlock(&api_lock);
@@ -58,6 +62,10 @@ static void on_exit(int reason) {
 
 /* Holds api_lock through creation so UI snapshots cannot see a partial board. */
 static int begin_start(char *err, size_t errlen) {
+    if (atomic_load(&henge_tl_ran)) {
+        snprintf(err, errlen, "A Mac app ran in this launch. Quit Henge (swipe it away) and open it again to start a Mac.");
+        return -1;
+    }
     pthread_rwlock_wrlock(&api_lock);
     if ((state != 0 && state != 2) || installer_session) {
         snprintf(err, errlen, "%s", installer_session
@@ -90,8 +98,87 @@ static int started(char *err, size_t errlen) {
     return 0;
 }
 
+static int boot_or_resume(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
+                          int cpus, const char *resume, const char *ident, char *err, size_t errlen);
+
 int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
                   int cpus, char *err, size_t errlen) {
+    return boot_or_resume(rom, disk, aux, ecid, seed, ram_mb, cpus, NULL, NULL, err, errlen);
+}
+
+int henge_vm_resume(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
+                    int cpus, const char *path, const char *ident, char *err, size_t errlen) {
+    return boot_or_resume(rom, disk, aux, ecid, seed, ram_mb, cpus, path, ident, err, errlen);
+}
+
+int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int64_t *saved_at) {
+    return hv_snapshot_check(path, ident, bytes, saved_at);
+}
+
+int henge_vm_pause(char *err, size_t errlen) {
+    if (state == 4) return 0;
+    if (!lock_running()) {
+        snprintf(err, errlen, "No Mac is running.");
+        return -1;
+    }
+    if (installer_session) {
+        pthread_rwlock_unlock(&api_lock);
+        snprintf(err, errlen, "An install cannot be paused.");
+        return -1;
+    }
+    if (hv_vm_pause() != 0) {
+        /* It stopped by itself at the same moment: on_exit takes it from here once the lock is free. */
+        pthread_rwlock_unlock(&api_lock);
+        snprintf(err, errlen, "The Mac stopped by itself.");
+        return -1;
+    }
+    state = 4;
+    pthread_rwlock_unlock(&api_lock);
+    fprintf(stderr, "henge: the Mac is paused\n");
+    return 0;
+}
+
+int henge_vm_save(const char *path, const char *ident, char *err, size_t errlen) {
+    pthread_rwlock_rdlock(&api_lock);
+    if (state != 4) {
+        pthread_rwlock_unlock(&api_lock);
+        snprintf(err, errlen, "The Mac is not paused.");
+        return -1;
+    }
+    int r = hv_snapshot_save(path, ident, err, errlen);
+    pthread_rwlock_unlock(&api_lock);
+    fprintf(stderr, "henge: %s\n", r ? err : "the paused Mac is saved");
+    return r;
+}
+
+int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errlen) {
+    if (henge_vm_pause(err, errlen) != 0) return -1;
+    int r = henge_vm_save(path, ident, err, errlen);
+    if (r) henge_vm_continue();
+    return r;
+}
+
+int henge_vm_continue(void) {
+    pthread_rwlock_wrlock(&api_lock);
+    if (state != 4) {
+        pthread_rwlock_unlock(&api_lock);
+        return -1;
+    }
+    state = 1;
+    int r = hv_vm_continue();
+    if (r != 0) {
+        /* No threads for its CPUs: it cannot run on. Release it, as a stop would. */
+        hv_vm_destroy();
+        exit_outcome = HENGE_VM_OUTCOME_ERROR;
+        state = 2;
+    }
+    pthread_rwlock_unlock(&api_lock);
+    fprintf(stderr, "henge: the Mac runs on%s\n", r ? " -- no, its CPU threads could not start" : "");
+    return r;
+}
+
+static int boot_or_resume(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
+                          int cpus, const char *resume, const char *ident, char *err, size_t errlen) {
     { extern void hv_prof_ios_start(void); hv_prof_ios_start(); }
     if (begin_start(err, errlen)) return -1;
     HengeDualMapping *jit = henge_ios_jit_get_mapping();
@@ -104,6 +191,15 @@ int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t e
     fprintf(stderr, "henge: booting with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
             jit->size >> 20);
     if (hv_vm_create(&c, err, errlen) != 0) return failed_start();
+    if (resume) {
+        int restored = hv_snapshot_restore(resume, ident, err, errlen);
+        /* Used once: from here the Mac runs on and its disk moves past what the file holds. */
+        unlink(resume);
+        if (restored != 0) {
+            fprintf(stderr, "henge: resume failed: %s\n", err);
+            return failed_start();
+        }
+    }
     if (getenv("HV_STATS")) hv_vm_machine()->stats_interval = atoi(getenv("HV_STATS"));
     return started(err, errlen);
 }
@@ -196,6 +292,18 @@ static int lock_running(void) {
     return 0;
 }
 void henge_vm_stop(void) {
+    if (state == 4) { /* paused: its CPU threads have ended already, so nothing calls on_exit */
+        pthread_rwlock_wrlock(&api_lock);
+        if (state == 4) {
+            hv_vm_destroy();
+            exit_reason = HV_EXIT_HALT;
+            exit_outcome = HENGE_VM_OUTCOME_HOST_STOP;
+            state = 2;
+            fprintf(stderr, "henge: the paused Mac was stopped and released\n");
+        }
+        pthread_rwlock_unlock(&api_lock);
+        return;
+    }
     if (!lock_running()) return;
     hv_vm_stop();
     state = 3;

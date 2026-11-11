@@ -207,6 +207,26 @@ void hv_virtio_blk_stop(HvVirtioBlk *b) {
     b->workers_started = 0;
 }
 
+/* Workers again after hv_virtio_blk_stop (a machine paused to be saved runs on). 0, or -1 if none started. */
+int hv_virtio_blk_start(HvVirtioBlk *b) {
+    if (!b || b->workers_started) return 0;
+    pthread_mutex_lock(&b->mu);
+    b->stopping = 0;
+    pthread_mutex_unlock(&b->mu);
+    for (int i = 0; i < HV_VBLK_WORKERS; i++) {
+        if (pthread_create(&b->worker[i], NULL, worker, b) != 0) break;
+        b->workers_started++;
+    }
+    return b->workers_started ? 0 : -1;
+}
+
+/* Stopped and every request handed back: nothing of it is in flight. */
+int hv_virtio_blk_idle(HvVirtioBlk *b) {
+    if (!b) return 1;
+    hv_virtio_blk_poll(b);
+    return !b->workers_started && b->published == b->submitted && !b->inflight;
+}
+
 void hv_virtio_blk_destroy(HvVirtioBlk *b) {
     if (!b) return;
     hv_virtio_blk_stop(b);

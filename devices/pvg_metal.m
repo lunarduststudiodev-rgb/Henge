@@ -461,26 +461,33 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     NSMutableData *lib = [NSMutableData dataWithLength:h.len];
     if (hv_pvg_lite_task_read(lite, task, h.off, lib.mutableBytes, h.len)) return nil;
     /* iOS 17 refuses macOS's libraries as they are (a macOS 15 build, AIR 2.7): relabelled as iOS 17 ones
-       (devices/metallib.c), header first, then the bitcode's target too, it may load them. The stage that
-       worked is tried first from then on. HV_PVG_NO_RELABEL: never. */
-    static int start_stage = -1; /* 0: as sent; 1, 2: relabelled */
+       (devices/metallib.c), header and the bitcode's target, it loads them. Stage 1 (the header alone) is not
+       tried after the library as sent: iOS 17 loads such a library, but every pipeline made from it then fails
+       "Target OS is incompatible", the module still saying macOS (issue 44). The stage that worked is tried first
+       from then on. Stage 3 (the version metadata too) only when asked for: HV_PVG_RELABEL=3. HV_PVG_NO_RELABEL:
+       never. */
+    static int start_stage = -1; /* 0: as sent; 1, 2, 3: relabelled */
     static int no_relabel = -1;
     if (no_relabel < 0) no_relabel = getenv("HV_PVG_NO_RELABEL") != NULL;
     if (start_stage < 0) { /* HV_PVG_RELABEL=N (testing): every library relabelled at stage N from the start */
         const char *f = getenv("HV_PVG_RELABEL");
-        start_stage = f && atoi(f) >= 1 && atoi(f) <= 2 ? atoi(f) : 0;
+        start_stage = f && atoi(f) >= 1 && atoi(f) <= 3 ? atoi(f) : 0;
     }
     NSError *err = nil, *first_err = nil;
     id<MTLLibrary> library = nil;
-    for (int stage = no_relabel ? 0 : start_stage; stage <= (no_relabel ? 0 : 2) && !library; stage++) {
+    int last_stage = no_relabel ? 0 : start_stage >= 3 ? 3 : 2, loaded_at = -1;
+    for (int stage = no_relabel ? 0 : start_stage; stage <= last_stage && !library; stage = stage ? stage + 1 : 2) {
         NSMutableData *try = lib;
         if (stage) {
             try = [lib mutableCopy];
-            if (hv_metallib_relabel(try.mutableBytes, try.length, stage) <= 0) continue;
+            const char *why = NULL;
+            if (hv_metallib_relabel(try.mutableBytes, try.length, stage, &why) <= 0) continue;
+            if (why) [self complain:[NSString stringWithFormat:@"library: relabelled (stage %d) only in part: %s", stage, why]];
         }
         dispatch_data_t data = dispatch_data_create(try.bytes, try.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         err = nil;
         library = [device newLibraryWithData:data error:&err];
+        if (library) loaded_at = stage;
         if (!library && !first_err) first_err = err;
         if (library && (stage != start_stage || (stage && first_err == nil && !getenv("HV_PVG_RELABEL_QUIET")))) {
             [self complain:[NSString stringWithFormat:@"library: loaded relabelled for iOS 17 (stage %d; as sent: %@)", stage,
@@ -494,9 +501,14 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         [self complain:[NSString stringWithFormat:@"library: %@", (first_err ?: err).localizedDescription]];
         return nil;
     }
-    {   /* m4 fork: while tracing, keep each library macOS sends, to read its shaders on a Mac */
-        const char *tf = getenv("HV_PVG_TRACE_FILE");
-        if (tf && getenv("HV_SHADER_DUMP") && atoi(getenv("HV_SHADER_DUMP"))) {
+    {   /* m4 fork: while tracing, keep each library macOS sends, to read its shaders on a Mac. Also, unless
+           HV_SHADER_DUMP=0, the first 48 that had to be relabelled (Documents/shaders, as sent): what an OS that
+           refuses them was sent, for relabelling to be checked against on a Mac. */
+        static int relabelled_kept = 0;
+        const char *tf = getenv("HV_PVG_TRACE_FILE"), *sd = getenv("HV_SHADER_DUMP");
+        int keep = sd ? atoi(sd) != 0 : loaded_at > 0 && relabelled_kept < 48;
+        if (keep && !sd) relabelled_kept++;
+        if (tf && keep) {
             NSString *dir = [[[NSString stringWithUTF8String:tf] stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"shaders"];
             [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
             NSString *name = [NSString stringWithFormat:@"%@-%llx.metallib", library.functionNames.firstObject ?: @"lib", (unsigned long long)at];
@@ -2399,7 +2411,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 }
 
 - (void)showOnLayer:(uint64_t)mapping {
-    HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : surfaces[@(mapping)];
+    HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]); /* not met yet: a resumed machine's screen */
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     on_screen = mapping;
     BOOL half = surface->fourcc == 'RGhA';
@@ -2601,7 +2613,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         return;
     }
     late = NO;
-    HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : surfaces[@(mapping)];
+    HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]); /* not met yet: a resumed machine's screen */
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     last_capture = now;
     [last_cb waitUntilCompleted]; /* the CPU copies the pixels here, so the GPU must be done with them */
@@ -2924,4 +2936,105 @@ int hv_pvg_metal_frame(HvPvgMetal *m, const uint8_t **pixels, uint32_t *w, uint3
     if (!r->frame) return -1;
     *pixels = r->frame, *w = r->frame_w, *h = r->frame_h;
     return 0;
+}
+
+@interface HvReplay (Resume)
+- (void)page:(HvObject *)o toGuest:(BOOL)down task:(uint32_t)task blit:(id<MTLBlitCommandEncoder> *)blit commandBuffer:(id<MTLCommandBuffer>)cb;
+@end
+
+/* Instant resume: the CPUs are stopped. Finish what the guest handed over, then copy what only the GPU holds (it drew
+   into private memory and the guest has not asked for it back) into guest memory, where a replay made after a restore
+   reads it from. A texture in a heap goes with its heap's bytes, as the heap is what is made again from guest memory. */
+void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+    if (!m) return;
+    HvReplay *r = (__bridge HvReplay *)m;
+    @autoreleasepool {
+        dispatch_sync(r->worker, ^{});
+        dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
+        dispatch_sync(r->worker, ^{
+            id<MTLCommandBuffer> cb = nil;
+            id<MTLBlitCommandEncoder> blit = nil;
+            unsigned copied = 0;
+            for (NSNumber *task in r->tasks) {
+                NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
+                for (NSNumber *ref in objs) {
+                    HvObject *o = objs[ref];
+                    if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
+                    if (o->parent && o->parent->heap_whole) continue;
+                    if (!cb) cb = [r->queue commandBuffer];
+                    [r page:o toGuest:YES task:task.unsignedIntValue blit:&blit commandBuffer:cb];
+                    o->guest_stale = NO;
+                    copied++;
+                }
+            }
+            [blit endEncoding];
+            if (cb) {
+                [cb commit];
+                [cb waitUntilCompleted];
+            }
+            fprintf(stderr, "hengevm: pvg-metal: quiesced, %u GPU-only objects copied to guest memory\n", copied);
+        });
+        dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
+    }
+}
+
+typedef struct DisplayState {
+    uint64_t on_screen;
+    uint32_t cursor_w, cursor_h, cursor_stride, cursor_shown;
+    int32_t hot_x, hot_y;
+} DisplayState;
+
+size_t hv_pvg_metal_display_state(HvPvgMetal *m, void *out, size_t cap) {
+    HvReplay *r = (__bridge HvReplay *)m;
+    __block size_t need = 0;
+    dispatch_sync(r->worker, ^{
+        os_unfair_lock_lock(&r->screen_lock);
+        size_t bits = r->cursor ? (size_t)r->cursor_stride * r->cursor_h : 0;
+        need = sizeof(DisplayState) + bits;
+        if (out && cap >= need) {
+            DisplayState d = {.on_screen = r->on_screen, .cursor_w = bits ? r->cursor_w : 0, .cursor_h = bits ? r->cursor_h : 0,
+                              .cursor_stride = bits ? r->cursor_stride : 0, .cursor_shown = r->cursor_shown,
+                              .hot_x = r->cursor_hot_x, .hot_y = r->cursor_hot_y};
+            memcpy(out, &d, sizeof d);
+            if (bits) memcpy((uint8_t *)out + sizeof d, r->cursor, bits);
+        }
+        os_unfair_lock_unlock(&r->screen_lock);
+    });
+    return need;
+}
+
+void hv_pvg_metal_set_display_state(HvPvgMetal *m, const void *in, size_t len) {
+    if (!m || len < sizeof(DisplayState)) return;
+    HvReplay *r = (__bridge HvReplay *)m;
+    DisplayState d;
+    memcpy(&d, in, sizeof d);
+    size_t bits = (size_t)d.cursor_stride * d.cursor_h;
+    if (len < sizeof d + bits || d.cursor_w > 512 || d.cursor_h > 512 || (bits && d.cursor_stride < d.cursor_w * 4)) bits = 0;
+    uint8_t *copy = bits ? malloc(bits) : NULL;
+    if (copy) memcpy(copy, (const uint8_t *)in + sizeof d, bits);
+    dispatch_sync(r->worker, ^{
+        @autoreleasepool {
+            id<MTLTexture> glyph = nil;
+            if (copy) {
+                MTLTextureDescriptor *ct = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                              width:d.cursor_w height:d.cursor_h mipmapped:NO];
+                ct.storageMode = MTLStorageModeShared;
+                glyph = [r->device newTextureWithDescriptor:ct];
+                [glyph replaceRegion:MTLRegionMake2D(0, 0, d.cursor_w, d.cursor_h) mipmapLevel:0 withBytes:copy bytesPerRow:d.cursor_stride];
+            }
+            os_unfair_lock_lock(&r->screen_lock);
+            if (copy) {
+                free(r->cursor);
+                r->cursor = copy, r->cursor_w = d.cursor_w, r->cursor_h = d.cursor_h, r->cursor_stride = d.cursor_stride;
+                r->cursor_hot_x = d.hot_x, r->cursor_hot_y = d.hot_y;
+                r->cursor_tex = glyph;
+            }
+            r->cursor_shown = d.cursor_shown != 0;
+            os_unfair_lock_unlock(&r->screen_lock);
+            r->on_screen = d.on_screen;
+            if (d.on_screen) [r present:d.on_screen];
+            [r drawCursor];
+        }
+    });
+    fprintf(stderr, "hengevm: pvg-metal: screen %llu and a %ux%u pointer restored\n", (unsigned long long)d.on_screen, d.cursor_w, d.cursor_h);
 }

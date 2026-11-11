@@ -138,11 +138,73 @@ int main(void) {
         check("no CPU, disk or network worker leak", threads() == initial_threads);
         check("no leaked CPU thread ports", dead_ports() == initial_dead_ports);
     }
+    /* Instant resume: a counter in RAM goes on from where it was saved, in this machine and in a new one. */
+    {
+        char snap[300];
+        snprintf(snap, sizeof snap, "%s/state.hsnap", dir);
+        /* movz x1, #0x7000, lsl 16; loop: ldr x2, [x1]; add x2, x2, #1; str x2, [x1]; b loop */
+        uint32_t code[] = {0xd2ae0001, 0xf9400022, 0x91000442, 0xf9000022, 0x17fffffd};
+        write_file(rom, code, sizeof code);
+        int rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
+        check("resume test boots", rc == 0);
+        usleep(50000);
+        rc = henge_vm_suspend(snap, "test", error, sizeof error);
+        if (rc) fprintf(stderr, "suspend: %s\n", error);
+        check("suspend saves", rc == 0 && henge_vm_state() == 4 && access(snap, F_OK) == 0);
+        volatile uint64_t *count = (volatile uint64_t *)hv_vm_board()->ram;
+        uint64_t c1 = *count;
+        usleep(20000);
+        check("paused: the counter stands still", c1 > 0 && *count == c1);
+        check("continue runs it on", henge_vm_continue() == 0 && henge_vm_state() == 1);
+        for (int n = 0; n < 1000 && *count == c1; n++) usleep(1000);
+        check("continued: the counter moves", *count > c1);
+        rc = henge_vm_suspend(snap, "test", error, sizeof error);
+        uint64_t c2 = *count;
+        check("second suspend saves", rc == 0 && c2 > c1);
+        henge_vm_stop();
+        check("a paused Mac stops", henge_vm_state() == 2 && hv_vm_board()->ram == NULL);
+        uint64_t bytes = 0;
+        check("the save is whole", henge_vm_saved_ok(snap, "test", &bytes, NULL) == 0 && bytes > 0);
+        check("another ident is refused", henge_vm_saved_ok(snap, "other", NULL, NULL) != 0);
+        rc = henge_vm_resume(rom, disk, aux, 1, 0, 64, 2, snap, "other", error, sizeof error);
+        check("resume with another ident fails and leaves it startable", rc != 0 && henge_vm_can_start());
+        check("a failed resume uses the file up too", access(snap, F_OK) != 0);
+        /* Save again (the failed resume took the file), then resume it properly. */
+        rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
+        usleep(30000);
+        rc |= henge_vm_suspend(snap, "test", error, sizeof error);
+        c2 = *(volatile uint64_t *)hv_vm_board()->ram;
+        henge_vm_stop();
+        rc |= henge_vm_resume(rom, disk, aux, 1, 0, 64, 2, snap, "test", error, sizeof error);
+        if (rc) fprintf(stderr, "resume: %s\n", error);
+        check("resume starts the saved Mac", rc == 0 && henge_vm_state() == 1);
+        check("the file is used once", access(snap, F_OK) != 0);
+        count = (volatile uint64_t *)hv_vm_board()->ram;
+        check("resumed: the counter is where it was", *count >= c2);
+        for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
+        check("resumed: the counter moves on", *count > c2);
+        henge_vm_stop();
+        for (int n = 0; n < 3000 && henge_vm_state() != 2; n++) usleep(1000);
+        check("resumed Mac stops", henge_vm_state() == 2);
+        /* A disk written after the save: the saved Mac must not come back over it. */
+        rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
+        usleep(30000);
+        rc |= henge_vm_suspend(snap, "test", error, sizeof error);
+        henge_vm_stop();
+        int dfd = open(disk, O_WRONLY);
+        check("disk changed", dfd >= 0 && pwrite(dfd, "x", 1, 4096) == 1);
+        if (dfd >= 0) close(dfd);
+        check("save before the disk changes", rc == 0);
+        rc = henge_vm_resume(rom, disk, aux, 1, 0, 64, 2, snap, "test", error, sizeof error);
+        check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
+        check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
+        unlink(snap);
+    }
     hv_vm_destroy();
     atomic_store(&reader_done, 1);
     pthread_join(reader, NULL);
     hv_jit_region_close(&jit);
     unlink(rom); unlink(disk); unlink(aux); rmdir(dir);
-    printf("VM lifecycle: 12 power cycles and 3 failed boots, %d failures\n", failures);
+    printf("VM lifecycle: 12 power cycles, 3 failed boots and a suspend/resume, %d failures\n", failures);
     return failures != 0;
 }

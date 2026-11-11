@@ -199,6 +199,9 @@ static uint8_t *alloc_no_footprint(uint64_t size) {
 /* A mapped file's page is slow to touch the first time and as fast as any other
    afterwards, so a background thread gets there before the guest does. Adding
    zero dirties the page without changing it, whatever the guest has written. */
+/* An Apple register block's bytes (64 KB), for saving the machine. */
+uint8_t *hv_vmapple_avp_regs(void *avp) { return avp ? ((AvpRegs *)avp)->regs : NULL; }
+
 struct PrefaultArgs {
     uint8_t *ram;
     uint64_t size;

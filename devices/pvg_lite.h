@@ -64,4 +64,16 @@ int hv_pvg_trace_on(void);
 void hv_pvg_lite_set_mode(uint32_t width, uint32_t height);
 void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm);
 
+/* Instant resume (host/snapshot.c). State blobs: called with out NULL they return the size needed. */
+size_t hv_pvg_lite_state(HvPvgLite *p, void *out, size_t cap);
+int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len);
+void hv_pvg_lite_quiesce(HvPvgLite *p);
+size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap);
+void hv_pvg_lite_set_display_state(HvPvgLite *p, const void *in, size_t len);
+#include <stdio.h>
+void hv_pvg_lite_debug(HvPvgLite *p, FILE *f);
+void hv_pvg_metal_quiesce(HvPvgMetal *m);
+size_t hv_pvg_metal_display_state(HvPvgMetal *m, void *out, size_t cap);
+void hv_pvg_metal_set_display_state(HvPvgMetal *m, const void *in, size_t len);
+
 #endif

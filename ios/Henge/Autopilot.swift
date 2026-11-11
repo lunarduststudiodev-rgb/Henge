@@ -139,6 +139,25 @@ enum Autopilot {
         case "balloon": // "balloon 2048": ask the Mac to hand 2 GB of its memory back (needs HV_BALLOON in henge-env.txt)
             let got = henge_vm_balloon(Int(arg) ?? -1)
             HengeLog.log("autopilot", got < 0 ? "no balloon (set HV_BALLOON in henge-env.txt)" : "balloon: the Mac has handed over \(got) MB")
+        case "tlsamples": // the sample Mac programs into Documents/Mac Apps (Mac apps without macOS)
+            guard let dmg = Bundle.main.url(forResource: "tl-samples", withExtension: "dmg") else { HengeLog.log("autopilot", "no samples in this build"); break }
+            try? FileManager.default.createDirectory(at: MacAppsStore.folder, withIntermediateDirectories: true)
+            var err = [CChar](repeating: 0, count: 512)
+            let n = henge_tl_import_dmg(dmg.path, MacAppsStore.folder.path, &err, err.count)
+            HengeLog.log("autopilot", "tlsamples: \(n) copied \(String(cString: err))")
+        case "tl": // "tl Hello (C)": run a program from Documents/Mac Apps (or a path) through the translation layer; output to the log
+            let url = arg.hasPrefix("/") ? URL(fileURLWithPath: arg) : MacAppsStore.folder.appendingPathComponent(arg)
+            guard let app = MacApp(url: url) else { HengeLog.log("autopilot", "tl: \(url.path) is not a Mac app or program"); break }
+            let out = MacAppsStore.output(for: app)
+            let exe = app.executable
+            let (rc, why) = await Task.detached { () -> (Int32, String) in
+                var err = [CChar](repeating: 0, count: 512)
+                let rc = henge_tl_run(exe, out.path, &err, err.count)
+                return (rc, String(cString: err))
+            }.value
+            let text = (try? String(contentsOf: out, encoding: .utf8)) ?? ""
+            HengeLog.log("autopilot", "tl: \(app.name) returned \(rc) \(why)")
+            for line in text.prefix(4000).split(separator: "\n").prefix(40) { HengeLog.log("tl-out", String(line)) }
         case "log": // already in the log; the wall clock too, to line it up with things measured elsewhere
             HengeLog.log("autopilot", String(format: "at %.3f", Date().timeIntervalSince1970))
         case "stop":

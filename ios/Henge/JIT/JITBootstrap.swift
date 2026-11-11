@@ -60,12 +60,20 @@ enum JITBootstrap {
     /// The one region HengeVM's translator gets for the whole session (it flushes and starts over when full,
     /// never asks for more). 1 GB takes about 1.5 s to prepare, and a first boot through Setup makes that much code; a full flush drops all of it.
     static let codeCacheKey = "henge.perf.codeCacheMB"
-    /// 1 GB, or 1.5 GB (Settings > Performance > Code cache; without a choice there, 1.5 GB where the memory limit
-    /// has room for it: about 6 GB on 12 GB iPhones). A bigger cache fills and empties less often (macOS 27 filled
-    /// 1 GB about once a minute) and costs more memory (its blocks' records come to about 0.75 of its size). Fixed for
-    /// the launch: the region is claimed once.
-    static let defaultCodeCacheMB: Int = Entitlements.memoryLimitAtLaunch >= 5_500 << 20 ? 1536 : 1024
-    static let jitBytes: Int = ((UserDefaults.standard.object(forKey: codeCacheKey) as? Int) ?? defaultCodeCacheMB) == 1536 ? 1536 << 20 : 1024 << 20
+    /// 512 MB, 1 GB or 1.5 GB (Settings > Performance > Code cache; without a choice there, by the memory limit: 1.5 GB
+    /// with about 6 GB, as on 12 GB iPhones; 512 MB under 3.5 GB, as on 6 GB devices without the increased memory limit,
+    /// where 1 GB and its records left a 2 GB Mac too little room in Setup, #70). A bigger cache fills and empties less
+    /// often (macOS 27 filled 1 GB about once a minute) and costs more memory (its blocks' records come to about 0.75 of
+    /// its size). Fixed for the launch: the region is claimed once.
+    static let defaultCodeCacheMB: Int = Entitlements.memoryLimitAtLaunch >= 5_500 << 20 ? 1536
+        : Entitlements.memoryLimitAtLaunch >= 3_500 << 20 ? 1024 : 512
+    static let jitBytes: Int = {
+        switch (UserDefaults.standard.object(forKey: codeCacheKey) as? Int) ?? defaultCodeCacheMB {
+        case 1536: return 1536 << 20
+        case 512: return 512 << 20
+        default: return 1024 << 20
+        }
+    }()
 
     /// True once the region is held. The memory budget needs this: after a
     /// prewarm the JIT is already counted in the footprint, so subtracting it

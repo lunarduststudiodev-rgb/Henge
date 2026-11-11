@@ -75,6 +75,9 @@ targets:
           - "-lpcre2-8"
           - "-liconv"
           - "-lresolv"
+          - "-lcompression"
+          - "-lhengetl"
+          - "-lbz2"
           # On-device pairing for Built-in StikJIT (from Husk's src/rppairing-ios).
           - "-lhusk_rppairing"
           - "-framework"
@@ -95,7 +98,7 @@ targets:
         script: |
           set -e
           cd "$SRCROOT/.."
-          make ios-lib build/henge-agent.gz
+          make ios-lib build/henge-agent.gz build/tl-samples.dmg
           ./tools/build_ios_restore.sh
         basedOnDependencyAnalysis: false
     postBuildScripts:
@@ -104,6 +107,8 @@ targets:
         script: |
           set -e
           cp "$SRCROOT/../build/henge-agent.gz" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/henge-agent.gz"
+          rm -f "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/tl-samples.dmg"
+          cp -X "$SRCROOT/../build/tl-samples.dmg" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/tl-samples.dmg"
         basedOnDependencyAnalysis: false
       - name: Embed StikJIT
         # As in Husk: the helper links StikJIT; it lives in the app's Frameworks
