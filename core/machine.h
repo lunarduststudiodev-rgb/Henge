@@ -69,6 +69,10 @@ typedef struct HvBlock {
 /* Counters for --stats: where the time goes. */
 typedef struct HvStats {
     uint64_t blocks, translations, block_flushes;
+    /* Two CPUs translating the same block: ours given up before it took room in the region, or after
+       (placed, then found to be a duplicate: that room stays used until the next full flush), and the
+       hot words of those. */
+    uint64_t dup_skipped, dup_placed, dup_placed_words;
     uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
     uint64_t chained, ijc_fills, ijc_resets;
     uint64_t xchained;
