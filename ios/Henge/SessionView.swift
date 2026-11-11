@@ -102,7 +102,7 @@ struct SessionView: View {
     /// The reveal hint is for controls the keyboard tucked away, not ones the person hid.
     @State private var revealHintTyping = false
     /// Off: hidden controls leave no handle, and only three fingers on the screen bring them back.
-    @AppStorage("henge.controls.handle") private var controlsHandleShown = true
+    @AppStorage("henge.controls.handle") private var controlsHandleShown = false
     @State private var showRevealHint = false
     /// Why no on-screen keyboard came up: a hardware keyboard is connected (perhaps a Mac's, by Universal Control).
     @State private var keyboardNotice: String?
