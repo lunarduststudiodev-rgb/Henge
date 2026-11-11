@@ -9,7 +9,7 @@ struct InstallView: View {
     @State private var downloadError: String?
     @State private var jitReady = JITBootstrap.ready
     @StateObject private var display = DisplayRouter()
-    @State private var release = MacOSRelease.all.first(where: Installer.haveImage) ?? MacOSRelease.all[0]
+    @State private var release = MacOSRelease.all.first(where: Installer.haveImage) ?? MacOSRelease.recommended
     @State private var name = "Mac"
     @State private var ramGB = Device.suggestedRAMGB
     @State private var deleteAfter = false

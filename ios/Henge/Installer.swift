@@ -9,9 +9,17 @@ struct MacOSRelease: Identifiable, Hashable {
     let bytes: Int64
     let note: String
 
-    /// The builds offered, newest last. Apple's catalog (mesu.apple.com) only lists the newest;
+    /// The builds offered, oldest first. Apple's catalog (mesu.apple.com) only lists the newest;
     /// these are the same images from Apple's CDN, and Apple still signs them for virtual Macs.
     static let all: [MacOSRelease] = [
+        /* macOS Monterey 12.6 (21G115, 2022FallFCS/fullrestores/012-40537/0EC7C669-13E9-49FB-BD64-9EECC1D174B2) installs and boots,
+           but its GPU driver (protocol 0x1f) never starts WindowServer's GPU work under Henge yet: not offered until it does. */
+        MacOSRelease(id: "22G120", name: "macOS Ventura 13.6",
+                     url: URL(string: "https://updates.cdn-apple.com/2023FallFCS/fullrestores/042-55833/C0830847-A2F8-458F-B680-967991820931/UniversalMac_13.6_22G120_Restore.ipsw")!,
+                     bytes: 12_297 << 20, note: "The smallest download (and about 35 GB in all), for devices short on storage."),
+        MacOSRelease(id: "23G93", name: "macOS Sonoma 14.6.1",
+                     url: URL(string: "https://updates.cdn-apple.com/2024SummerFCS/fullrestores/062-52859/932E0A8F-6644-4759-82DA-F8FA8DEA806A/UniversalMac_14.6.1_23G93_Restore.ipsw")!,
+                     bytes: 14_106 << 20, note: "A smaller download than Sequoia (and about 40 GB in all)."),
         MacOSRelease(id: "24G90", name: "macOS Sequoia 15.6.1",
                      url: URL(string: "https://updates.cdn-apple.com/2025SummerFCS/fullrestores/093-10809/CFD6DD38-DAF0-40DA-854F-31AAD1294C6F/UniversalMac_15.6.1_24G90_Restore.ipsw")!,
                      bytes: 16_035 << 20, note: "Recommended: the version Henge is tested with."),
@@ -27,6 +35,9 @@ struct MacOSRelease: Identifiable, Hashable {
                      url: URL(string: "https://updates.cdn-apple.com/2026FallSeed/53df7654-4865-4259-8dae-30177b76f104/UniversalMac_27.3_26C5035r_Restore.ipsw")!,
                      bytes: 25_946 << 20, note: "Beta. The touchscreen MacBook Pro's touch: bigger menus and window buttons. Not tested with Henge yet."),
     ]
+
+    /// Selected in the Install tab when nothing is downloaded yet: the one Henge is tested with most.
+    static let recommended = all.first { $0.id == "24G90" } ?? all[0]
 
     /// The least memory (MB) the Mac gets while this macOS installs. Sequoia and Tahoe restore with 2 GB. macOS 27's
     /// iBoot panics with 3 GB before the restore starts (#42, 27.2 on an 8 GB iPad) and installs with 4 GB (#26), so it

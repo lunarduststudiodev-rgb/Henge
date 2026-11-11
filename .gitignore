@@ -3,6 +3,9 @@ build/
 DerivedData/
 xcuserdata/
 .DS_Store
+*.ipa
+*.tipa
+Henge-*/
 
 # Private working folders (notes, trackers, logs, local tools): never published
 local/
