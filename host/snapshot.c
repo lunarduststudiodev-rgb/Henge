@@ -506,6 +506,9 @@ static void save_devices(W *w, HvVmapple *b) {
         uint64_t wc[4] = {atomic_load(&d->written), atomic_load(&d->consumed), d->underruns, d->xfers};
         w_section(w, VSND, wc, sizeof wc);
         w_section(w, VSND, RANGE(d, pending, ptail));
+        /* the input stream (HV_MIC): its parameters and the capture buffers it holds; what was recorded is not kept */
+        w_section(w, VSND, RANGE(d, in_channels, in_running));
+        w_section(w, VSND, RANGE(d, in_pending, in_tail));
     }
     if (b->balloon) {
         save_virtio(w, VBAL, &b->balloon->vio);
@@ -562,7 +565,8 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
         HvVirtioSnd *d = b->snd;
         uint64_t wc[4];
         if (load_virtio(r, VSND, &d->vio) || R_RANGE(r, VSND, d, channels, running) || r_section(r, VSND, d->ring, HV_VSND_RING) ||
-            r_section(r, VSND, wc, sizeof wc) || R_RANGE(r, VSND, d, pending, ptail))
+            r_section(r, VSND, wc, sizeof wc) || R_RANGE(r, VSND, d, pending, ptail) ||
+            R_RANGE(r, VSND, d, in_channels, in_running) || R_RANGE(r, VSND, d, in_pending, in_tail))
             return -1;
         atomic_store(&d->written, wc[0]), atomic_store(&d->consumed, wc[1]);
         d->underruns = wc[2], d->xfers = wc[3];
