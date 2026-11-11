@@ -22,6 +22,7 @@
 #ifndef HV_PVG_METALLIB_H
 #define HV_PVG_METALLIB_H
 
+#include "metallib.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>

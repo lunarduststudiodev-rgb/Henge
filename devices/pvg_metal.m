@@ -54,7 +54,7 @@ static int cursor_scale(void) {
 #include "pvg_validate.h"
 #include "pvg_video.h"
 #include "ramfile.h"
-#include "pvg_metallib.h"
+#include "metallib.h"
 
 #if !TARGET_OS_IPHONE
 #import <CoreGraphics/CoreGraphics.h>
@@ -443,7 +443,7 @@ static void over_surface(HvObject *o) {
     NSMutableSet<NSData *> *surface_shapes;
     double video_scan_time, video_upload_time, video_wait_time;
     /* GPU code this OS refused (libraries, even relabelled, and pipelines from relabelled ones), and libraries it took
-       only relabelled (pvg_metallib.h). */
+       only relabelled (metallib.h). */
     _Atomic uint32_t libs_refused, libs_lowered;
     /* Work the GPU has not finished, and the guest's work until its completion's part on complete_q is done too.
        Stamps are given back in the order they came: the GPU's completion handlers run in the order of commit, and
@@ -971,21 +971,19 @@ static HvTexDesc made_desc(id<MTLTexture> t) {
     return stand_in;
 }
 
-/* A library this OS refused, tried once more relabelled for an older Metal (pvg_metallib.h: macOS 15's on iPadOS 17). */
+/* A library this OS refused, tried once more relabelled for an older Metal (metallib.h: macOS 15's on iPadOS 17). */
 - (id<MTLLibrary>)lowered:(NSData *)sent {
+    const char *why = NULL;
     NSMutableData *copy = [sent mutableCopy];
-    uint32_t format = hv_metallib_format(copy.bytes, copy.length);
-    if (hv_metallib_lower(copy.mutableBytes, copy.length) != 1) return nil;
+    if (hv_metallib_relabel(copy.mutableBytes, copy.length, 2, &why) <= 0) return nil;
     dispatch_data_t data = dispatch_data_create(copy.bytes, copy.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
     NSError *again = nil;
     id<MTLLibrary> library = [device newLibraryWithData:data error:&again];
     if (library) {
         atomic_fetch_add(&libs_lowered, 1);
-        [self complain:[NSString stringWithFormat:@"library: format %u.%u refused, loaded as %d.%d (an older iOS's Metal)",
-                        format >> 16, format & 0xffff, HV_MTLB_LEGACY_MAJOR, HV_MTLB_LEGACY_MINOR]];
+        [self complain:[NSString stringWithFormat:@"library: relabelled for iOS 17%@", why ? [NSString stringWithFormat:@" (%s)", why] : @""]];
     } else {
-        [self complain:[NSString stringWithFormat:@"library: format %u.%u refused, and as %d.%d: %@", format >> 16, format & 0xffff,
-                        HV_MTLB_LEGACY_MAJOR, HV_MTLB_LEGACY_MINOR, again.localizedDescription]];
+        [self complain:[NSString stringWithFormat:@"library: relabelled for iOS 17, but still refused: %@", again.localizedDescription]];
     }
     return library;
 }

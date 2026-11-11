@@ -118,10 +118,11 @@ struct SettingsView: View {
                 Toggle("Superblocks (experimental)", isOn: $superblocks)
                 Toggle("High-priority CPUs (experimental)", isOn: $highPriority)
                 Picker("Code cache", selection: $codeCacheMB) {
+                    Text("512 MB").tag(512)
                     Text("1 GB").tag(1024)
                     Text("1.5 GB").tag(1536)
                 }
-                Text("A bigger code cache empties less often and takes more memory; Henge picks 1.5 GB where there is room for it. Applies the next time Henge opens. If JIT stops turning on, choose 1 GB.")
+                Text("A bigger code cache empties less often and takes more memory (about 1.75 times its size); Henge picks one by its memory limit: 1.5 GB where there is plenty, 512 MB where there is little. Applies the next time Henge opens. If JIT stops turning on, or a Mac closes Henge during setup, choose a smaller one.")
                     .font(.footnote).foregroundStyle(.secondary)
                 Text("60 Hz leaves more of the emulated CPU to apps. Faster disk writes order them without waiting for a full sync; a sudden power loss could lose the last ones. Quicker wake keeps an idle CPU watching for work for 50 µs, at some battery cost. Superblocks let translated code run past conditional branches. Changes apply the next time a Mac starts.")
                     .font(.footnote).foregroundStyle(.secondary)

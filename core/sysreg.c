@@ -209,6 +209,9 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
     case R(3, 0, 4, 0, 0): cpu->spsr_el1 = v; return 0;
     case R(3, 0, 4, 0, 1): cpu->elr_el1 = v; return 0;
     case R(3, 0, 1, 0, 0): { /* SCTLR: xnu flips the PAC enables (EnIA/IB/DA/DB) on every process switch */
+        /* No AArch32 at EL0: ITD and SED read as 1 and CP15BEN as 0, whatever is written. macOS 12 reads SCTLR back
+           on its way to user mode and spins for ever if it is not exactly what it expects (0x10007414519d). */
+        v = (v | 1u << 7 | 1u << 8) & ~(uint64_t)(1u << 5);
         uint64_t changed = cpu->sctlr_el1 ^ v;
         cpu->sctlr_el1 = v;
         if (changed & (1u | 1u << 19 | 1u << 24 | 1u << 25)) { /* M, WXN, E0E, EE: what translations depend on */

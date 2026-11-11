@@ -1668,6 +1668,15 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
         put_load_field(e, rt, off);
         return 1;
     }
+    case SR(3, 0, 2, 0, 2): /* TCR_EL1, PAR_EL1: reads (writes change translation; PAR is written by AT) */
+    case SR(3, 0, 7, 4, 0):
+        if (!read || !el1) return 0;
+        put_load_field(e, rt, reg == SR(3, 0, 2, 0, 2) ? HV_CPU_TCR_EL1 : HV_CPU_PAR_EL1);
+        return 1;
+    case SR(3, 0, 4, 2, 3): /* PAN: a block is translated for one PAN state (HV_BLOCK_PAN) and every write ends it */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, (e->flags & HV_BLOCK_PAN) ? HV_PSTATE_PAN : 0);
+        return 1;
     case SR(3, 0, 4, 1, 0): /* SP_EL0: only while it is banked (SPSel = 1) */
         if (!el1 || !spx) return 0;
         if (read) put_load_field(e, rt, HV_CPU_SP_EL0);

@@ -29,7 +29,7 @@ B = build
 CORE = $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu.o $(B)/memop.o \
        $(B)/exception.o $(B)/sysreg.o $(B)/rosetta.o $(B)/machine.o $(B)/ramfile.o $(B)/saveguard.o
 HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o
-DEV = $(B)/pvg_lite.o $(B)/pvg_metal.o $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
+DEV = $(B)/pvg_lite.o $(B)/pvg_metal.o $(B)/metallib.o $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_fs.o $(B)/virtio_net.o $(B)/virtio_input.o $(B)/virtio_snd.o $(B)/virtio_usb.o $(B)/virtio_balloon.o $(B)/xhci.o $(B)/usb_storage.o $(B)/usb_audio.o $(B)/usb_video.o $(B)/vmapple.o $(B)/aes.o $(B)/pl061.o $(B)/power_source.o $(B)/frame_pace.o
 ENGINE = $(CORE) $(HOST)
 # Suspend (core/snapshot.h): apart from the engine, since it needs libcompression.
