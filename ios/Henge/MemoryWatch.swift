@@ -46,6 +46,11 @@ final class MemoryWatch {
     private var lastForced = Date.distantPast
     private var critical = false
     private var forget: DispatchWorkItem?
+    private var release: DispatchWorkItem?
+    /// The most of the Mac's memory asked back from it: a third. More and macOS itself runs short and swaps.
+    private static let balloonShare: UInt64 = 3
+    /// How long memory has been normal before the Mac gets some of its memory back, and between two such steps.
+    private static let releaseAfter: TimeInterval = 120
 
     private static let lock = NSLock()
     private static var criticalAtValue: Date?
@@ -85,6 +90,8 @@ final class MemoryWatch {
 
     /// On the queue. Signs within half a second are one warning (UIKit's and the pressure source's come together).
     private func sign(_ what: String, critical: Bool) {
+        release?.cancel() // short again: the Mac keeps what it has given
+        release = nil
         if var g = gathering {
             g.signs.append(what)
             g.critical = g.critical || critical
@@ -125,6 +132,20 @@ final class MemoryWatch {
                 let why = g.critical ? "a flush was forced \(Int(since)) s ago" : "not critical"
                 gave.append("translation tables: as the code cache next makes room (\(why); \(done) given back before)")
             }
+            // The Mac's own spare memory (Settings > Memory; devices/virtio_balloon.c): macOS chooses what it can do
+            // without, its file cache first, and those pages go back to iPadOS. Without this iPadOS takes pages of
+            // the Mac's memory itself, by compressing whichever it likes, and the Mac's CPUs wait for them to come back.
+            let have = henge_vm_balloon(-1)
+            if have >= 0 {
+                let most = Int(Self.guestRAMMB / Self.balloonShare)
+                let want = min(most, have + (g.critical ? 1024 : 512))
+                if want > have {
+                    _ = henge_vm_balloon(want)
+                    gave.append("the Mac's spare memory: asked it for \(want) MB (it has given \(have) MB)")
+                } else {
+                    gave.append("the Mac's spare memory: it has given the \(have) MB it may")
+                }
+            }
         }
         let after = Self.footprint()
         let left = henge_ios_available_memory()
@@ -155,7 +176,24 @@ final class MemoryWatch {
         queue.asyncAfter(deadline: .now() + Self.criticalKept, execute: item)
     }
 
+    /// On the queue. Memory is no longer short: the Mac gets its memory back half at a time, unless iPadOS warns again.
+    private func scheduleRelease() {
+        release?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, henge_vm_state() == 1 else { return }
+            let have = henge_vm_balloon(-1)
+            guard have > 0 else { return }
+            let keep = have >= 256 ? have / 2 : 0
+            _ = henge_vm_balloon(keep)
+            HengeLog.log("memory", "memory has been normal for a while: the Mac gets \(have - keep) MB of its memory back (\(keep) MB still held)")
+            if keep > 0 { self.scheduleRelease() }
+        }
+        release = item
+        queue.asyncAfter(deadline: .now() + Self.releaseAfter, execute: item)
+    }
+
     private func backToNormal() {
+        scheduleRelease()
         guard critical else { return }
         clearCritical("iPadOS says it is back to normal")
     }

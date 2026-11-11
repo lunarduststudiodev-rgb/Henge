@@ -53,6 +53,7 @@
    (load_pvg); not in sections_fit. An older Henge passes over it. */
 #define S_PVGS TAG('P', 'V', 'G', 'S')
 #define S_POWER TAG('P', 'W', 'R', 'S') /* the virtual battery: only when the board has one */
+#define S_BALLOON TAG('B', 'A', 'L', 'N') /* the memory balloon: only when the board has one (HV_BALLOON) */
 
 #define OUT(f) HV_SNAP_OUT(o, f)
 #define IN(f) HV_SNAP_IN(in, f)
@@ -451,6 +452,27 @@ static void load_input(HvVirtioInput *d, HvSnapIn *in, const char *name) {
 /* The power source holds no buffer of the guest's (it answers one only when it has news), so its queue
    and what it last told the guest are all there is. After a load the guest is told the host's state
    again: the battery has moved on while the Mac was saved. */
+/* The balloon holds no buffer of the guest's either (each list of pages is answered as it comes): its queues,
+   what the guest was last asked for, and the two words the driver reads and writes (asked, given). The pages
+   it holds are holes in the Mac's memory, which is saved as it is. */
+static void save_balloon(HvVirtioBalloon *d, HvSnapOut *o) {
+    save_virtio(&d->vio, o);
+    uint64_t words = 0;
+    memcpy(&words, d->vio.config, 8);
+    OUT(d->applied);
+    OUT(words);
+}
+
+static void load_balloon(HvVirtioBalloon *d, HvSnapIn *in) {
+    load_virtio(&d->vio, in, "memory balloon");
+    uint64_t words = 0;
+    IN(d->applied);
+    IN(words);
+    if (in->bad) return;
+    memcpy(d->vio.config, &words, 8);
+    __atomic_store_n(&d->target, d->applied, __ATOMIC_RELEASE); /* as it was: the host asks again when it needs to */
+}
+
 static void save_power(HvPowerSource *d, HvSnapOut *o) {
     save_virtio(&d->vio, o);
     int32_t kind = d->kind;
@@ -1308,6 +1330,7 @@ static int sections_fit(HvVmapple *b, HvSnapReader *r, const char **which) {
         {S_MOUSE, b->mouse != NULL, "mouse"}, {S_TABLET, b->tablet != NULL, "touch tablet"},
         {S_SND, b->snd != NULL, "sound device"}, {S_XHCI, b->usb != NULL, "USB controller"},
         {S_FS, b->fs != NULL, "shared folders"}, {S_POWER, b->power != NULL, "battery"},
+        {S_BALLOON, b->balloon != NULL, "memory balloon"},
         {S_PVG, b->pvg != NULL, "screen"}, {HV_SNAP_GIC, 1, "interrupt controller"},
     };
     for (size_t i = 0; i < sizeof want / sizeof want[0]; i++) {
@@ -1725,6 +1748,7 @@ int hv_vmapple_snap_save(HvVmapple *b, HvSnapWriter *w) {
     if (b->usb) PUT(S_DRVS, save_drives(b->usb, o));
     if (b->fs) PUT(S_FS, save_fs(b->fs, o));
     if (b->power) PUT(S_POWER, save_power(b->power, o));
+    if (b->balloon) PUT(S_BALLOON, save_balloon(b->balloon, o));
     if (b->pvg) {
         HvSnapOut ids = {0}; /* after S_PVG: its save finished the mapper's walk first */
         PUT(S_PVG, if (!rc && save_pvg(b, w, o, &ids, deadline) != 0) rc = -1);
@@ -1779,6 +1803,7 @@ int hv_vmapple_snap_load(HvVmapple *b, HvSnapReader *r) {
     if (!rc && b->usb && load_camera(b->usb, r) != 0) rc = -1;
     GET(S_FS, "shared folders", b->fs, load_fs(b->fs, in));
     GET(S_POWER, "battery", b->power, V(load_power(b->power, in)));
+    GET(S_BALLOON, "memory balloon", b->balloon, V(load_balloon(b->balloon, in)));
     GET(S_PVG, "screen", b->pvg, load_pvg(b->pvg, r, in));
 #undef GET
 #undef V

@@ -9,6 +9,7 @@ enum EngineTuning {
     static let wfiSpinKey = "henge.perf.wfiSpin"
     static let fastFlushKey = "henge.perf.fastFlush"
     static let highPriorityKey = "henge.perf.highPriority"
+    static let balloonKey = "henge.memory.balloon"
 
     static let defaults: [String: String] = [
         // 60, not 120: every frame macOS draws is emulated and replayed, so 120 Hz
@@ -31,6 +32,8 @@ enum EngineTuning {
         // The Mac's CPU threads at the user-interactive class instead of user-initiated (host/vm.c hv_vm_cpu_qos).
         if d.bool(forKey: highPriorityKey) { env["HV_QOS"] = "ui" } else { unsetenv("HV_QOS") }
         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }
+        // The Mac gets a memory balloon, asking for nothing yet: MemoryWatch asks when iPadOS runs short.
+        if d.bool(forKey: balloonKey) { env["HV_BALLOON"] = "0" } else { unsetenv("HV_BALLOON") }
         let docs = EnvFile.documents
         // GPU command trace: on while Documents/trace-on exists (looked for once a second, so it can be toggled live).
         env["HV_PVG_TRACE_FILE"] = docs.appendingPathComponent("trace-on").path

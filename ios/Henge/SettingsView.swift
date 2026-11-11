@@ -16,6 +16,7 @@ struct SettingsView: View {
     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
     @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
     @AppStorage(EngineTuning.highPriorityKey) private var highPriority = false
+    @AppStorage(EngineTuning.balloonKey) private var memoryBalloon = false
     @AppStorage(MacPause.autoPauseKey) private var autoPause = true
     @AppStorage(MacPause.autoResumeKey) private var autoResume = true
     @AppStorage(GuestMemory.saveAheadKey) private var quickSuspend = false
@@ -65,6 +66,7 @@ struct SettingsView: View {
                 LabeledContent("Extra memory", value: Entitlements.increasedMemory ? "On" : "Off")
                 LabeledContent("Henge's limit", value: ByteText.string(UInt64(Entitlements.memoryLimitAtLaunch)))
                 LabeledContent("Free for Henge", value: ByteText.string(UInt64(henge_available_memory())))
+                Toggle("Take back the Mac's spare memory when the iPad runs short (experimental)", isOn: $memoryBalloon)
                 Text(Entitlements.increasedMemory
                      ? "A Mac's memory is kept out of this limit once JIT is on. If iOS refuses that, it uses free storage instead."
                      : "This install isn't signed with the increased memory limit entitlement. Reinstall Henge with a certificate that has it. Export your Mac first if the reinstall replaces the app's data.")
