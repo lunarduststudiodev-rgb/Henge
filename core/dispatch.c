@@ -2016,7 +2016,7 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
         if (site && off >= -(1 << 25) && off < (1 << 25)) {
             uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
             hv_jit_write(&m->jit, site, &insn, 4);
-            hv_jit_finish(&m->jit, site, 1);
+            hv_jit_finish_branch(&m->jit, site); /* B to B; the stub follows the slot meanwhile */
         }
         HV_STAT_ADD(m, chained, 1);
         if (m->stats_interval) HV_STAT_ADD(m, xchained, 1);
@@ -2030,7 +2030,7 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
     if (site && off >= -(1 << 25) && off < (1 << 25)) {
         uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
         hv_jit_write(&m->jit, site, &insn, 4);
-        hv_jit_finish(&m->jit, site, 1);
+        hv_jit_finish_branch(&m->jit, site); /* B to B; the stub follows the slot meanwhile */
     }
     uint32_t *cond = m->slot_cond[idx];
     if (cond) { /* the conditional branch to that stub, too */

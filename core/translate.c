@@ -2298,9 +2298,8 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
         hv_jit_write(&m->jit, dst, e->hot, e->nhot * 4);
         hv_jit_write(&m->jit, cold, e->cold, e->pool_at * 4);
         hv_jit_write(&m->jit, cold + e->pool_at, e->pool, e->npool * 8);
-        hv_jit_finish(&m->jit, cold, e->ncold);
     }
-    hv_jit_finish(&m->jit, dst, e->nhot);
+    hv_jit_finish2(&m->jit, dst, e->nhot, e->flat ? NULL : cold, e->flat ? 0 : e->ncold); /* one wait for both parts */
     b->code = dst;
     b->words = (uint16_t)(e->nhot + pad + e->ncold > 0xffff ? 0xffff : e->nhot + pad + e->ncold);
     b->gate = (uint32_t)(((e->flat ? dst : cold) + e->gate_at) - dst);

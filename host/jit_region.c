@@ -115,6 +115,38 @@ void hv_jit_patch(HvJitRegion *region, uint32_t *const *at, const uint32_t *word
 #endif
 }
 
+/* As sys_icache_invalidate does it (libsystem_platform: DSB, IC IVAU per 64-byte line with a DSB after every 20 for
+   the CPUs that need one, DSB, ISB), over both ranges. */
+static void ic_lines(uint32_t *start, size_t words, int *n) {
+    if (!start || !words) return;
+    uintptr_t a = (uintptr_t)start & ~(uintptr_t)63, end = (uintptr_t)(start + words);
+    for (; a < end; a += 64) {
+        __asm__ volatile("ic ivau, %0" ::"r"(a) : "memory");
+        if (++*n % 20 == 0) __asm__ volatile("dsb ish" ::: "memory");
+    }
+}
+
+void hv_jit_finish2(HvJitRegion *region, uint32_t *a, size_t na, uint32_t *b, size_t nb) {
+    (void)region;
+#if TARGET_OS_OSX
+    if (!region->rw_diff) pthread_jit_write_protect_np(1);
+#endif
+    int n = 0;
+    __asm__ volatile("dsb ish" ::: "memory");
+    ic_lines(a, na, &n);
+    ic_lines(b, nb, &n);
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+}
+
+void hv_jit_finish_branch(HvJitRegion *region, uint32_t *word) {
+    (void)region;
+#if TARGET_OS_OSX
+    if (!region->rw_diff) pthread_jit_write_protect_np(1);
+#endif
+    /* The store first (so a refetch finds the new word), then the line, with no wait for every CPU's cache. */
+    __asm__ volatile("dsb ish\n\tic ivau, %0" ::"r"((uintptr_t)word & ~(uintptr_t)63) : "memory");
+}
+
 /* Any thread: an even number of words (blocks stay 8-byte aligned), taken atomically. */
 uint32_t *hv_jit_reserve(HvJitRegion *region, size_t words) {
     words = (words + 1) & ~(size_t)1;
