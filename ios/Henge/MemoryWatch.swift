@@ -52,6 +52,25 @@ final class MemoryWatch {
     /// How long memory has been normal before the Mac gets some of its memory back, and between two such steps.
     private static let releaseAfter: TimeInterval = 120
 
+    // The compressor, watched while a Mac with a balloon runs. iPadOS often never warns: on an 8 GB iPad a 6 GB Mac
+    // ran 17 minutes with its CPUs waiting on pages iPadOS had compressed (39 freezes, 16 s) and not one warning came.
+    // So the sign used here is the work itself: pages iPadOS had to decompress, across the device (Henge is nearly
+    // all of it while a Mac runs). Much of it means the Mac holds more than the iPad can keep in memory, and the Mac
+    // is asked for some back: it gives what it can best do without (its file cache), which iPadOS could not know.
+    /// Seconds between two looks at the compressor.
+    private static let sampleEvery: TimeInterval = 10
+    /// Pages (16 KB) decompressed a second, over one look, that count as the Mac waiting on memory: 32 MB a second.
+    private static let busyPagesPerSecond: Double = 2000
+    /// And few enough that the iPad has room again.
+    private static let quietPagesPerSecond: Double = 200
+    /// Looks in a row that must be busy before the Mac is asked, and quiet before it gets some back (3 minutes).
+    private static let busyLooks = 2, quietLooks = 18
+    /// What each ask adds, MB.
+    private static let balloonStep = 256
+    private var compressorTimer: DispatchSourceTimer?
+    private var lastDecompressions: UInt64?
+    private var busyRun = 0, quietRun = 0
+
     private static let lock = NSLock()
     private static var criticalAtValue: Date?
     private static var guestRAMValue: UInt64 = 0
@@ -82,6 +101,11 @@ final class MemoryWatch {
         }
         source.resume()
         self.source = source
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.sampleEvery, repeating: Self.sampleEvery, leeway: .seconds(1))
+        timer.setEventHandler { [weak self] in self?.watchCompressor() }
+        timer.resume()
+        compressorTimer = timer
         observer = NotificationCenter.default.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil,
                                                           queue: nil) { [weak self] _ in
             self?.queue.async { self?.sign("UIKit warning", critical: false) }
@@ -174,6 +198,54 @@ final class MemoryWatch {
         let item = DispatchWorkItem { [weak self] in self?.clearCritical("no sign for \(Int(Self.criticalKept / 60)) minutes") }
         forget = item
         queue.asyncAfter(deadline: .now() + Self.criticalKept, execute: item)
+    }
+
+    /// On the queue, every `sampleEvery`. Nothing without a running Mac that has a balloon (Settings > Memory).
+    private func watchCompressor() {
+        guard henge_vm_state() == 1 else {
+            lastDecompressions = nil
+            busyRun = 0
+            quietRun = 0
+            return
+        }
+        let have = henge_vm_balloon(-1)
+        guard have >= 0, let now = Self.decompressions() else { return }
+        defer { lastDecompressions = now }
+        guard let last = lastDecompressions, now >= last else { return }
+        let rate = Double(now - last) / Self.sampleEvery
+        if rate >= Self.busyPagesPerSecond {
+            quietRun = 0
+            busyRun += 1
+            release?.cancel() // the Mac keeps what it has given
+            release = nil
+            guard busyRun >= Self.busyLooks else { return }
+            let most = Int(Self.guestRAMMB / Self.balloonShare)
+            let want = min(most, have + Self.balloonStep)
+            guard want > have else { return }
+            _ = henge_vm_balloon(want)
+            HengeLog.log("memory", "iPadOS is decompressing \(Int(rate * 16 / 1024)) MB a second of memory the Mac waits for: "
+                         + "asked the Mac for \(want) MB of its spare memory (it has given \(have) MB; at most \(most) MB)")
+        } else {
+            busyRun = 0
+            guard rate < Self.quietPagesPerSecond else { quietRun = 0; return }
+            quietRun += 1
+            guard quietRun >= Self.quietLooks, have > 0 else { return }
+            quietRun = 0
+            let keep = have >= 2 * Self.balloonStep ? have / 2 : 0
+            _ = henge_vm_balloon(keep)
+            HengeLog.log("memory", "the iPad has had room for \(Int(Double(Self.quietLooks) * Self.sampleEvery / 60)) minutes: "
+                         + "the Mac gets \(have - keep) MB of its memory back (\(keep) MB still held)")
+        }
+    }
+
+    /// Pages iPadOS has decompressed since it started, for every app together.
+    private static func decompressions() -> UInt64? {
+        var stats = vm_statistics64_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &stats) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count) }
+        }
+        return kr == KERN_SUCCESS ? UInt64(stats.decompressions) : nil
     }
 
     /// On the queue. Memory is no longer short: the Mac gets its memory back half at a time, unless iPadOS warns again.

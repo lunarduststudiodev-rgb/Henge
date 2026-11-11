@@ -67,6 +67,8 @@ struct SettingsView: View {
                 LabeledContent("Henge's limit", value: ByteText.string(UInt64(Entitlements.memoryLimitAtLaunch)))
                 LabeledContent("Free for Henge", value: ByteText.string(UInt64(henge_available_memory())))
                 Toggle("Take back the Mac's spare memory when the iPad runs short (experimental)", isOn: $memoryBalloon)
+                Text("For a Mac with more memory than this \\(Device.name) can keep at once (6 GB on an 8 GB iPad): when iPadOS starts squeezing the Mac's memory, macOS is asked to give up what it can best do without, up to a third, and gets it back when there is room. Applies the next time a Mac starts from cold.")
+                    .font(.footnote).foregroundStyle(.secondary)
                 Text(Entitlements.increasedMemory
                      ? "A Mac's memory is kept out of this limit once JIT is on. If iOS refuses that, it uses free storage instead."
                      : "This install isn't signed with the increased memory limit entitlement. Reinstall Henge with a certificate that has it. Export your Mac first if the reinstall replaces the app's data.")
