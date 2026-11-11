@@ -100,6 +100,10 @@ int henge_vm_tablet_on(void);
 void henge_vm_tablet_move(int px, int py);
 void henge_vm_tablet_button(int button, int down);
 void henge_vm_tablet_release(void);
+/* The iPad's battery, which the Mac shows as its own (menu bar, Battery settings, low-battery warnings) when
+   it was started with HV_BATTERY=1: percent 0..100, charger 1 when plugged in, charging 1 while it fills,
+   full 1 when plugged in and full. Any thread, any time, before a Mac starts too. */
+void henge_vm_set_power(double percent, int charger, int charging, int full);
 /* The Mac's screen size in display pixels. 0, or -1 when no Mac is running. */
 int henge_vm_screen(int *w, int *h);
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */

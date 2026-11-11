@@ -10,6 +10,7 @@ enum EngineTuning {
     static let fastFlushKey = "henge.perf.fastFlush"
     static let highPriorityKey = "henge.perf.highPriority"
     static let statsKey = "henge.perf.stats"
+    static let batteryKey = "henge.battery"
 
     static let defaults: [String: String] = [
         // 60, not 120: every frame macOS draws is emulated and replayed, so 120 Hz
@@ -30,6 +31,8 @@ enum EngineTuning {
         if d.bool(forKey: highPriorityKey) { env["HV_QOS"] = "ui" } else { unsetenv("HV_QOS") }
         // Instant pointer: an absolute pointing device beside the mouse (devices/xhci.c), used by HardwareMouse.
         if d.bool(forKey: HardwareMouse.instantKey) { env["HV_TABLET"] = "1" } else { unsetenv("HV_TABLET") }
+        // The Mac gets Apple's virtual battery (devices/power_source.c), fed from the iPad's (Battery.swift).
+        if d.bool(forKey: batteryKey) { env["HV_BATTERY"] = "1" } else { unsetenv("HV_BATTERY") }
         // The Mac's sound card gets an input stream only while the microphone setting is on (Microphone.swift).
         if Microphone.isOn { env["HV_MIC"] = "1" } else { unsetenv("HV_MIC") }
         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }

@@ -27,6 +27,10 @@ typedef struct HvVmConfig {
 
 /* Returns 0, or -1 with a reason in err. */
 int hv_vm_create(const HvVmConfig *cfg, char *err, size_t errlen);
+/* The host's battery, which the Mac shows as its own when it was built with HV_BATTERY=1 (devices/power_source.h):
+   percent 0..100, external 1 on a charger, charging 1 while it fills, full 1 on a charger and full. Any thread,
+   any time, before hv_vm_create too: the last state is kept for the next Mac. */
+void hv_vm_set_power(double percent, int external, int charging, int full);
 /* After CPUs stop, detach backends and release the old machine. Borrowed iOS
    JIT memory stays owned by the app and can be attached to the next machine. */
 void hv_vm_destroy(void);

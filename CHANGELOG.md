@@ -6,6 +6,13 @@ Every change keeps its original author in the git history.
 
 ## Unreleased
 
+### The iPad's battery on the Mac
+- Settings > "Show this iPad's battery on the Mac" gives the Mac Apple's virtual-Mac battery
+  (`devices/power_source.c`, PCI 0x106b:0x1a07, driven by macOS's own AppleVirtualPlatformPowerSource),
+  fed from the iPad's charge and charger state (`ios/Henge/Battery.swift`). The device and its protocol
+  notes are walriyami's (github.com/walriyami/Henge); here it is behind `HV_BATTERY=1`, off by default,
+  and takes the PCI slot after every other device. Not yet run on a device.
+
 ### Microphone
 - Settings > Sound > Microphone gives the Mac this device's microphone: the virtual sound card
   (`devices/virtio_snd.c`) offers an input stream, filled from a RemoteIO input unit

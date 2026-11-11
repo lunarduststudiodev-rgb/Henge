@@ -107,6 +107,7 @@ static uint64_t fingerprint(void) {
     MIX(sizeof(HvVirtio)), MIX(sizeof(HvVirtq)), MIX(sizeof(HvVirtioSnd)), MIX(sizeof(HvVirtioInput));
     MIX(sizeof(HvVirtioBalloon)), MIX(sizeof(HvPciDev)), MIX(sizeof(HvPcie)), MIX(sizeof(HvAes)), MIX(sizeof(HvBdif));
     MIX(sizeof(HvPl011)), MIX(sizeof(HvPl031)), MIX(sizeof(HvPl061)), MIX(sizeof(HvVmapple));
+    MIX(sizeof(HvPowerSource));
     MIX(hv_pvg_lite_state(NULL, NULL, 0)), MIX(CHUNK_PAGES), MIX(PAGE);
 #undef MIX
     return f;
@@ -480,6 +481,7 @@ static int load_virtio(R *r, uint32_t tag, HvVirtio *v) {
 #define VBAL TAG('V', 'B', 'A', 'L')
 #define VINP TAG('V', 'I', 'N', 'P')
 #define XHCI TAG('X', 'H', 'C', 'I')
+#define POWR TAG('P', 'O', 'W', 'R')
 
 static void save_devices(W *w, HvVmapple *b) {
     w_section(w, TAG('B', 'O', 'R', 'D'), b->avp_rtc, sizeof b->avp_rtc);
@@ -530,6 +532,8 @@ static void save_devices(W *w, HvVmapple *b) {
         w_section(w, XHCI, (const uint8_t *)x + offsetof(HvXhci, reports), sizeof(HvXhci) - offsetof(HvXhci, reports));
         pthread_mutex_unlock(&x->mu);
     }
+    /* The battery: only its queue. What it last told the guest is not kept: a restored one says it again. */
+    if (b->power) save_virtio(w, POWR, &b->power->vio);
     size_t pn = hv_pvg_lite_state(b->pvg, NULL, 0);
     uint8_t *pb = malloc(pn);
     if (pb && b->pvg) hv_pvg_lite_state(b->pvg, pb, pn);
@@ -581,6 +585,10 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
             r_section(r, XHCI, (uint8_t *)x + offsetof(HvXhci, usbcmd), offsetof(HvXhci, mu) - offsetof(HvXhci, usbcmd)) ||
             r_section(r, XHCI, (uint8_t *)x + offsetof(HvXhci, reports), sizeof(HvXhci) - offsetof(HvXhci, reports)))
             return -1;
+    }
+    if (b->power) {
+        if (load_virtio(r, POWR, &b->power->vio)) return -1;
+        b->power->resend = 1; /* the battery as it is now, not as it was when saved */
     }
     void *blob;
     uint64_t len;

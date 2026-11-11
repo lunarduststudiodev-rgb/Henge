@@ -20,6 +20,7 @@ struct HengeApp: App {
         JITBootstrap.installTrapGuard()
         Microphone.configureSession()
         if Microphone.isOn { Microphone.requestPermission() }
+        Task { @MainActor in MacBattery.start() } // the iPad's battery, for a Mac that shows it (Settings)
         Machines.shared.collectImports()
         // The display question: does this iOS have Apple's paravirtualized graphics at all?
         for path in ["/System/Library/Frameworks/ParavirtualizedGraphics.framework/ParavirtualizedGraphics",

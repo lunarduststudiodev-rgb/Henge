@@ -233,6 +233,7 @@ static uint64_t tick_locked(HvMachine *m, HvCpu *cpu) {
     hv_virtio_input_poll(b->mouse);
     hv_virtio_snd_poll(b->snd);
     hv_virtio_usb_poll(b->vusb);
+    hv_power_source_poll(b->power);
     hv_virtio_balloon_poll(b->balloon);
     hv_bdif_poll(b->bdif);
     return deadline; /* every GIC state change already updated the CPU's lines */
@@ -338,6 +339,12 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     return 0;
 }
 
+int hv_vmapple_add_power_source(HvVmapple *b, int kind) {
+    if (b->power) return -1;
+    b->power = hv_power_source_create(b->m, b->pcie, kind);
+    return b->power ? 0 : -1;
+}
+
 int hv_vmapple_load_rom(HvVmapple *b, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -371,6 +378,7 @@ void hv_vmapple_destroy(HvVmapple *b) {
         free(b->vusb);
     }
     if (b->snd) { free(b->snd->ring); free(b->snd); }
+    if (b->power) { pthread_mutex_destroy(&b->power->mu); free(b->power); }
     free(b->balloon);
     if (b->keyboard) { pthread_mutex_destroy(&b->keyboard->mu); free(b->keyboard); }
     if (b->mouse) { pthread_mutex_destroy(&b->mouse->mu); free(b->mouse); }

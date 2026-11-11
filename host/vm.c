@@ -242,6 +242,36 @@ uint64_t hv_vm_gpu_frames(void) {
     return pvg ? hv_pvg_lite_gpu_frames(pvg) : 0;
 }
 
+/* The host's battery, kept for a board built after it is set. */
+static pthread_mutex_t power_mu = PTHREAD_MUTEX_INITIALIZER;
+static HvPowerState power_state;
+static int power_known;
+static HvPowerSource *power_dev; /* under power_mu */
+
+void hv_vm_set_power(double percent, int external, int charging, int full) {
+    pthread_mutex_lock(&power_mu);
+    power_state = (HvPowerState){.percent = percent, .external = external != 0, .charging = charging != 0, .full = full != 0};
+    power_known = 1;
+    if (power_dev) hv_power_source_set(power_dev, &power_state);
+    pthread_mutex_unlock(&power_mu);
+}
+
+/* HV_BATTERY=1: the Mac gets Apple's virtual battery, in the PCI slot after every other device. Not on installer
+   boots. Until hv_vm_set_power is called it reads full, on a charger. */
+static void add_power_source(void) {
+    const char *e = getenv("HV_BATTERY");
+    if (!e || !atoi(e) || board.vusb) return;
+    if (hv_vmapple_add_power_source(&board, HV_POWER_BATTERY) != 0) {
+        fprintf(stderr, "hengevm: no battery for the Mac\n");
+        return;
+    }
+    fprintf(stderr, "hengevm: the Mac has a battery (HV_BATTERY)\n");
+    pthread_mutex_lock(&power_mu);
+    power_dev = board.power;
+    if (power_known) hv_power_source_set(power_dev, &power_state);
+    pthread_mutex_unlock(&power_mu);
+}
+
 int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     if (machine_created) return fail(err, errlen, "The previous machine has not been released.");
     if (primary_started) {
@@ -288,6 +318,7 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     }
     sound_on = board.snd && !c->no_sound;
     if (sound_on) hv_audio_attach(board.snd);
+    add_power_source();
     pause_state = 0;
     board.poll = board_poll;
     if (board.vusb && getenv("HV_VUSB_PROBE")) hv_usb_probe_start(board.vusb);
@@ -316,6 +347,9 @@ void hv_vm_destroy(void) {
     hv_net_detach();
     net_on = 0;
     hv_audio_detach();
+    pthread_mutex_lock(&power_mu);
+    power_dev = NULL;
+    pthread_mutex_unlock(&power_mu);
     hv_vmapple_destroy(&board);
     hv_disk_close(&disk);
     hv_disk_close(&aux);

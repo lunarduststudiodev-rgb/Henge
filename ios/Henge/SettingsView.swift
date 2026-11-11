@@ -18,6 +18,7 @@ struct SettingsView: View {
     @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
     @AppStorage(EngineTuning.highPriorityKey) private var highPriority = false
     @AppStorage(EngineTuning.statsKey) private var engineStats = true
+    @AppStorage(EngineTuning.batteryKey) private var macBattery = false
     @AppStorage(Microphone.key) private var microphone = false
     @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
     @AppStorage(DeskAppearance.key) private var appearance = DeskAppearance.system
@@ -135,6 +136,7 @@ struct SettingsView: View {
                     Toggle("Superblocks (experimental)", isOn: $superblocks)
                     Toggle("High-priority CPUs (experimental)", isOn: $highPriority)
                     Toggle("Engine statistics in the log", isOn: $engineStats)
+                    Toggle("Show this iPad's battery on the Mac (experimental)", isOn: $macBattery)
                     Picker("Code cache", selection: $codeCacheMB) {
                         Text("512 MB").tag(512)
                         Text("1 GB").tag(1024)

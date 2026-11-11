@@ -22,8 +22,11 @@ enum InstantResume {
         let build = info["CFBundleVersion"] as? String ?? "?"
         let commit = info["HengeBuildCommit"] as? String ?? "unstamped"
         let stamp = info["HengeBuildDate"] as? String ?? "?"
+        let d = UserDefaults.standard
         return "Henge \(version) (\(build)) \(commit) \(stamp) mac \(mac.id.uuidString) ram \(ramMB) cpus \(cpus) "
-            + "screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina)"
+            + "screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina) "
+            // devices a setting adds to the Mac: one saved with a device is not for a Mac built without it
+            + "battery \(d.bool(forKey: EngineTuning.batteryKey)) pointer \(d.bool(forKey: HardwareMouse.instantKey)) mic \(Microphone.isOn)"
     }
 
     /// A whole saved Mac for these settings, and when it was saved.

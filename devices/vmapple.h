@@ -14,6 +14,7 @@
 #include "virtio_blk.h"
 #include "virtio_input.h"
 #include "virtio_usb.h"
+#include "power_source.h"
 #include "xhci.h"
 #include "virtio_net.h"
 #include "virtio_snd.h"
@@ -70,6 +71,7 @@ typedef struct HvVmapple {
     HvVirtioInput *keyboard, *mouse;
     HvXhci *usb;             /* USB controller with the keyboard macOS actually uses */
     HvVirtioUsb *vusb;       /* the USB device port an installer talks to (installer boots only) */
+    HvPowerSource *power;    /* Apple's virtual battery or wall power (optional, hv_vmapple_add_power_source) */
     uint8_t *cfg, *rom, *ram;
     uint64_t ram_size;
     int ram_fd;              /* the file under guest RAM, kept open for the balloon's holes, or -1 */
@@ -84,6 +86,10 @@ typedef struct HvVmapple {
    Guest RAM is reserved, not committed: pages are only used once touched. */
 int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpus, uint64_t ram_size, HvDisk *root, HvDisk *aux,
                       const HvCfgParams *cfg, const uint8_t mac[6]);
+/* After hv_vmapple_create and before the guest runs, once: Apple's virtual power source, HV_POWER_BATTERY or
+   HV_POWER_WALL, in the next PCI slot (after every other device, so none of theirs move). Feed it with
+   hv_power_source_set(b->power, ...). 0, or -1. */
+int hv_vmapple_add_power_source(HvVmapple *b, int kind);
 /* Copies a boot ROM image into the firmware region. */
 int hv_vmapple_load_rom(HvVmapple *b, const char *path);
 /* CPU reset: EL1, MMU off, interrupts masked, at the start of the ROM. */

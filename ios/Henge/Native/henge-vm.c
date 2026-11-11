@@ -420,6 +420,9 @@ void henge_vm_tablet_release(void) {
     hv_vm_tablet_release();
     pthread_rwlock_unlock(&api_lock);
 }
+void henge_vm_set_power(double percent, int charger, int charging, int full) {
+    hv_vm_set_power(percent, charger, charging, full); /* its own lock: kept for a Mac not built yet */
+}
 int henge_vm_screen(int *w, int *h) {
     if (!lock_running()) return -1;
     hv_vm_screen(w, h);
