@@ -2932,16 +2932,35 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
         memcpy(&region, r.p + sizeof s, sizeof region);
         if (!s.width || !s.height || s.depth != 1 || s.width > e.tileWidth || s.height > e.tileHeight ||
             (uint64_t)s.width * s.height > cur_render.maxTotalThreadsPerThreadgroup) { /* both within a tile: no overflow */
-            [self complain:[NSString stringWithFormat:@"tile dispatch of %lux%lux%lu in a %lux%lu tile", (unsigned long)s.width, (unsigned long)s.height,
-                            (unsigned long)s.depth, (unsigned long)e.tileWidth, (unsigned long)e.tileHeight]];
+            /* Told with what decides it: the pipeline's own limit, and whether it wants a threadgroup a tile (on an iPad
+               the limit has come out under the 32x32 macOS dispatches, and the effect it draws is then missing) */
+            [self complain:[NSString stringWithFormat:@"tile dispatch of %lux%lux%lu in a %lux%lu tile dropped: the pipeline takes %lu threads a tile%s; pass %llux%llu",
+                            (unsigned long)s.width, (unsigned long)s.height, (unsigned long)s.depth, (unsigned long)e.tileWidth,
+                            (unsigned long)e.tileHeight, (unsigned long)cur_render.maxTotalThreadsPerThreadgroup,
+                            cur_render.threadgroupSizeMatchesTileSize ? " (a threadgroup a tile)" : "", pass_w, pass_h]];
             break;
         }
-        if (tag == 162 && (region.origin.z || region.size.depth != 1 || region.origin.x > pass_w || region.size.width > pass_w - region.origin.x ||
-                           region.origin.y > pass_h || region.size.height > pass_h - region.origin.y)) {
-            /* within the pass: Metal's debug layer takes any region, and doesn't say if it is in tiles or pixels; the pass's
-               pixels bound either */
-            [self complain:@"tile dispatch in a region past its pass"];
+        if (tag == 162 && (region.origin.z || region.size.depth != 1 || region.origin.x >= pass_w || region.origin.y >= pass_h ||
+                           !region.size.width || !region.size.height)) {
+            [self complain:[NSString stringWithFormat:@"tile dispatch in a region outside its pass dropped: %lu,%lu,%lu %lux%lux%lu in %llux%llu",
+                            (unsigned long)region.origin.x, (unsigned long)region.origin.y, (unsigned long)region.origin.z,
+                            (unsigned long)region.size.width, (unsigned long)region.size.height, (unsigned long)region.size.depth, pass_w, pass_h]];
             break;
+        }
+        if (tag == 162 && (region.size.width > pass_w - region.origin.x || region.size.height > pass_h - region.origin.y)) {
+            /* A region that starts in the pass and runs past its edge (macOS rounds one up to whole tiles, and a pass is
+               seldom whole tiles) was dropped whole, and what it draws went missing: the menu bar's backdrop among it.
+               It is cut to the pass instead. Metal's debug layer takes any region and doesn't say if it is in tiles or
+               pixels; the pass's pixels bound either, so the part inside is within both. */
+            static int told; /* the first few with their sizes: every window size would be another line */
+            if (told < 8) {
+                told++;
+                [self complain:[NSString stringWithFormat:@"tile dispatch in a region past its pass, cut to it: %lu,%lu %lux%lu in %llux%llu",
+                                (unsigned long)region.origin.x, (unsigned long)region.origin.y, (unsigned long)region.size.width,
+                                (unsigned long)region.size.height, pass_w, pass_h]];
+            }
+            if (region.size.width > pass_w - region.origin.x) region.size.width = (NSUInteger)(pass_w - region.origin.x);
+            if (region.size.height > pass_h - region.origin.y) region.size.height = (NSUInteger)(pass_h - region.origin.y);
         }
         if (![self charge:hv_pvg_sat_mul(pass_w, pass_h)]) break; /* a thread a pixel, at most */
         SEL sel = sel_registerName("dispatchThreadsPerTile:inRegion:");
