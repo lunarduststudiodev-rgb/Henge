@@ -1,4 +1,6 @@
 #include "pvg.h"
+#include "gpu_switch.h"
+#include "../host/host_fp.h"
 
 #include <sys/resource.h>
 #import <AppKit/AppKit.h>
@@ -49,6 +51,7 @@ typedef bool (^IOSFCRaiseInterrupt)(uint32_t vector);
 
 static HvVmapple *board;
 static id<PGDevice> pgdev;
+static int attached; /* hv_pvg_attach succeeded: the device is running and board is set */
 static id<PGDisplay> pgdisp;
 static PGIOSurfaceHostDevice *iosfc;
 static id<MTLDevice> mtl;
@@ -66,6 +69,9 @@ static PGMemoryMapDescriptor *memory_map(void) {
     PGMemoryMapDescriptor *map = [PGMemoryMapDescriptor new];
     for (int i = 0; i < board->m->nram; i++) {
         HvRam *r = &board->m->ram[i];
+        /* Kept in files (Quick Suspend): the framework writes it unseen, so no save of this run can trust the
+           files' pages: every one is whole */
+        if (r->file) hv_ramfile_gpu_map(r->host, NULL, 1);
         [map addRange:(PGGuestPhysicalRange_t){r->pa, r->size, r->host}];
     }
     return map;
@@ -250,7 +256,9 @@ static void new_frame(void) {
 static int pvg_trace = -1;
 static double trace_t0;
 
-static void trace(const char *dev, int write, uint64_t off, uint64_t v, unsigned size) {
+/* The time is floating point: under the host's FPCR (host/host_fp.h), as the MMIO handlers call this on the CPU
+   thread outside their own brackets. */
+static HV_HOST_FP_WORK void trace_fp(const char *dev, int write, uint64_t off, uint64_t v, unsigned size) {
     if (pvg_trace < 0) {
         pvg_trace = getenv("HV_PVG_TRACE") ? atoi(getenv("HV_PVG_TRACE")) : 0;
         trace_t0 = [NSDate timeIntervalSinceReferenceDate];
@@ -259,6 +267,13 @@ static void trace(const char *dev, int write, uint64_t off, uint64_t v, unsigned
     fprintf(stderr, "pvgtrace %.4f %s %s +%04llx = %llx (%u) pc %llx\n", [NSDate timeIntervalSinceReferenceDate] - trace_t0,
             dev, write == 2 ? "IRQ" : write ? "W" : "R", (unsigned long long)off, (unsigned long long)v, size,
             (unsigned long long)board->m->access_pc);
+}
+
+static void trace(const char *dev, int write, uint64_t off, uint64_t v, unsigned size) {
+    if (!pvg_trace) return;
+    HvHostFp fp = hv_host_fp_begin();
+    trace_fp(dev, write, off, v, size);
+    hv_host_fp_end(fp);
 }
 
 /* HV_PVG_TRACE=2 also dumps what the guest puts in the FIFO and what the
@@ -396,10 +411,13 @@ static void trace_data(int write, uint64_t off, uint64_t v) {
     }
 }
 
+/* ParavirtualizedGraphics on the CPU that made the access: the host's FPCR around it (host/host_fp.h). */
 static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
     (void)opaque;
+    HvHostFp fp = hv_host_fp_begin();
     uint64_t v = [pgdev mmioReadAtOffset:off];
     if (size == 8) v |= (uint64_t)[pgdev mmioReadAtOffset:off + 4] << 32;
+    hv_host_fp_end(fp);
     trace("gfx", 0, off, v, size);
     return v;
 }
@@ -408,13 +426,17 @@ static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     (void)opaque;
     trace("gfx", 1, off, v, size);
     trace_data(1, off, v);
+    HvHostFp fp = hv_host_fp_begin();
     [pgdev mmioWriteAtOffset:off value:(uint32_t)v];
     if (size == 8) [pgdev mmioWriteAtOffset:off + 4 value:(uint32_t)(v >> 32)];
+    hv_host_fp_end(fp);
 }
 
 static uint64_t iosfc_read(void *opaque, uint64_t off, unsigned size) {
     (void)opaque;
+    HvHostFp fp = hv_host_fp_begin();
     uint64_t v = [iosfc mmioReadAtOffset:off];
+    hv_host_fp_end(fp);
     v = size == 8 ? v : v & ((1ull << (size * 8)) - 1);
     trace("iosfc", 0, off, v, size);
     return v;
@@ -431,7 +453,9 @@ static void iosfc_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
         if (q) dump_hex("iosfc-cmd", io_ring + ((v - 1) & 0x3ff) * 0x40, q, 0x40);
     }
     (void)io_done;
+    HvHostFp fp = hv_host_fp_begin();
     [iosfc mmioWriteAtOffset:off value:v];
+    hv_host_fp_end(fp);
 }
 
 void hv_pvg_poll(void) {
@@ -450,12 +474,18 @@ static void swap_handlers(const char *name, uint64_t (*rd)(void *, uint64_t, uns
 }
 
 int hv_pvg_attach(HvVmapple *b, const char *screenshot) {
+    const char *off = hv_gpu_switched_off();
+    if (off) { /* no GPU device, so no ParavirtualizedGraphics device either: it would make one of its own */
+        fprintf(stderr, "hengevm: pvg: %s is set: no GPU device\n", off);
+        return -1;
+    }
     board = b;
     shot_path = screenshot;
     if (getenv("HV_SHOT_SECS")) shot_every = atof(getenv("HV_SHOT_SECS"));
     attach_time = [NSDate timeIntervalSinceReferenceDate];
     @autoreleasepool {
-        mtl = MTLCreateSystemDefaultDevice();
+        mtl = hv_gpu_device();
+        if (!mtl) return -1;
         mtl_queue = [mtl newCommandQueue];
 
         PGIOSurfaceHostDeviceDescriptor *idesc = [PGIOSurfaceHostDeviceDescriptor new];
@@ -523,6 +553,7 @@ int hv_pvg_attach(HvVmapple *b, const char *screenshot) {
     }
     swap_handlers("gfx", gfx_read, gfx_write);
     swap_handlers("iosurface", iosfc_read, iosfc_write);
+    attached = 1;
     return 0;
 }
 
@@ -633,17 +664,18 @@ static void key(uint16_t mac, int down) {
 - (void)mouseUp:(NSEvent *)e {
     if (self.captured) [self button:HV_BTN_LEFT down:0];
 }
+/* In the codes macOS's driver makes those buttons of (virtio_input.h): BTN_RIGHT would be a middle click. */
 - (void)rightMouseDown:(NSEvent *)e {
-    if (self.captured) [self button:HV_BTN_RIGHT down:1];
+    if (self.captured) [self button:HV_BTN_SECONDARY down:1];
 }
 - (void)rightMouseUp:(NSEvent *)e {
-    if (self.captured) [self button:HV_BTN_RIGHT down:0];
+    if (self.captured) [self button:HV_BTN_SECONDARY down:0];
 }
 - (void)otherMouseDown:(NSEvent *)e {
-    if (self.captured) [self button:HV_BTN_MIDDLE down:1];
+    if (self.captured) [self button:HV_BTN_TERTIARY down:1];
 }
 - (void)otherMouseUp:(NSEvent *)e {
-    if (self.captured) [self button:HV_BTN_MIDDLE down:0];
+    if (self.captured) [self button:HV_BTN_TERTIARY down:0];
 }
 - (void)scrollWheel:(NSEvent *)e {
     if (!self.captured) return;
@@ -673,7 +705,13 @@ static void key(uint16_t mac, int down) {
 }
 @end
 
+int hv_pvg_running(void) { return attached; } /* set before the CPU and input threads start */
+
 void hv_pvg_window_run(void) {
+    if (!attached) { /* nothing to show, and its keys and clicks would go to a board it was never given */
+        fprintf(stderr, "hengevm: pvg: no graphics device, so no window\n");
+        return;
+    }
     @autoreleasepool {
         NSApplication *app = NSApplication.sharedApplication;
         app.activationPolicy = NSApplicationActivationPolicyRegular;

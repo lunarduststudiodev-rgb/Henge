@@ -22,26 +22,14 @@ import os
 enum HengeLog {
     private static let osLog = Logger(subsystem: "com.henge.app", category: "henge")
 
-    /// Exposed because a C signal handler closure cannot capture context.
-    fileprivate static var rawLogFD: Int32 { logFD }
     private static var logFD: Int32 = -1
-    fileprivate static var pipeReadFD: Int32 = -1
-
-    /// Scratch space for the crash handler, taken before it is needed.
-    /// Nothing inside a signal handler may allocate.
-    fileprivate static let crashBuf =
-        UnsafeMutableRawPointer.allocate(byteCount: 8192, alignment: 16)
-
-    /// Frame pointers for the crash backtrace, taken before they are needed.
-    fileprivate static let crashFrames =
-        UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 64)
+    private static var pipeReadFD: Int32 = -1
     private static var pipeWriteFD: Int32 = -1
     /// HV_LOG_CONSOLE: a copy of the original stderr, so `devicectl device process launch --console` (and Xcode's
     /// console) can follow the log live. `colorprobe` (any text) mirrors only lines containing it; `all` mirrors everything.
     private static var consoleFD: Int32 = -1
     private static var consoleFilter: String?
     private static var started = false
-    private static let writeLock = NSLock()
     private static let startTime = Date()
 
     /// Recent lines, for the in-app viewer. Bounded so a long session cannot grow
@@ -82,11 +70,50 @@ enum HengeLog {
         try? FileManager.default.removeItem(at: prev)
         try? FileManager.default.moveItem(at: url, to: prev)
         logFD = open(url.path, O_CREAT | O_WRONLY | O_TRUNC, 0o644)
+        // The file is written by a thread of its own (henge-logq.c): a write(2) to it took up to 0.65 s on the main
+        // thread while the iPad's storage was busy (freeze recorder, 8 Nov 2026). Logging now only copies the line
+        // into memory; the crash handler and exit() still get what is queued out.
+        if logFD >= 0, henge_logq_start(logFD) != 0 {
+            log("boot", "WARNING: no log writer thread; henge.log is written by whoever logs")
+        }
 
         redirectStdio()
         installCrashHandlers()
+        flushWithTheApp()
         logBanner()
         replayPreviousNativeLog()
+    }
+
+    /// What is queued for the file is written before iOS can stop the app: on going to the background (it may be
+    /// suspended and then killed without a word, which loses what is still in memory), on a memory warning (a
+    /// memory kill gives no warning of its own), and as it is closed.
+    private static func flushWithTheApp() {
+        let centre = NotificationCenter.default
+        centre.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { _ in
+            // Not on the main thread: a background task keeps the app running until the writer has caught up.
+            var task = UIBackgroundTaskIdentifier.invalid
+            task = UIApplication.shared.beginBackgroundTask(withName: "henge.log") {
+                UIApplication.shared.endBackgroundTask(task)
+                task = .invalid
+            }
+            DispatchQueue.global(qos: .userInitiated).async {
+                henge_logq_sync(5)
+                DispatchQueue.main.async {
+                    if task != .invalid { UIApplication.shared.endBackgroundTask(task); task = .invalid }
+                }
+            }
+        }
+        centre.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: nil) { _ in
+            // The writer is already on it; this only says how far behind it was, and nudges it.
+            let behind = henge_logq_pending(), dropped = henge_logq_dropped()
+            if behind > 64 * 1024 || dropped > 0 {
+                log("log", "memory warning: \(behind / 1024) KB of log not yet written, \(dropped) lines dropped so far")
+            }
+            DispatchQueue.global(qos: .userInitiated).async { henge_logq_flush(2) }
+        }
+        centre.addObserver(forName: UIApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+            flushNow()
+        }
     }
 
     /// Put the last run's native output into this run's log.
@@ -120,9 +147,11 @@ enum HengeLog {
             .appendingPathComponent("henge-native-prev.log")
     }
 
-    /// Force everything out to disk.
+    /// Everything logged so far to the file, and the file to storage: before Henge closes itself. Waits at most
+    /// half a second for the writer thread: Henge's self-restart (Relaunch.swift) must be gone before the app it
+    /// opened calls it back, about 1 s later. exit() waits for the queue briefly too (henge-logq.c).
     static func flushNow() {
-        if logFD >= 0 { fsync(logFD) }
+        henge_logq_sync(0.5)
     }
 
     /// Point stdout and stderr at a pipe we drain ourselves.
@@ -205,78 +234,21 @@ enum HengeLog {
 
     /// Turn "the app vanished with no crash log" into a labelled last line.
     ///
+    /// The handler is C (henge-logq.c), so that it allocates nothing and takes no lock: what is still queued for
+    /// henge.log, a FATAL SIGNAL marker, whatever native code wrote to henge-native.log that the reader thread had not
+    /// reached (QEMU's assertion text, which once cost a whole diagnosis), a backtrace, fsync, then the signal's
+    /// default action.
+    ///
     /// Deliberately does NOT touch SIGTRAP or SIGBUS: those belong to the JIT trap
     /// guard in henge-ios-jit.c, which needs to step over an unserviced brk rather
     /// than treat it as fatal. Stealing them here would break JIT detection.
     /// SIGPIPE is already set to SIG_IGN in start() and must stay that way.
     private static func installCrashHandlers() {
-        let fatal: [Int32] = [SIGSEGV, SIGABRT, SIGILL, SIGFPE, SIGSYS]
-        for sig in fatal {
-            signal(sig) { received in
-                // Async-signal-safe only: write(2) straight to the fds, no
-                // allocation, no locks, no Swift runtime.
-                let msg = "\n*** FATAL SIGNAL \(received) -- process is dying ***\n"
-                msg.withCString { p in
-                    let n = strlen(p)
-                    if HengeLog.rawLogFD >= 0 { _ = write(HengeLog.rawLogFD, p, n) }
-                }
-                // Drain whatever C wrote but the reader thread never got to.
-                //
-                // QEMU's own abort messages -- assertion text, error_report --
-                // go to stderr, which is a pipe read by a thread. When the
-                // process aborts, that thread has usually not been scheduled
-                // since the write, so the message dies in the pipe buffer and
-                // the log shows the fatal signal with nothing before it. That
-                // happened on the first virtio-sound boot and cost the whole
-                // diagnosis: a correct command line, a device that exists, and
-                // no reason given.
-                //
-                // read(2) and write(2) are async-signal-safe; the non-blocking
-                // flag is what stops this hanging when the pipe is empty.
-                if HengeLog.pipeReadFD >= 0 {
-                    // Reading a file now, so this cannot block and cannot
-                    // miss anything: whatever the tailer has not reached is
-                    // still on disk at this descriptor's offset.
-                    // A buffer allocated up front, because this one did not
-                    // work: creating an array here allocates, and abort() can
-                    // be raised while the allocator's lock is held -- so the
-                    // drain deadlocked inside malloc and took the fsync with
-                    // it. The marker was written and nothing after it, which
-                    // looked exactly like "QEMU printed nothing".
-                    while true {
-                        let n = read(HengeLog.pipeReadFD, HengeLog.crashBuf, 8192)
-                        if n <= 0 { break }
-                        if HengeLog.rawLogFD >= 0 {
-                            _ = write(HengeLog.rawLogFD, HengeLog.crashBuf, n)
-                        }
-                    }
-                }
-                // Where it died.
-                //
-                // Six months of "FATAL SIGNAL 11" with no frames is six months
-                // of guessing which of QEMU, ANGLE, the audio ring or our own
-                // Swift was at fault. backtrace_symbols_fd is documented
-                // async-signal-safe and writes straight to a descriptor, which
-                // is the only reason it can be used here -- and the frame
-                // buffer is taken at startup because nothing in a signal
-                // handler may allocate.
-                if HengeLog.rawLogFD >= 0 {
-                    let header = "\n--- backtrace ---\n"
-                    header.withCString { p in
-                        _ = write(HengeLog.rawLogFD, p, strlen(p))
-                    }
-                    let n = backtrace(HengeLog.crashFrames, 64)
-                    backtrace_symbols_fd(HengeLog.crashFrames, n, HengeLog.rawLogFD)
-                }
-                if HengeLog.rawLogFD >= 0 { fsync(HengeLog.rawLogFD) }
-                signal(received, SIG_DFL)
-                raise(received)
-            }
-        }
+        henge_logq_install_crash_handlers(pipeReadFD)
         NSSetUncaughtExceptionHandler { ex in
             HengeLog.log("crash", "uncaught exception: \(ex.name.rawValue) -- \(ex.reason ?? "")")
             HengeLog.log("crash", ex.callStackSymbols.prefix(20).joined(separator: " | "))
-            HengeLog.flushNow()
+            // No flush: abort() follows, and the SIGABRT handler writes the queue out without waiting on a thread.
         }
         log("boot", "crash handlers installed (SEGV/ABRT/ILL/FPE/SYS; "
                   + "TRAP+BUS left to the JIT guard; SIGPIPE ignored)")
@@ -289,7 +261,8 @@ enum HengeLog {
     private static func emit(_ line: String, fromStream: Bool) {
         ringLock.lock()
         ring.append(line)
-        if ring.count > ringLimit { ring.removeFirst(ring.count - ringLimit) }
+        // Trimmed 500 at a time: removeFirst shifts every line left, and once per line was 4,000 moves a line.
+        if ring.count > ringLimit + 500 { ring.removeFirst(ring.count - ringLimit) }
         ringLock.unlock()
 
         // The C side (henge-ios-jit.c, henge-display.c) writes to os_log itself as
@@ -305,21 +278,13 @@ enum HengeLog {
             console.withUnsafeBytes { raw in _ = write(consoleFD, raw.baseAddress, raw.count) }
         }
 
-        // Written synchronously with write(2) rather than queued. An async write
-        // can still be pending when the process dies, which loses exactly the
-        // lines that explain why it died -- and those are the whole point of this
-        // file. write(2) to a file lands in the page cache and is cheap.
-        guard logFD >= 0, let data = (line + "\n").data(using: .utf8) else { return }
-        writeLock.lock()
-        data.withUnsafeBytes { raw in
-            var off = 0
-            while off < raw.count {
-                let n = write(logFD, raw.baseAddress!.advanced(by: off), raw.count - off)
-                if n <= 0 { break }
-                off += n
-            }
-        }
-        writeLock.unlock()
+        // Queued, not written here: the writer thread (henge-logq.c) writes it, in order. A write(2) here once took
+        // 0.65 s on the main thread. What a crash would otherwise lose, the fatal-signal handler writes from the
+        // queue itself, and exit() waits for the queue; a full queue drops the line (counted, and marked in the file)
+        // rather than wait.
+        guard logFD >= 0 else { return }
+        var bytes = line + "\n"
+        bytes.withUTF8 { raw in _ = henge_logq_push(raw.baseAddress, raw.count) }
     }
 
     /// Log from Swift. Lands in the same stream as QEMU's own output.

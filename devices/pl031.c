@@ -7,6 +7,8 @@
 
 static const uint8_t pl031_id[8] = {0x31, 0x10, 0x14, 0x00, 0x0d, 0xf0, 0x05, 0xb1};
 
+void (*hv_rtc_watch)(const char *clock, int write, uint64_t reg, uint64_t value);
+
 static uint32_t now(HvPl031 *r) {
     return (uint32_t)((int64_t)time(NULL) + r->offset);
 }
@@ -25,6 +27,7 @@ void hv_pl031_tick(HvPl031 *r) {
 static uint64_t pl031_read(void *opaque, uint64_t off, unsigned size) {
     (void)size;
     HvPl031 *r = opaque;
+    if (hv_rtc_watch && (off == 0 || off == 8)) hv_rtc_watch("pl031", 0, off, now(r));
     switch (off) {
     case 0x00: return now(r);         /* DR */
     case 0x04: return r->mr;
@@ -42,6 +45,7 @@ static uint64_t pl031_read(void *opaque, uint64_t off, unsigned size) {
 static void pl031_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     (void)size;
     HvPl031 *r = opaque;
+    if (hv_rtc_watch) hv_rtc_watch("pl031", 1, off, v);
     switch (off) {
     case 0x04: r->mr = (uint32_t)v; hv_pl031_tick(r); break;
     case 0x08: r->offset = (int64_t)(uint32_t)v - (int64_t)time(NULL); break;

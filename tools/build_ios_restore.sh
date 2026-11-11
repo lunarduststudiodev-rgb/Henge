@@ -32,6 +32,21 @@ COMMON=(-O2 -w -DHAVE_CONFIG_H -I"$TP/restore_config" -I"$TP" -I"$TP/libusb-1.0"
         -I"$TP/libzip/lib" -I"$DEPS/libzip" -I"$TP/mbedtls/include")
 OBJS=()
 
+# The newest header in a source's folder and in its library's include folder: an object older than that is
+# built again too (objects don't record which headers they read, and a changed struct or prototype in a
+# header, like img4.h's img4_envelope, must not leave stale objects linked against the new ones).
+typeset -A NEWEST_H
+newest_header() { # source file -> $REPLY
+    local d=${1:h}
+    if [ -z "${NEWEST_H[$d]+x}" ]; then
+        local hs=("$d"/*.h(N.om) "${d:h}"/include/*.h(N.om) "${d:h}"/include/*/*.h(N.om))
+        NEWEST_H[$d]=${${(@)hs}[1]:-}
+        local h
+        for h in "${hs[@]}"; do [ "$h" -nt "${NEWEST_H[$d]}" ] && NEWEST_H[$d]=$h; done
+    fi
+    REPLY=${NEWEST_H[$d]}
+}
+
 compile() { # name extra-flags... -- files...
     local name=$1; shift
     local flags=()
@@ -40,7 +55,8 @@ compile() { # name extra-flags... -- files...
     mkdir -p "$OUT/$name"
     for f in "$@"; do
         local o="$OUT/$name/$(basename "${f%.*}").o"
-        if [ ! -f "$o" ] || [ "$f" -nt "$o" ]; then
+        newest_header "$f"
+        if [ ! -f "$o" ] || [ "$f" -nt "$o" ] || { [ -n "$REPLY" ] && [ "$REPLY" -nt "$o" ]; }; then
             "${CC[@]}" "${COMMON[@]}" -I"${f:h}" "${flags[@]}" -c "$f" -o "$o" || { echo "FAILED: $f" >&2; return 1; }
         fi
         OBJS+=("$o")

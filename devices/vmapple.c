@@ -15,6 +15,8 @@
 #include <unistd.h>
 #include <time.h>
 
+#include "ramfile.h"
+#include "sysreg.h"
 #include "timer.h"
 
 #define ROM_SIZE 0x00100000ull
@@ -54,8 +56,7 @@ static void pvpanic_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
         }
         p += sizeof key - 1;
     }
-    if (v & 1)
-        for (int i = 0; i < b->ncpus; i++) b->cpu[i].halted = 4;
+    if (v & 1) hv_machine_halt(b->m, HV_HALT_PANIC);
 }
 
 /* Not in QEMU's vmapple, which targets macOS 12 guests. iBootStage2 (Sequoia)
@@ -64,17 +65,38 @@ static void pvpanic_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
    so it answers 0xf001. The kernel's AppleVirtualPlatformRTC uses the same
    window: +0 is a 64-bit microsecond counter, and wall time is the counter
    plus an offset the driver keeps in NVRAM ("AvpRtc", absent until the guest
-   sets the clock), so the counter is Unix time in microseconds. +0x18 bit 0
-   enables it, +0x20 is the interrupt control and +0x38 the alarm; they are
-   plain storage here (the driver arms no alarm). Anything else is logged. */
+   sets the clock), so the counter is Unix time in microseconds.
+   The rest, as Virtualization.framework's VzCore::Hardware::AvpRtc has it (macOS 27's
+   com.apple.Virtualization.VirtualMachine, device "com.apple.virtualization.avp.rtc", INTID 0x33):
+     +0x10 load (kept), +0x18 control (kept), +0x20 interrupt mask (bits 0..2),
+     +0x28 raw interrupt status, +0x30 masked status, +0x38 interrupt clear (write 1s), +0x40 version 0xf001.
+   The line is high while status & mask. Framework sets status bit 1 when the host has woken from sleep
+   (kIOMessageSystemHasPoweredOn) and bit 2 after restoring a saved machine; macOS enables both (mask 6) and
+   its AppleVirtualPlatformRTC tells timed, whose AppleVirtualPlatformRTCPlugin rereads the clock and sets
+   the time ("Resync Time"). That is how a Mac that stood still learns it is behind: hv_vmapple_rtc_event. */
+static void avp_rtc_update(HvVmapple *b) {
+    hv_gicv3_set_irq(b->gic, 32 + VMAPPLE_IRQ_AVP_RTC, (b->avp_rtc[5] & b->avp_rtc[4]) != 0);
+}
+
+void hv_vmapple_rtc_event(HvVmapple *b, unsigned bits) {
+    if (!b || !b->gic) return;
+    pthread_mutex_lock(&b->avp_rtc_lock);
+    b->avp_rtc[5] |= bits & 7;
+    avp_rtc_update(b);
+    pthread_mutex_unlock(&b->avp_rtc_lock);
+}
+
 static uint64_t rtc_select_read(void *opaque, uint64_t off, unsigned size) {
     HvVmapple *b = opaque;
     if (off == 0x40) return 0xf001;
+    if (off == 0x30) return b->avp_rtc[5] & b->avp_rtc[4];
+    if (off == 0x38) return 0;
     if (off < 0x40 && !(off & 7) && off) return b->avp_rtc[off / 8];
     if (off == 0 || off == 4) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         uint64_t us = (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000;
+        if (hv_rtc_watch && off == 0) hv_rtc_watch("avp", 0, off, us);
         return off ? us >> 32 : size == 4 ? (uint32_t)us : us;
     }
     if (b->m->log) fprintf(stderr, "hengevm: read of unknown register 0x%llx+%llx (size %u)\n",
@@ -84,6 +106,16 @@ static uint64_t rtc_select_read(void *opaque, uint64_t off, unsigned size) {
 
 static void rtc_select_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     HvVmapple *b = opaque;
+    if (hv_rtc_watch) hv_rtc_watch("avp", 1, off, v);
+    if (off == 0x20 || off == 0x38) {
+        pthread_mutex_lock(&b->avp_rtc_lock);
+        if (off == 0x20) b->avp_rtc[4] = v & 7;
+        else b->avp_rtc[5] &= ~(v & 7);
+        avp_rtc_update(b);
+        pthread_mutex_unlock(&b->avp_rtc_lock);
+        return;
+    }
+    if (off == 0x28 || off == 0x30) return; /* status is read-only */
     if (off && off < 0x40 && !(off & 7)) {
         b->avp_rtc[off / 8] = v;
         return;
@@ -123,7 +155,7 @@ static void avp_regs_write(void *opaque, uint64_t off, uint64_t v, unsigned size
 
 static void avp_put(AvpRegs *r, uint64_t off, uint64_t v, unsigned size) { memcpy(r->regs + off, &v, size); }
 
-static void avp_regs_create(HvMachine *m, uint64_t ram_size) {
+static void avp_regs_create(HvVmapple *b, HvMachine *m, uint64_t ram_size) {
     AvpRegs *ctrr = calloc(1, sizeof *ctrr), *sealed = calloc(1, sizeof *sealed);
     ctrr->name = "avp-ctrr", sealed->name = "avp-sealed-registers";
     ctrr->log = sealed->log = getenv("HV_AVP_LOG") != NULL;
@@ -137,6 +169,8 @@ static void avp_regs_create(HvMachine *m, uint64_t ram_size) {
     avp_put(ctrr, 0x70, 7, 8);
     hv_machine_add_mmio(m, VMAPPLE_CTRR, sizeof ctrr->regs, ctrr, avp_regs_read, avp_regs_write, "avp-ctrr");
     hv_machine_add_mmio(m, VMAPPLE_SEALED, sizeof sealed->regs, sealed, avp_regs_read, avp_regs_write, "avp-sealed-registers");
+    _Static_assert(sizeof ctrr->regs == VMAPPLE_AVP_REGS, "avp register windows");
+    b->avp_ctrr = ctrr->regs, b->avp_sealed = sealed->regs;
 }
 
 /* The guest's device tree gives the GIC a third region (gic,vmapple1), and
@@ -223,13 +257,19 @@ static uint64_t tick_locked(HvMachine *m, HvCpu *cpu) {
     hv_pvg_lite_poll(b->pvg);
     hv_virtio_blk_poll(b->root_blk);
     hv_virtio_blk_poll(b->aux_blk);
+    hv_virtio_fs_poll(b->fs);
+    hv_virtio_net_poll(b->net);
     hv_xhci_poll(b->usb);
     hv_virtio_input_poll(b->keyboard);
+    hv_virtio_input_poll(b->tablet); /* before the mouse: a touch puts the pointer where its scroll goes */
     hv_virtio_input_poll(b->mouse);
     hv_virtio_snd_poll(b->snd);
     hv_virtio_usb_poll(b->vusb);
+    hv_power_source_poll(b->power);
     hv_virtio_balloon_poll(b->balloon);
     hv_bdif_poll(b->bdif);
+    uint64_t usb_due = hv_xhci_due(b->usb); /* an isochronous transfer's frame ends (guest time) */
+    if (usb_due && (!deadline || usb_due + hv_time_bias < deadline)) deadline = usb_due + hv_time_bias;
     return deadline; /* every GIC state change already updated the CPU's lines */
 }
 
@@ -245,6 +285,7 @@ static uint64_t tick(HvMachine *m, HvCpu *cpu) {
 int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size, HvDisk *root, HvDisk *aux,
                       const HvCfgParams *cfg, const uint8_t mac[6]) {
     memset(b, 0, sizeof *b);
+    pthread_mutex_init(&b->avp_rtc_lock, NULL);
     b->ram_fd = -1;
     b->m = m;
     b->cpu = cpu;
@@ -257,7 +298,17 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
        The file is unlinked at once and goes away with the process. */
     const char *ram_file = getenv("HV_RAM_FILE");
     b->ram = MAP_FAILED;
-    if (!getenv("HV_RAM_NO_LEDGER")) {
+    /* HV_RAM_SAVE_AHEAD=<folder>: the RAM is files in that run folder (core/ramfile.h), written ahead, so a Suspend
+       writes only what changed since the background writer last caught up. A resume takes its saved copy into it
+       (hv_snap_get_ram). Failing that, memory as without it: a save is then whole. */
+    HvRamFile *rf = NULL;
+    const char *run = getenv("HV_RAM_SAVE_AHEAD");
+    if (run && *run) {
+        rf = hv_ramfile_open(run, ram_size);
+        if (rf) b->ram = hv_ramfile_base(rf);
+        else fprintf(stderr, "hengevm: guest RAM: no saving ahead (the files above); a suspend saves it whole\n");
+    }
+    if (b->ram == MAP_FAILED && !getenv("HV_RAM_NO_LEDGER")) {
         uint8_t *free_of_footprint = alloc_no_footprint(ram_size);
         if (free_of_footprint) b->ram = free_of_footprint;
     }
@@ -286,9 +337,11 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     if (b->ram == MAP_FAILED) return -1;
     b->rom = mmap(NULL, ROM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (b->rom == MAP_FAILED) return -1;
+    hv_machine_set_cpus(m, b->ncpus); /* before the RAM: its per-CPU tables are made for them */
     /* QEMU maps the firmware as RAM, and so do we. */
     hv_machine_add_ram(m, VMAPPLE_FIRMWARE, ROM_SIZE, b->rom, 0);
-    hv_machine_add_ram(m, VMAPPLE_MEM, ram_size, b->ram, 0);
+    if (hv_machine_add_ram(m, VMAPPLE_MEM, ram_size, b->ram, 0) == 0 && rf && hv_machine_attach_file(m, &m->ram[m->nram - 1], rf) != 0)
+        fprintf(stderr, "hengevm: Quick Suspend's memory couldn't be tracked: saves are whole\n");
 
     b->gic = hv_gicv3_create(m, VMAPPLE_GIC_DIST, VMAPPLE_GIC_REDIST);
     hv_machine_add_mmio(m, VMAPPLE_GIC_MSI, 0x10000, b, gic_msi_read, gic_msi_write, "gic-msi");
@@ -300,7 +353,7 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     hv_machine_add_mmio(m, VMAPPLE_PVPANIC, 2, b, pvpanic_read, pvpanic_write, "pvpanic");
     b->pvg = hv_pvg_lite_create(m, b->gic, VMAPPLE_GFX, VMAPPLE_IOSFC, 32 + 0x11, 32 + 0x10);
     hv_machine_add_mmio(m, VMAPPLE_RTC_SELECT, 0x4000, b, rtc_select_read, rtc_select_write, "rtc-select");
-    avp_regs_create(m, ram_size);
+    avp_regs_create(b, m, ram_size);
     HvCfgParams p = *cfg;
     p.ram_size = ram_size;
     b->cfg = hv_cfg_create(m, VMAPPLE_CONFIG, &p);
@@ -325,12 +378,38 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     if (cfg->run_installer1 || cfg->run_installer2) {
         b->vusb = hv_virtio_usb_create(m, b->pcie);
         b->bdif->usb = b->vusb;
+    } else if (b->usb && !getenv("HV_NO_CAMERA")) {
+        /* The webcam: on USB, so it takes no PCI slot. The host feeds it (hv_vm_camera_*). */
+        b->camera = hv_usb_video_create(m, "iPad Camera");
+        hv_xhci_camera_attach(b->usb, b->camera);
     }
+    /* Last, so every device before it keeps the PCI slot an installed macOS already knows. */
+    if (!getenv("HV_NO_TABLET")) b->tablet = hv_virtio_input_create(m, b->pcie, HV_VINPUT_TABLET);
 
     m->tick = tick;
     m->tick_opaque = b;
     cpu->m = m;
     return 0;
+}
+
+int hv_vmapple_add_power_source(HvVmapple *b, int kind) {
+    if (b->power || b->fs) return -1; /* once, and before the shared folders */
+    b->power = hv_power_source_create(b->m, b->pcie, kind);
+    return b->power ? 0 : -1;
+}
+
+int hv_vmapple_share_folders(HvVmapple *b, const char *const names[], const char *const paths[], const int readonly[], int n) {
+    if (b->fs) return -1;
+    /* After every other device (even the tablet), so none of their PCI slots move. */
+    b->fs = hv_virtio_fs_create(b->m, b->pcie, HV_VFS_TAG_AUTOMOUNT);
+    if (!b->fs) return -1;
+    int shared = 0;
+    for (int i = 0; i < n; i++) {
+        if (!paths[i]) continue;
+        if (hv_fuse_export(&b->fs->fuse, names[i], paths[i], readonly[i]) == 0) shared++;
+        else fprintf(stderr, "virtio-fs: cannot share %s (%s)\n", names[i], paths[i]);
+    }
+    return shared;
 }
 
 int hv_vmapple_load_rom(HvVmapple *b, const char *path) {

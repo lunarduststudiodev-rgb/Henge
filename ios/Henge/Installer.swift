@@ -20,8 +20,19 @@ struct MacOSRelease: Identifiable, Hashable {
                      bytes: 18_856 << 20, note: "Not tested with Henge yet."),
         MacOSRelease(id: "26B123", name: "macOS 27.2",
                      url: URL(string: "https://updates.cdn-apple.com/2026FallFCS/c9671975-52db-4fb5-9af2-00217169ba8d/UniversalMac_27.2_26B123_Restore.ipsw")!,
-                     bytes: 24_409 << 20, note: "The newest. Not tested with Henge yet."),
+                     bytes: 24_409 << 20, note: "Has macOS's own touch, without the touch-sized menus and window buttons."),
+        // The first build for virtual Macs with the touchscreen MacBook Pro's AppKit (its 27.2, 26B7124, is for
+        // that Mac only): touch-sized menu items and window buttons.
+        MacOSRelease(id: "26C5035r", name: "macOS 27.3 beta",
+                     url: URL(string: "https://updates.cdn-apple.com/2026FallSeed/53df7654-4865-4259-8dae-30177b76f104/UniversalMac_27.3_26C5035r_Restore.ipsw")!,
+                     bytes: 25_946 << 20, note: "Beta. The touchscreen MacBook Pro's touch: bigger menus and window buttons. Not tested with Henge yet."),
     ]
+
+    /// The least memory (MB) the Mac gets while this macOS installs. Sequoia and Tahoe restore with 2 GB. macOS 27's
+    /// iBoot panics with 3 GB before the restore starts (#42, 27.2 on an 8 GB iPad) and installs with 4 GB (#26), so it
+    /// gets 4 GB, as later builds do. (Apple's manifests ask 4 GB of every virtual Mac, VirtualMachineMinMemorySizeMB, even
+    /// 15.6.1's, so that value can't tell them apart.) Builds are numbered one ahead: 24 is macOS 15, 26 is macOS 27.
+    var restoreMinMB: Int { (Int(id.prefix(2)) ?? 99) >= 26 ? 4096 : 2048 }
 }
 
 /// Downloads a restore image and installs it on a new virtual Mac, on the
@@ -36,28 +47,25 @@ final class Installer: NSObject, ObservableObject {
         case downloading
         case preparing
         case installing
+        /// Downloaded, and Henge restarts to install once the Mac running in this launch is shut down (Relaunch).
+        case waitingForMac
         case done(String)
         case failed(String)
     }
 
     @Published private(set) var phase: Phase = .idle
-    @Published private(set) var received: Int64 = 0
-    @Published private(set) var expected: Int64 = 0
     @Published private(set) var step: Int = 0
     @Published private(set) var stepProgress: Double = 0
     @Published private(set) var machineName = ""
-
-    private var session: URLSession?
+    /// The build an install is using while it runs, so Downloads doesn't delete it.
+    @Published private(set) var imageInUse: String?
     /* Background time, so a moment out of the foreground (a notification, iPhone Mirroring reconnecting)
        does not suspend the restore at once; iOS gives about 30 s. */
     private var grace = UIBackgroundTaskIdentifier.invalid
-    private var downloadContinuation: CheckedContinuation<URL, Error>?
-    nonisolated(unsafe) private var downloadTarget: URL? // set before the task starts, read by the delegate
-    private var lastResumeData: Data?
 
     var busy: Bool {
         switch phase {
-        case .downloading, .preparing, .installing: return true
+        case .downloading, .preparing, .installing, .waitingForMac: return true
         default: return false
         }
     }
@@ -74,11 +82,65 @@ final class Installer: NSObject, ObservableObject {
 
     static func haveImage(_ r: MacOSRelease) -> Bool { imageSize(r) != nil }
 
-    static func deleteImage(_ r: MacOSRelease) { try? FileManager.default.removeItem(at: imagePath(r)) }
+    /// The whole image, or the part of one downloaded so far.
+    static func deleteImage(_ r: MacOSRelease) { deleteImage(r.id) }
 
-    /// Free space an install takes: the new Mac's disk, and the download if it is not here yet.
-    static func spaceNeeded(_ r: MacOSRelease) -> Int64 { (haveImage(r) ? 0 : r.bytes) + newMacBytes }
+    static func deleteImage(_ id: String) {
+        ImageDownloads.shared.delete(id)
+        try? FileManager.default.removeItem(at: imageDirectory.appendingPathComponent("\(id).ipsw"))
+        RestoreImages.shared.refresh()
+    }
+
+    /// Free space an install takes: the new Mac's disk, and what is left to download.
+    static func spaceNeeded(_ r: MacOSRelease) -> Int64 {
+        let left = haveImage(r) ? 0 : max(r.bytes - (ImageDownloads.shared.status[r.id]?.received ?? 0), 0)
+        return left + newMacBytes
+    }
     private static let newMacBytes: Int64 = 24 << 30
+
+    // MARK: Memory for the restore
+
+    /// About 6 GB or less (6 GB iPhones report ~5.6 GB). There a restore given 4 GB, with the 1 GB JIT region on top,
+    /// leaves iOS too little and the phone stalls or closes Henge while macOS is written (#13), so the restore gets
+    /// only the least its macOS needs. 8 GB devices report ~7.5 GB.
+    private static let lowMemoryDevice = ProcessInfo.processInfo.physicalMemory >> 20 < 7_000
+
+    /// The memory (MB) the Mac gets while it installs, whatever it is set to use afterwards: at least what its macOS needs,
+    /// at most 4 GB (the restore system caches the ~15 GB it writes, so it fills all the memory it is given, and 10 GB of
+    /// a 12 GB iPhone's RAM in use, outside Henge's footprint so iOS does not stop it, stalls the whole phone two thirds of
+    /// the way through), and only the least on a low-memory device.
+    static func restoreRAMMB(_ r: MacOSRelease, asked: Int) -> Int {
+        let least = r.restoreMinMB
+        return lowMemoryDevice ? least : min(max(asked, least), max(4096, least))
+    }
+
+    /// Why this device can't give the Mac the memory this macOS needs to install, said before anything is downloaded;
+    /// nil when it can, or when that can't be known in this launch (a Mac has run in it: the install happens after a restart).
+    /// `serious`: it certainly can't (JIT is on, so the room measured is the room there is); otherwise a warning.
+    static func memoryProblem(_ r: MacOSRelease) -> (text: String, serious: Bool)? {
+        let need = r.restoreMinMB
+        let others = MacOSRelease.all.filter { $0.restoreMinMB < need }.map { $0.name.replacingOccurrences(of: "macOS ", with: "") }
+        let instead = others.isEmpty ? "" : " " + ListFormatter.localizedString(byJoining: others) + " need\(others.count == 1 ? "s" : "") only \(MacOSRelease.all.map(\.restoreMinMB).min()! / 1024) GB."
+        if !Relaunch.needed {
+            // The guest memory is one mapping; the JIT region, once claimed, takes about its own size out of the room for it.
+            let jit = JITBootstrap.ready ? 0 : UInt64(JITBootstrap.jitBytes >> 20)
+            let reach = henge_largest_mapping_mb()
+            let room = reach > 512 + jit ? (reach - 512 - jit) / 512 * 512 : 0
+            if room < UInt64(need) {
+                let limit = Int((Double(Entitlements.memoryLimitAtLaunch) / Double(1 << 30)).rounded())
+                let why = Entitlements.increasedMemory || limit == 0 ? ""
+                    : " Henge was signed without the increased-memory entitlement (a free Apple ID can't give it), which keeps it to about \(limit) GB."
+                // Before JIT is on this is an estimate (the region's place in memory varies), so it only warns.
+                let can = JITBootstrap.ready ? "can get only" : "will likely get only"
+                return ("\(r.name) needs \(need / 1024) GB of memory for the Mac while it installs, and Henge \(can) \(String(format: "%.1f", Double(room) / 1024)) GB on this \(Device.name)." + why + instead, JITBootstrap.ready)
+            }
+        }
+        if lowMemoryDevice && need > 2048 {
+            let gb = Int((Double(ProcessInfo.processInfo.physicalMemory) / Double(1 << 30)).rounded())
+            return ("\(r.name) needs \(need / 1024) GB of memory for the Mac while it installs. On this \(gb) GB \(Device.name) that leaves iOS very little, and it may close Henge partway through." + instead, false)
+        }
+        return nil
+    }
 
     func reset() { if !busy { phase = .idle } }
 
@@ -91,27 +153,46 @@ final class Installer: NSObject, ObservableObject {
     func start(_ release: MacOSRelease, name: String, ramMB: Int, cpus: Int, keepImage: Bool) {
         guard !busy else { return }
         machineName = name
-        UIApplication.shared.isIdleTimerDisabled = true // the screen locking would suspend the download and the restore
+        imageInUse = release.id
+        UIApplication.shared.isIdleTimerDisabled = true // the download goes on without Henge, but the restore needs it open
         grace = UIApplication.shared.beginBackgroundTask(withName: "Henge install") {
             MainActor.assumeIsolated { Installer.shared.endGrace() }
         }
         Task {
-            defer { UIApplication.shared.isIdleTimerDisabled = false; endGrace() }
+            defer {
+                UIApplication.shared.isIdleTimerDisabled = false
+                imageInUse = nil
+                RestoreImages.shared.refresh()
+                endGrace()
+            }
             var made: VirtualMac?
             do {
                 try checkSpace(release)
+                if let problem = Self.memoryProblem(release), problem.serious { throw message(problem.text) } // before the long download
                 let rom = try await BootROM.file() // before the long download, so a problem shows up at once
                 HengeLog.log("install", "boot ROM ready")
                 let ipsw = try await download(release)
+                if Relaunch.needed {
+                    // A Mac has run in this launch: the install runs in a fresh Henge, which finds the download there.
+                    // A Mac still on is never cut short: Henge restarts once it has shut down.
+                    if henge_vm_state() == 1 {
+                        phase = .waitingForMac
+                        HengeLog.log("install", "downloaded; waiting for the running Mac to shut down before restarting")
+                        while henge_vm_state() == 1 { try await Task.sleep(nanoseconds: 1_000_000_000) }
+                    }
+                    phase = .idle
+                    Relaunch.shared.install(release, name: name, ramMB: ramMB, cpus: cpus, keepImage: keepImage)
+                    return
+                }
                 phase = .preparing
                 var mac = try prepare(name: name, ramMB: ramMB, rom: rom)
                 mac.osName = release.name
                 made = mac
                 phase = .installing
-                try await install(mac, ipsw: ipsw, cpus: cpus)
+                try await install(mac, release: release, ipsw: ipsw, cpus: cpus)
                 if !keepImage { try? FileManager.default.removeItem(at: ipsw) }
                 HengeLog.log("install", "\(name): installed \(release.name)")
-                phase = .done("\(release.name) is installed on \(name). Quit Henge (swipe it away) and open it again, then tap Start.")
+                phase = .done("\(release.name) is installed on \(name). Start it from the Macs tab.")
             } catch {
                 HengeLog.log("install", "failed: \(error.localizedDescription)")
                 // A half-installed Mac is no use, and its disk can be many gigabytes. The download stays.
@@ -132,43 +213,17 @@ final class Installer: NSObject, ObservableObject {
 
     // MARK: Download
 
+    /// The image, once ImageDownloads has all of it. It downloads in the background and can be paused;
+    /// this waits through a pause.
     private func download(_ r: MacOSRelease) async throws -> URL {
         let dest = Self.imagePath(r)
-        try FileManager.default.createDirectory(at: Self.imageDirectory, withIntermediateDirectories: true)
-        Machines.excludeFromBackup(Self.imageDirectory)
         if Self.haveImage(r) {
             HengeLog.log("install", "using the downloaded \(r.name)")
             return dest
         }
         phase = .downloading
-        received = 0
-        expected = r.bytes
-        downloadTarget = dest
-        HengeLog.log("install", "downloading \(r.url.absoluteString)")
-        for attempt in 1...20 {
-            do {
-                return try await downloadOnce(r.url)
-            } catch let error as URLError where error.code != .cancelled && attempt < 20 {
-                lastResumeData = error.downloadTaskResumeData ?? lastResumeData
-                HengeLog.log("install", "download interrupted (\(error.localizedDescription)); resuming")
-                try await Task.sleep(nanoseconds: 3_000_000_000)
-            }
-        }
-        throw message("The download kept failing.")
-    }
-
-    private func downloadOnce(_ url: URL) async throws -> URL {
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 120
-        cfg.timeoutIntervalForResource = 48 * 3600
-        let s = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
-        session = s
-        return try await withCheckedThrowingContinuation { (c: CheckedContinuation<URL, Error>) in
-            downloadContinuation = c
-            let task = lastResumeData.map { s.downloadTask(withResumeData: $0) } ?? s.downloadTask(with: url)
-            lastResumeData = nil
-            task.resume()
-        }
+        try await ImageDownloads.shared.download(r)
+        return dest
     }
 
     // MARK: The new machine
@@ -178,6 +233,7 @@ final class Installer: NSObject, ObservableObject {
         let ecid = UInt64.random(in: 1 << 40 ..< 1 << 62)
         var mac = VirtualMac(name: name, ecid: ecid, seed: 0, ramMB: ramMB, diskBytes: 64 << 30)
         (mac.screenWidth, mac.screenHeight) = Device.fittingScreen
+        mac.retina = true // on an iPad; elsewhere the fitting screen
         let fm = FileManager.default
         try fm.createDirectory(at: mac.directory, withIntermediateDirectories: true)
         Machines.excludeFromBackup(Machines.root)
@@ -197,15 +253,16 @@ final class Installer: NSObject, ObservableObject {
 
     // MARK: The restore
 
-    private func install(_ mac: VirtualMac, ipsw: URL, cpus: Int) async throws {
+    private func install(_ mac: VirtualMac, release: MacOSRelease, ipsw: URL, cpus: Int) async throws {
         guard JITBootstrap.ready else { throw message("Turn on JIT first: the installer runs the Mac's own restore system, which needs it.") }
-        // The restore needs 2 GB, whatever the Mac is set to use afterwards, and gets at most 4 GB: the restore system
-        // caches the ~15 GB it writes, so it fills all the memory it is given, and 10 GB of a 12 GB iPhone's RAM in use
-        // (it is outside Henge's footprint, so iOS does not stop it) stalls the whole phone two thirds of the way through.
         var restoring = mac
-        restoring.ramMB = min(max(mac.ramMB, 2048), 4096)
+        restoring.ramMB = Self.restoreRAMMB(release, asked: mac.ramMB)
         let ram = GuestMemory.prepare(restoring)
-        guard ram >= 2048 else { throw message("Installing needs a few more GB of free storage for the Mac's memory.") }
+        guard ram >= UInt64(release.restoreMinMB) else {
+            // Less than its macOS needs: 27's iBoot panics before the restore starts (#42).
+            throw message(Self.memoryProblem(release).flatMap { $0.serious ? $0.text : nil }
+                          ?? "Installing needs a few more GB of free storage for the Mac's memory.")
+        }
         setenv("HV_WRITE_CACHE", "0", 1) // the ~15 GB the restore writes goes straight to storage (host/disk.c); this process runs no other Mac
         let work = mac.directory.appendingPathComponent("restore", isDirectory: true)
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
@@ -250,50 +307,5 @@ final class Installer: NSObject, ObservableObject {
 
     private func message(_ text: String) -> NSError {
         NSError(domain: "Henge", code: 2, userInfo: [NSLocalizedDescriptionKey: text])
-    }
-}
-
-extension Installer: URLSessionDownloadDelegate {
-    nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
-                                totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
-        Task { @MainActor in
-            self.received = totalBytesWritten
-            if totalBytesExpectedToWrite > 0 { self.expected = totalBytesExpectedToWrite }
-        }
-    }
-
-    nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didResumeAtOffset fileOffset: Int64,
-                                expectedTotalBytes: Int64) {
-        Task { @MainActor in self.received = fileOffset }
-    }
-
-    nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        // The file is gone when this returns: move it now, on this thread.
-        let target = self.downloadTarget
-        let status = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0
-        do {
-            guard let target, status == 200 || status == 206 else {
-                throw NSError(domain: "Henge", code: 3, userInfo: [NSLocalizedDescriptionKey: "Apple's server answered \(status)."])
-            }
-            try? FileManager.default.removeItem(at: target)
-            try FileManager.default.moveItem(at: location, to: target)
-            Task { @MainActor in
-                self.downloadContinuation?.resume(returning: target)
-                self.downloadContinuation = nil
-            }
-        } catch {
-            Task { @MainActor in
-                self.downloadContinuation?.resume(throwing: error)
-                self.downloadContinuation = nil
-            }
-        }
-    }
-
-    nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard let error else { return }
-        Task { @MainActor in
-            self.downloadContinuation?.resume(throwing: error)
-            self.downloadContinuation = nil
-        }
     }
 }

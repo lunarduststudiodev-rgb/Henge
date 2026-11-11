@@ -26,6 +26,18 @@
 extern "C" {
 #endif
 
+struct img4_envelope {
+	unsigned char prefix[16];
+	unsigned int prefix_size;
+	unsigned char *suffix;
+	size_t suffix_size;
+};
+
+/* Build the bytes surrounding an IM4P payload. Only its opening fields need
+ * to be in memory; the component type is patched there when required. */
+int img4_build_envelope(const char* component_name, void* component_prefix, size_t prefix_size,
+	size_t component_size, plist_t parameters, plist_t tss_response, struct img4_envelope* envelope);
+
 int img4_stitch_component(const char* component_name, const void* component_data, size_t component_size, plist_t parameters, plist_t tss_response, void** img4_data, size_t *img4_size);
 int img4_create_local_manifest(plist_t request, plist_t build_identity, plist_t* manifest);
 

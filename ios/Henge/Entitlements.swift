@@ -11,10 +11,17 @@ enum Entitlements {
     private typealias CreateFromSelf = @convention(c) (CFAllocator?) -> CFTypeRef?
     private typealias CopyValue = @convention(c) (CFTypeRef, CFString, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> CFTypeRef?
 
-    static func has(_ name: String) -> Bool {
+    /// get-task-allow: whether a debugger may attach, which every JIT method but TrollStore and a jailbreak needs. Nil when
+    /// the signature could not be read.
+    static let debuggable = value("get-task-allow")
+
+    static func has(_ name: String) -> Bool { value(name) ?? false }
+
+    /// The entitlement's yes or no, nil when the signature could not be read at all (a missing entitlement is a no).
+    private static func value(_ name: String) -> Bool? {
         let handle = UnsafeMutableRawPointer(bitPattern: -2) // RTLD_DEFAULT
-        guard let create = dlsym(handle, "SecTaskCreateFromSelf"), let copy = dlsym(handle, "SecTaskCopyValueForEntitlement") else { return false }
-        guard let task = unsafeBitCast(create, to: CreateFromSelf.self)(nil) else { return false }
+        guard let create = dlsym(handle, "SecTaskCreateFromSelf"), let copy = dlsym(handle, "SecTaskCopyValueForEntitlement") else { return nil }
+        guard let task = unsafeBitCast(create, to: CreateFromSelf.self)(nil) else { return nil }
         return (unsafeBitCast(copy, to: CopyValue.self)(task, name as CFString, nil) as? NSNumber)?.boolValue ?? false
     }
 }

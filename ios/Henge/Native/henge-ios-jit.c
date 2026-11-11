@@ -508,10 +508,27 @@ static void henge_ios_jit_log_map(const char *tag)
     HENGE_LOG("map[%s]: highest mapped end %#llx", tag, (unsigned long long)prev_end);
 }
 
+/* Whether nothing is mapped in [start, start + bytes): the first mapping at or after start begins at its end or later.
+   Only a hint for where to try; vm_remap with VM_FLAGS_FIXED stays the real test. */
+static bool henge_ios_jit_range_free(uintptr_t start, size_t bytes)
+{
+    if (start + bytes < start) return false;
+    vm_address_t a = (vm_address_t)start;
+    vm_size_t size = 0;
+    natural_t depth = 0;
+    struct vm_region_submap_info_64 info;
+    mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+    if (vm_region_recurse_64(mach_task_self(), &a, &size, &depth, (vm_region_recurse_info_t)&info, &count) != KERN_SUCCESS)
+        return true; /* nothing mapped from here on */
+    return a >= start + bytes;
+}
+
 static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes);
 
 static HengeDualMapping henge_prewarmed;
 static bool henge_prewarm_done;
+/* The last try failed because no debugger answered the probe: the trap came back to this process's own guard. */
+static bool henge_prewarm_unanswered;
 
 HENGE_EXPORT bool henge_ios_jit_prewarm(size_t bytes)
 {
@@ -519,10 +536,26 @@ HENGE_EXPORT bool henge_ios_jit_prewarm(size_t bytes)
         return henge_prewarmed.rw_addr != NULL;
     }
     henge_prewarm_done = true;
+    henge_prewarm_unanswered = false;
     henge_prewarmed = henge_ios_jit_allocate_real(bytes);
     fprintf(stderr, "[henge-jit] prewarm %s: %zu bytes\n",
             henge_prewarmed.rw_addr ? "OK" : "FAILED", bytes);
     return henge_prewarmed.rw_addr != NULL;
+}
+
+/*
+ * A debugger Henge asked for has just attached. A failed prewarm is kept so that nothing traps a second time into a
+ * debugger that is not answering, but a failure whose probe came back to Henge's own trap guard says no debugger was
+ * answering then: one may be now (StikDebug launched Henge without its script, or LiveContainer only marked it as
+ * debugged, and then Turn On JIT attached StikDebug with the script). Without this, JIT could not be turned on again
+ * until Henge was closed.
+ */
+HENGE_EXPORT void henge_ios_jit_prewarm_rearm(void)
+{
+    if (!henge_prewarm_done || henge_prewarmed.rw_addr || !henge_prewarm_unanswered) return;
+    henge_prewarm_done = false;
+    henge_prewarm_unanswered = false;
+    fprintf(stderr, "[henge-jit] a debugger attached after an unanswered prewarm; the next prewarm asks again\n");
 }
 
 /*
@@ -624,7 +657,9 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
                  "is our own SIGTRAP handler stepping over an unanswered brk. "
                  "Trying to make %zu bytes without it.",
                  (unsigned long long)n, bytes);
-        return henge_self_dual_mapping(bytes);
+        HengeDualMapping self = henge_self_dual_mapping(bytes);
+        if (!self.rw_addr) henge_prewarm_unanswered = true;
+        return self;
     }
 
     uint32_t probe_lo = (uint32_t)probe;
@@ -702,6 +737,9 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
         for (int side = 0; side < 2 && kr != KERN_SUCCESS; side++) {
             uintptr_t want = side == 0 ? (uintptr_t)rx + bytes + off : (uintptr_t)rx - bytes - off;
             if (side == 1 && (uintptr_t)rx < bytes + off + step) continue;
+            /* A failing vm_remap of the whole region costs ~4 ms, and on iPadOS 27 all ~260 of them fail (a second
+               at every JIT start): ask the map first, which costs microseconds. */
+            if (!henge_ios_jit_range_free(want, bytes)) continue;
             rw = (vm_address_t)want;
             kr = vm_remap(mach_task_self(), &rw, (vm_size_t)bytes, /*mask=*/0, VM_FLAGS_FIXED,
                           mach_task_self(), (vm_address_t)rx, /*copy=*/FALSE, &cur_prot, &max_prot, VM_INHERIT_NONE);
@@ -719,6 +757,7 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
     if (kr != KERN_SUCCESS) {
         HENGE_LOG("#%llu: vm_remap failed for rx=%p size=%zu: %d (%s)",
                  (unsigned long long)n, rx, bytes, (int)kr, mach_error_string(kr));
+        vm_deallocate(mach_task_self(), (vm_address_t)rx, (vm_size_t)bytes);
         return region;
     }
 
@@ -729,13 +768,13 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
                  (unsigned long long)n, (void *)rw, bytes, (int)kr,
                  mach_error_string(kr));
         vm_deallocate(mach_task_self(), rw, (vm_size_t)bytes);
+        vm_deallocate(mach_task_self(), (vm_address_t)rx, (vm_size_t)bytes);
         return region;
     }
 
     region.rw_addr = (uint8_t *)rw;
     region.rx_addr = (uint8_t *)rx;
     region.size    = bytes;
-    atomic_store(&g_jit_available, true);
 
     HENGE_LOG("#%llu: dual mapping established: rw=%p rx=%p size=%zu diff=%+lld",
              (unsigned long long)n, (void *)region.rw_addr, (void *)region.rx_addr,
@@ -751,6 +790,8 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
         return region;
     }
 
+    /* Only now: a region that failed its test is not JIT, and saying so earlier let Start go on to "no JIT region". */
+    atomic_store(&g_jit_available, true);
     return region;
 }
 
@@ -931,6 +972,8 @@ HengeDualMapping henge_ios_jit_allocate(size_t bytes)
 }
 bool henge_ios_jit_prewarm(size_t bytes) { (void)bytes; return false; }
 bool henge_ios_jit_prewarm_self(size_t bytes) { (void)bytes; return false; }
+void henge_ios_jit_prewarm_rearm(void) {}
+HengeDualMapping *henge_ios_jit_get_mapping(void) { return 0; }
 bool henge_ios_jit_reserve_bottom(size_t end) { (void)end; return true; }
 void henge_ios_jit_release(HengeDualMapping *m) { (void)m; }
 void henge_ios_jit_detach(void) {}

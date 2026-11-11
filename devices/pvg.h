@@ -14,8 +14,14 @@
 int hv_pvg_attach(HvVmapple *b, const char *screenshot);
 
 /* Main thread, instead of its run loop: a window showing the display, with the
-   host keyboard and mouse going to the guest's virtio-input devices. Does not return. */
+   host keyboard and mouse going to the guest's virtio-input devices. Does not return,
+   unless hv_pvg_attach didn't succeed: then there is no window, and it returns at once. */
 void hv_pvg_window_run(void);
+
+/* The framework's device is running (hv_pvg_attach succeeded). A Suspend can't carry its state, so none is made
+   then; asked for and not running (no device, or HV_NO_GPU / HV_PVG_NO_METAL set), the iPad's graphics device
+   handles the guest and a Suspend can be made. */
+int hv_pvg_running(void);
 
 /* Called from the CPU thread: delivers interrupts the framework raised. */
 void hv_pvg_poll(void);

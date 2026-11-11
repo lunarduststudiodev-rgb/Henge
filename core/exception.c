@@ -8,6 +8,7 @@
 #include "machine.h"
 #include "dispatch.h"
 #include "mmu.h"
+#include "rosetta.h"
 
 /* Only EL0 and EL1 exist for the guest; HengeVM plays EL2 (PSCI over HVC, as
    QEMU's vmapple machine sets up) and there is no EL3. */
@@ -43,14 +44,19 @@ void hv_pstate_set(HvCpu *cpu, uint64_t spsr) {
 }
 
 void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set_far, uint64_t ret) {
-    if (type == HV_EXC_SYNC) cpu->m->stats.exceptions++;
-    else cpu->m->stats.interrupts++;
+    /* An x86 thread's accesses (fenced) stay before the kernel's (not fenced: on a Mac it runs in TSO mode too, here
+       it doesn't need to, but nothing it does may pass the thread's). The same on the way back (hv_eret). */
+    if (hv_tso_thread(cpu)) __atomic_thread_fence(__ATOMIC_SEQ_CST);
     uint64_t spsr = hv_pstate_get(cpu);
-    {
-        HvStats *st = &cpu->m->stats;
-        uint32_t k = st->nelchg++ & 15;
-        st->elchg[k].from = ret, st->elchg[k].spsr = spsr, st->elchg[k].kind = (uint32_t)type, st->elchg[k].el = cpu->el;
-        st->elchg[k].to = esr;
+    cpu->aspsr_el1 = (cpu->apflags >> 25) & 6;
+    cpu->apflags = 0;
+    if (type == HV_EXC_SYNC) HV_CPU_COUNT(cpu, exceptions, 1);
+    else HV_CPU_COUNT(cpu, interrupts, 1);
+    if (cpu->pc_state) { /* this CPU's history of EL changes (hv_debug_el0_in_kernel) */
+        HvPerCpu *p = cpu->pc_state;
+        uint32_t k = p->trace.nelchg++ & 15;
+        p->trace.elchg[k].from = ret, p->trace.elchg[k].spsr = spsr, p->trace.elchg[k].kind = (uint32_t)type, p->trace.elchg[k].el = cpu->el;
+        p->trace.elchg[k].to = esr;
     }
     if (cpu->m->trace || cpu->m->log >= 2)
         fprintf(stderr, "exception type %d esr %08x far %llx from pc %llx el%u\n", type, esr, (unsigned long long)far,
@@ -70,6 +76,7 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
     cpu->excl_addr = ~0ull;
     cpu->pc = (cpu->vbar_el1 & ~0x7ffull) + offset + (uint64_t)type * 0x80;
     cpu->exit_reason = HV_EXIT_EXCEPTION;
+    hv_rosetta_fp_apply(cpu);
 }
 
 void hv_raise_sync(HvCpu *cpu, uint32_t ec, uint32_t iss, uint64_t far, uint64_t pc) {
@@ -111,15 +118,18 @@ void hv_raise_abort(HvCpu *cpu, int insn, uint64_t va, uint32_t fsc, int wnr, in
 }
 
 void hv_eret(HvCpu *cpu) {
-    if (cpu->m) {
-        HvStats *st = &cpu->m->stats;
-        uint32_t k = st->nelchg++ & 15;
-        st->elchg[k].from = cpu->pc, st->elchg[k].to = cpu->elr_el1, st->elchg[k].spsr = cpu->spsr_el1;
-        st->elchg[k].kind = 9, st->elchg[k].el = cpu->el;
+    if (cpu->pc_state) {
+        HvTrace *t = &cpu->pc_state->trace;
+        uint32_t k = t->nelchg++ & 15;
+        t->elchg[k].from = cpu->pc, t->elchg[k].to = cpu->elr_el1, t->elchg[k].spsr = cpu->spsr_el1;
+        t->elchg[k].kind = 9, t->elchg[k].el = cpu->el;
     }
     cpu->pc = cpu->elr_el1;
     hv_pstate_set(cpu, cpu->spsr_el1);
+    cpu->apflags = (cpu->aspsr_el1 & 6) << 25;
+    hv_rosetta_fp_apply(cpu);
     cpu->excl_addr = ~0ull;
+    if (cpu->m && hv_tso_thread(cpu)) __atomic_thread_fence(__ATOMIC_SEQ_CST); /* see hv_take_exception */
 }
 
 static HvCpu *cpu_by_mpidr(HvMachine *m, uint64_t mpidr) {
@@ -140,9 +150,11 @@ static uint64_t psci(HvCpu *cpu, uint64_t fn) {
     case 0x84000006: return 2;                               /* MIGRATE_INFO_TYPE: no trusted OS */
     case 0x84000008:                                         /* SYSTEM_OFF */
     case 0x84000009:                                         /* SYSTEM_RESET */
-        for (int i = 0; i < cpu->m->ncpus; i++) /* the whole machine stops */
-            if (cpu->m->cpus[i]) cpu->m->cpus[i]->halted = (uint32_t)fn == 0x84000008 ? 1 : 2;
-        hv_machine_kick_all(cpu->m);
+        if (cpu->m->log)
+            fprintf(stderr, "hengevm: macOS asked to %s (cpu %u)\n", (uint32_t)fn == 0x84000008 ? "shut down" : "restart",
+                    cpu->index);
+        /* The whole machine stops, CPUs parked in CPU_OFF included (CPU 0 may be one of them). */
+        hv_machine_halt(cpu->m, (uint32_t)fn == 0x84000008 ? HV_HALT_SHUTDOWN : HV_HALT_RESET);
         return 0;
     case 0x8400000a: {                                       /* PSCI_FEATURES */
         uint32_t q = (uint32_t)cpu->x[1];
@@ -158,15 +170,29 @@ static uint64_t psci(HvCpu *cpu, uint64_t fn) {
         HvCpu *t = cpu_by_mpidr(cpu->m, cpu->x[1]);
         if (!t) return (uint64_t)-2;                         /* INVALID_PARAMETERS */
         if (!t->off) return (uint64_t)-4;                    /* ALREADY_ON */
-        while (!__atomic_load_n(&t->parked_off, __ATOMIC_SEQ_CST)) sched_yield(); /* still on its way out of CPU_OFF */
-        uint64_t mpidr = t->mpidr, entry = cpu->x[2], context = cpu->x[3];
+        /* Parked once parked_off reads 1 under its wake_mu: the target changes it only under that lock, and clears
+           it while it gives back what it held for running (wait_while_off), which a reset mustn't meet. */
+        HvPerCpu *pcs = t->pc_state;
+        for (;;) {
+            while (!__atomic_load_n(&t->parked_off, __ATOMIC_SEQ_CST)) { /* on its way out of CPU_OFF, or giving back */
+                /* The machine is stopping: the target may never park (it leaves instead). DENIED. */
+                if (__atomic_load_n(&cpu->halted, __ATOMIC_ACQUIRE) || __atomic_load_n(&t->halted, __ATOMIC_ACQUIRE))
+                    return (uint64_t)-3;
+                sched_yield();
+            }
+            pthread_mutex_lock(&pcs->wake_mu);
+            if (__atomic_load_n(&t->parked_off, __ATOMIC_SEQ_CST)) break;
+            pthread_mutex_unlock(&pcs->wake_mu);
+        }
+        uint64_t entry = cpu->x[2], context = cpu->x[3];
         if ((uint32_t)fn == 0x84000003) entry = (uint32_t)entry, context = (uint32_t)context;
         /* As at reset: EL1h, MMU and caches off, everything masked. Its thread
            waits on wake_mu, so it cannot see the CPU half reset. */
-        pthread_mutex_lock(&t->pc_state->wake_mu);
-        HvPerCpu *pcs = t->pc_state;
-        hv_cpu_reset_index(t, cpu->m, t->index);
-        t->mpidr = mpidr;
+        if (__atomic_load_n(&t->halted, __ATOMIC_ACQUIRE)) { /* the reset would clear the halt: the machine is stopping */
+            pthread_mutex_unlock(&pcs->wake_mu);
+            return (uint64_t)-3;
+        }
+        hv_cpu_reset_index(t, cpu->m, t->index); /* keeps its mpidr: another CPU's PSCI call may look for it */
         t->pc = entry;
         t->x[0] = context;
         t->parked_off = 1;
@@ -253,11 +279,15 @@ int hv_check_interrupts(HvCpu *cpu) {
     HvMachine *m = cpu->m;
     HvPerCpu *p = cpu->pc_state;
     (void)m;
+    /* Taken, an interrupt is where the CPU goes first: hv_cpu_pass_stop's pass, for the place it was, goes. Stored
+       before the call, so nothing lives across it: the path that takes none keeps its no-frame shape. */
     if (p->fiq_line && !(cpu->daif & HV_PSTATE_F)) {
+        p->stop_pass = ~0ull;
         hv_take_exception(cpu, HV_EXC_FIQ, 0, 0, 0, cpu->pc);
         return 1;
     }
     if (p->irq_line && !(cpu->daif & HV_PSTATE_I)) {
+        p->stop_pass = ~0ull;
         hv_take_exception(cpu, HV_EXC_IRQ, 0, 0, 0, cpu->pc);
         return 1;
     }

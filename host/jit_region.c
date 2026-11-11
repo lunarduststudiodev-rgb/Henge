@@ -91,6 +91,30 @@ void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words) {
     if (start && words) sys_icache_invalidate(start, words * sizeof(uint32_t));
 }
 
+void hv_jit_patch(HvJitRegion *region, uint32_t *const *at, const uint32_t *words, size_t n) {
+    if (!n) return;
+#if TARGET_OS_OSX
+    if (!region->rw_diff) pthread_jit_write_protect_np(0);
+#endif
+    for (size_t k = 0; k < n; k++) __atomic_store_n((uint32_t *)((uint8_t *)at[k] + region->rw_diff), words[k], __ATOMIC_RELEASE);
+#if TARGET_OS_OSX
+    if (!region->rw_diff) pthread_jit_write_protect_np(1);
+#endif
+#if defined(__aarch64__)
+    /* As sys_icache_invalidate does for one range (its data side needs nothing on these hosts): the stores done, each
+       line out of every core's instruction cache, then the barriers once. A DSB every 16 lines, as it also does on the
+       cores that need one every 20. */
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (size_t k = 0; k < n; k++) {
+        __asm__ volatile("ic ivau, %0" ::"r"((uintptr_t)at[k] & ~(uintptr_t)63) : "memory");
+        if ((k & 15) == 15) __asm__ volatile("dsb ish" ::: "memory");
+    }
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+#else
+    for (size_t k = 0; k < n; k++) sys_icache_invalidate(at[k], 4);
+#endif
+}
+
 /* Any thread: an even number of words (blocks stay 8-byte aligned), taken atomically. */
 uint32_t *hv_jit_reserve(HvJitRegion *region, size_t words) {
     words = (words + 1) & ~(size_t)1;

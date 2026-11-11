@@ -1,0 +1,83 @@
+# Development builds on GitHub's macOS runners: the engine's tests, and Henge.ipa / Henge.tipa to
+# download from the run's page (Actions -> the run -> Artifacts). Nothing is published as a release.
+# Based on PR #27 by not-nullptr.
+#
+# The IPA is ad-hoc signed (ios/scripts/package_ipa.sh). SideStore, AltStore or another sideloader
+# re-signs it with your certificate on install and keeps the entitlements it can; the increased memory
+# limit only survives if your certificate carries it. The .tipa is the same build for TrollStore.
+#
+# macOS runners are free on public repositories. On a private one their minutes count ten times.
+
+name: Development build
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+  pull_request: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mac-tests:
+    name: Engine tests (Mac)
+    # GitHub names its macOS images by Xcode version; xcode-27 is the standard (free) arm64 runner.
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the libraries the Mac build links
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: brew install pkg-config cmake glib libimobiledevice libtatsu libzip
+
+      - name: Build
+        run: make -j"$(sysctl -n hw.ncpu)" all
+
+      - name: Test
+        run: make test
+
+      # The tests that drive the host's GPU (Metal), which make test leaves out; run whatever make test said
+      - name: GPU tests
+        if: ${{ !cancelled() }}
+        run: make test-gpu
+
+  ipa:
+    name: Henge.ipa
+    runs-on: xcode-27
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: Henge
+
+      # Husk's iOS libraries and StikJIT take most of the build. ci/build-ipa.sh pins both and skips
+      # whatever the restored work folder already holds at the pinned revision.
+      - name: Restore Husk and StikJIT
+        uses: actions/cache@v4
+        with:
+          path: |
+            work/Husk/.git
+            work/Husk/src/app/Frameworks
+            work/Husk/build/ios-arm64
+            work/StikJIT/StikJIT.xcframework
+          key: ios-deps-${{ hashFiles('Henge/ci/build-ipa.sh', 'Henge/ci/build-stikjit.sh', 'Henge/ci/stikjit-high-address.patch') }}
+
+      - name: Build Henge.ipa and Henge.tipa
+        run: bash Henge/ci/build-ipa.sh work
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-${{ github.sha }}
+          path: |
+            ~/Desktop/Henge.ipa
+            ~/Desktop/Henge.tipa
+          if-no-files-found: error
+          retention-days: 14

@@ -3,6 +3,9 @@
 // (those come with the MMU tests), but SP is used as an ordinary operand.
 #include "harness.h"
 
+// Guest code, for the guest's CPU (an Apple M-series, Armv8.5+), not for the A12 the engine is built for
+// (Makefile ENGINE_CPU): pstate_bits uses DIT, an Armv8.4 register.
+    .arch armv8.4-a
     .text
     .p2align 14
     .globl _jit_programs_begin

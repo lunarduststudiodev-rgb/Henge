@@ -63,6 +63,7 @@ _henge_brk_jit_detach:
 .globl _henge_brk_probe
 .p2align 2
 _henge_brk_probe:
+    mov     x0, #0               /* a debugger that resumes without answering must not look like an answer */
     brk     #0x69
     ret
 

@@ -8,7 +8,10 @@ import UIKit
 /// Documents/henge-autopilot-once.txt is renamed to henge-autopilot.txt and followed, so the next
 /// launch runs nothing. Put the files there with devicectl device copy to. One command per line,
 /// picking up lines added later while it runs:
-///   mac [NAME]         start that Mac (the one used last without a name) once JIT is on
+///   mac [NAME]         start that Mac (the one used last without a name) once JIT is on. The plan is the only thing
+///                      that starts a Mac: Settings' Open straight into my Mac does nothing in a launch the autopilot
+///                      follows. One Mac per launch: nothing if a session is open already, or once a Mac has run in
+///                      this launch (launch Henge again)
 ///   wait SECONDS
 ///   type TEXT          typed into the Mac (the log shows only how long it is)
 ///   key CODE           a Linux key code (28 is Return, 1 is Escape)
@@ -21,6 +24,12 @@ import UIKit
 ///   balloon MB         ask the Mac for that much of its memory back (HV_BALLOON set), log what it gave
 ///   snap [NAME]        the Mac's screen (1920x1080) into Documents/NAME.jpg (snap.jpg)
 ///   log TEXT           a marker in henge.log
+///   bench [LABEL [STEPS]]  the benchmark (host/bench.h) on the running Mac, into Documents/henge-bench.jsonl
+///                      (LABEL - for none):
+///                      STEPS "all" (idle, video, scroll, apps, cpu, rosetta) or some, with commas between; waits
+///                      for the helper (it may be updating itself) and for the run to end, up to 30 minutes. The
+///                      helper runs in a logged-in Mac: one at its login window waits for someone to log in (up to
+///                      10 minutes), and says so at once ("waiting for someone to log in")
 ///   stop               stop the Mac
 ///   exit               quit Henge
 /// Each command is written to henge.log as it runs, so the log has the timeline.
@@ -141,6 +150,8 @@ enum Autopilot {
             HengeLog.log("autopilot", got < 0 ? "no balloon (set HV_BALLOON in henge-env.txt)" : "balloon: the Mac has handed over \(got) MB")
         case "log": // already in the log; the wall clock too, to line it up with things measured elsewhere
             HengeLog.log("autopilot", String(format: "at %.3f", Date().timeIntervalSince1970))
+        case "bench":
+            await bench(arg)
         case "stop":
             henge_vm_stop()
         case "exit":
@@ -150,5 +161,50 @@ enum Autopilot {
         default:
             HengeLog.log("autopilot", "unknown command")
         }
+    }
+
+    /// "bench [LABEL [STEPS]]": asks once this build's own helper is linked (up to 10 minutes: an older one updates
+    /// itself first, and doing so would end a run part way), then waits for the run to end. The helper runs in the
+    /// logged-in person's session, so a Mac at its login window (the system part says so: host/share.h) waits for
+    /// someone to log in; that is said in the log as soon as it is seen, for bench-ipad.sh to pass on, not found out
+    /// when the 10 minutes are up. Nothing here logs in: the Mac's own settings say whether it logs in by itself.
+    @MainActor private static func bench(_ arg: String) async {
+        let words = arg.split(separator: " ").map(String.init)
+        let label = words.first.map { $0 == "-" ? "" : $0 } ?? "", steps = words.count > 1 ? words[1] : "all"
+        let info = Bundle.main.infoDictionary ?? [:]
+        let build = "\(info["HengeBuildCommit"] as? String ?? "unstamped") \(info["CFBundleShortVersionString"] as? String ?? "?") (\(info["CFBundleVersion"] as? String ?? "?"))"
+        var asked = false, why = "", atLogin = false
+        let askUntil = Date().addingTimeInterval(600)
+        while !asked && Date() < askUntil && !Task.isCancelled {
+            if henge_vm_state() == 1 && henge_share_can_bench() != 0 {
+                var buf = [CChar](repeating: 0, count: 256)
+                asked = henge_vm_bench(label, steps, build, &buf, buf.count) == 0
+                why = String(cString: buf)
+            } else if henge_vm_state() == 1 {
+                /* Only what the system part says moves this: at the login window (HV_SESSION_LOGIN) or someone's
+                   session (HV_SESSION_USER). Not known (its link down while it updates itself, or the Mac restarting)
+                   and starting leave it as it was, as SessionView does. */
+                let session = henge_share_session()
+                if (session == 1 || session == 2) && (session == 1) != atLogin {
+                    atLogin = session == 1
+                    let left = max(1, Int(askUntil.timeIntervalSinceNow / 60 + 0.99))
+                    HengeLog.log("autopilot", atLogin
+                        ? "waiting for someone to log in: the Mac is at its login window, and the benchmark's helper runs only once someone has (up to \(left) more minute\(left == 1 ? "" : "s"))"
+                        : "the Mac is past its login window: waiting for the helper")
+                }
+                why = atLogin ? "the Mac stayed at its login window: nobody logged in" : "no helper that can run it yet"
+            } else {
+                why = "no Mac running"
+            }
+            if !asked { try? await Task.sleep(nanoseconds: 5_000_000_000) }
+        }
+        guard asked else { HengeLog.log("autopilot", "bench not started: \(why)"); return }
+        HengeLog.log("autopilot", "bench \(label) \(steps) under way")
+        let endBy = Date().addingTimeInterval(1800)
+        while henge_vm_bench_state() == 1 && Date() < endBy && !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+        if henge_vm_bench_state() == 1 { henge_vm_bench_give_up("timeout") }
+        HengeLog.log("autopilot", "bench \(henge_vm_bench_state() == 2 ? "done" : "failed"): Documents/henge-bench.jsonl")
     }
 }

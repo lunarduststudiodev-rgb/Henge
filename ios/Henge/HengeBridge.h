@@ -2,3 +2,4 @@
 #include "Native/henge-vm.h"
 #include "Native/HuskRPPairing.h"
 #include "hvsparse.h"
+#include "Native/henge-logq.h"

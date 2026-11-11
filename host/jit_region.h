@@ -31,6 +31,11 @@ void hv_jit_region_close(HvJitRegion *region);
 /* Copy `words` instructions to start (an executable address) and make them runnable. */
 void hv_jit_write(HvJitRegion *region, uint32_t *start, const void *src, size_t bytes);
 void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words);
+/* Rewrite n single instructions anywhere in the region (*at[k] = words[k], each in one store as hv_jit_write does)
+   and make them all runnable with one round of cache maintenance and barriers, not one each: what n pairs of
+   hv_jit_write and hv_jit_finish do. Patching code other CPUs run must be a change CPUs may run either side of
+   (a B or a NOP to another B). */
+void hv_jit_patch(HvJitRegion *region, uint32_t *const *at, const uint32_t *words, size_t n);
 
 /* Space for `words` instructions, or NULL when the region is full. */
 uint32_t *hv_jit_reserve(HvJitRegion *region, size_t words);

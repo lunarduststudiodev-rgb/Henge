@@ -19,7 +19,10 @@
 #define CPU_NZCV 0x108
 #define CPU_V 0x140
 #define CPU_FPCR 0x340
+#define CPU_FPCR_NATIVE 0x538
+#define CPU_ROSETTA 0x540
 #define CPU_FPSR 0x348
+#define HV_FPCR_MASK 0x07c80000 // as in cpu.h
 #define CPU_HELPER_RET 0x358
 #define CPU_HELPER_FROM 0x510
 #define CPU_SP 0xf8
@@ -234,6 +237,12 @@ _hv_helper_thunk:
     stp x12, x13, [x28, #96]
     str x14, [x28, #112]
     stp x16, x17, [x28, #128]
+    stp x19, x20, [x28, #152]     // the rest too: a page's last bytes are loaded or stored there (2 below)
+    stp x21, x22, [x28, #168]
+    stp x23, x24, [x28, #184]
+    stp x25, x26, [x28, #200]
+    str x27, [x28, #216]
+    str x29, [x28, #232]
     mov w2, w15
     mrs x15, nzcv
     str x15, [x28, #CPU_NZCV]
@@ -259,11 +268,22 @@ _hv_helper_thunk:
     ldp x16, x17, [x28, #128]
     ldr x30, [x28, #CPU_REFILL_RET]
     ldr x6, [x28, #0x130]
-    cbnz x7, 3f
+    tbnz x7, #1, 4f
+    cbnz w7, 3f            // an int: only the low half is defined
     // Filled: back to the start of the access, (op >> 19) words before where the helper would resume.
     ldr w15, [x6, #12]
     lsr w15, w15, #19
     sub x6, x30, x15, lsl #2
+    ldr x30, [x28, #240]
+    ret x6
+    // Done (2): the access is made and its registers are in the HvCpu; on as the helper would go.
+4:  ldp x19, x20, [x28, #152]
+    ldp x21, x22, [x28, #168]
+    ldp x23, x24, [x28, #184]
+    ldp x25, x26, [x28, #200]
+    ldr x27, [x28, #216]
+    ldr x29, [x28, #232]
+    mov x6, x30
     ldr x30, [x28, #240]
     ret x6
 3:  stp x0, x1, [x28]
@@ -351,7 +371,9 @@ _hv_xjump_thunk:
     and x6, x15, #1
     add x6, x28, x6, lsl #3
     ldr x6, [x6, #CPU_IJC_SALT]
-    and x15, x15, #15
+    tbz w15, #5, 7f               // HV_BLOCK_TSO: the EL0 table with bit 2 set (hv_ijc_table, machine.h)
+    orr w15, w15, #4
+7:  and x15, x15, #15
     add x15, x28, x15, lsl #3
     ldr x15, [x15, #CPU_IJC_TAB]  // this flags value's table
     ldr x7, [x7, #8]
@@ -419,7 +441,14 @@ _hv_xjump_thunk:
 
 // hv_fp_enter(cpu): the guest's FPCR and FPSR into the host registers.
 _hv_fp_enter:
-    ldr x1, [x0, #CPU_FPCR]
+    ldr x2, [x0, #CPU_ROSETTA]
+    cbz x2, 1f
+    ldr x1, [x0, #CPU_FPCR_NATIVE]          // Rosetta: the effective controls, masked by hv_rosetta_fp_apply
+    b 2f
+1:  ldr x1, [x0, #CPU_FPCR]
+    movz x2, #(HV_FPCR_MASK >> 16), lsl #16   // only the bits a guest may set (cpu.h)
+    and x1, x1, x2
+2:
     msr fpcr, x1
     ldr x1, [x0, #CPU_FPSR]
     msr fpsr, x1
@@ -427,8 +456,11 @@ _hv_fp_enter:
 
 // hv_fp_leave(cpu): and back into the HvCpu.
 _hv_fp_leave:
+    ldr x2, [x0, #CPU_ROSETTA]
+    cbnz x2, 1f
     mrs x1, fpcr
     str x1, [x0, #CPU_FPCR]
+1:
     mrs x1, fpsr
     str x1, [x0, #CPU_FPSR]
     ret

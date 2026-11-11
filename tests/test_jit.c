@@ -88,7 +88,7 @@ int main(void) {
             if (bad) printf("%-12s with a full JIT region: FAIL\n", programs[i].name);
             failed += bad != 0;
         }
-        printf("with a 1 KB JIT region: %llu flushes\n", (unsigned long long)small.stats.block_flushes);
+        printf("with a 1 KB JIT region: %llu flushes\n", (unsigned long long)HV_STAT_TOTAL(&small, block_flushes));
     }
     printf("%zu programs x 2 seeds, %d failures, %d blocks translated\n", count, failed, m.nblocks);
     return failed != 0;

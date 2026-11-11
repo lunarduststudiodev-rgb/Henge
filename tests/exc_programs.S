@@ -108,6 +108,27 @@ PROGRAM p_dabt
     mov x10, x8
 END p_dabt
 
+// Accesses that must be aligned (load-acquire, atomics), misaligned on a page whose TLB entry is there: an
+// alignment fault, not a light refill that sends them round again for ever.
+PROGRAM p_align
+    SETUP
+    mov x8, x9
+    ldr x7, [x8]
+    add x8, x8, #1
+1:  ldar x7, [x8]
+    mov x1, x20
+    mov x2, x21
+    adr x3, 1b
+    mov x4, x22
+    add x8, x8, #2
+2:  ldadd x10, x11, [x8]
+    mov x5, x20
+    mov x6, x21
+    adr x12, 2b
+    mov x13, x22
+    mov x14, x24
+END p_align
+
 // Down to EL0 and back up through SVC and an undefined MRS.
 PROGRAM p_el0
     SETUP
@@ -127,6 +148,25 @@ PROGRAM p_el0
     msr tpidr_el0, x17
     mrs x18, tpidr_el0
 END p_el0
+
+// DC ZVA at EL0 with SCTLR_EL1.DZE clear is undefined, also when it misses the TLB (x9: a page EL0 has not used).
+PROGRAM p_dze
+    SETUP
+    mov x1, #0x55
+    str x1, [x9]
+    mrs x0, sctlr_el1
+    bic x0, x0, #(1 << 14)
+    msr sctlr_el1, x0
+    isb
+    adr x0, 1f
+    msr elr_el1, x0
+    msr spsr_el1, xzr       // EL0t
+    eret
+1:  dc zva, x9
+    mov x2, x20
+    mov x3, x24
+    ldr x4, [x9]
+END p_dze
 
 PROGRAM p_sysregs
     SETUP
@@ -185,6 +225,18 @@ PROGRAM p_fptrap
     mov x1, x20
     mov x2, x24
     fmov x3, d0
+    // FPCR and FPSR trap too while FP is off; the handler turns it on and they run again.
+    msr cpacr_el1, xzr
+    mov x4, #(1 << 24)
+    msr fpcr, x4
+    mov x5, x24
+    msr cpacr_el1, xzr
+    mrs x6, fpsr
+    mov x7, x24
+    mov x8, x20
+    msr cpacr_el1, xzr
+    mrs x9, fpcr
+    mov x10, x24
 END p_fptrap
 
 PROGRAM p_psci

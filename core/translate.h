@@ -24,6 +24,8 @@ enum {
     HV_OP_CLREX,
     HV_OP_WFI,
     HV_OP_WFE,         /* waits for the exclusive monitor's word to change (or a request); the block carries on */
+    HV_OP_APFLAGS,    /* software Apple integer parity/adjust flags */
+    HV_OP_APFCMP,     /* parity from the native floating compare result */
 };
 
 #define HV_MAX_BLOCK_INSNS 128
@@ -38,7 +40,19 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t 
    translation lock). place returns -1 if the region is full. */
 int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail);
 int hv_translate_place(HvMachine *m, HvBlock *b);
+/* This thread's last block: its copied words the host may lack, as
+   HV_UNDEF_ENTRY(word in the hot part, guest instruction); *n is
+   HV_UNDEF_UNKNOWN if there were too many to record. */
+const uint32_t *hv_translate_undef_map(uint32_t *n);
+#define HV_UNDEF_ENTRY(hot_word, insn) ((uint32_t)(hot_word) << 8 | (uint32_t)(insn))
 uint32_t hv_translate_last_words(void);
+/* 1 if this thread's last block can't be kept on storage (core/codestore.c): its code holds this run's host
+   addresses. */
+int hv_translate_last_nosave(void);
+/* Guest words, from the block's first, that this thread's last translation depends on. */
+uint32_t hv_translate_last_read(void);
+/* A fingerprint of what translated code depends on beyond the guest's instructions and this build. */
+uint64_t hv_translate_config(const HvMachine *m);
 
 int hv_branch_retarget(uint32_t *w, int64_t off);
 

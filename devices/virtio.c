@@ -174,7 +174,7 @@ void hv_virtio_config_changed(HvVirtio *v) {
 
 int hv_virtq_pop(HvVirtio *v, int qi, HvVirtqElem *e) {
     HvVirtq *q = &v->q[qi];
-    uint16_t *avail = hv_phys_ptr(v->m, q->avail, 4 + 2u * q->size);
+    const uint16_t *avail = hv_phys_ptr_r(v->m, q->avail, 4 + 2u * q->size);
     if (!avail) return 0; /* not set up: nothing taken (-1 means an element was taken but is broken) */
     uint16_t idx = __atomic_load_n(&avail[1], __ATOMIC_ACQUIRE);
     if (q->last_avail == idx) return 0;
@@ -208,7 +208,7 @@ int hv_virtq_pop(HvVirtio *v, int qi, HvVirtqElem *e) {
     uint16_t i = head;
     for (uint32_t steps = 0; steps < HV_VIRTQ_MAX_SEGS; steps++) {
         if (i >= count) return -1;
-        uint8_t *d = hv_phys_ptr(v->m, table + 16u * i, 16);
+        const uint8_t *d = hv_phys_ptr_r(v->m, table + 16u * i, 16);
         if (!d) return -1;
         uint64_t addr;
         uint32_t len;
@@ -243,7 +243,7 @@ void hv_virtq_push(HvVirtio *v, int qi, const HvVirtqElem *e, uint32_t written) 
         return;
     }
     q->out[e->head] = 0;
-    uint8_t *used = hv_phys_ptr(v->m, q->used, 4 + 8u * q->size);
+    uint8_t *used = hv_phys_ptr_w(v->m, q->used, 4 + 8u * q->size);
     if (!used) return;
     uint16_t idx;
     memcpy(&idx, used + 2, 2);
@@ -253,6 +253,7 @@ void hv_virtq_push(HvVirtio *v, int qi, const HvVirtqElem *e, uint32_t written) 
     __atomic_thread_fence(__ATOMIC_RELEASE);
     idx++;
     memcpy(used + 2, &idx, 2);
+    hv_dma_written(v->m, q->used, 4 + 8u * q->size); /* as any device write: code there is stale now */
 }
 
 static uint32_t copy(HvVirtio *v, const HvVirtqElem *e, int writable, uint32_t off, uint8_t *buf, uint32_t len) {
@@ -266,10 +267,16 @@ static uint32_t copy(HvVirtio *v, const HvVirtqElem *e, int writable, uint32_t o
         }
         uint32_t n = g->len - off;
         if (n > len - done) n = len - done;
-        uint8_t *p = hv_phys_ptr(v->m, g->addr + off, n);
-        if (!p) break;
-        if (writable) memcpy(p, buf + done, n);
-        else memcpy(buf + done, p, n);
+        if (writable) {
+            uint8_t *p = hv_phys_ptr_w(v->m, g->addr + off, n);
+            if (!p) break;
+            memcpy(p, buf + done, n);
+            hv_dma_written(v->m, g->addr + off, n); /* drops translations of code it overwrote */
+        } else {
+            const uint8_t *p = hv_phys_ptr_r(v->m, g->addr + off, n);
+            if (!p) break;
+            memcpy(buf + done, p, n);
+        }
         done += n;
         off = 0;
     }

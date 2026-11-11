@@ -1,1 +1,28 @@
+# Build outputs
 build/
+DerivedData/
+xcuserdata/
+.DS_Store
+
+# Private working folders (notes, trackers, logs, local tools): never published
+local/
+VM Claude/
+.claude/
+
+# Your own signing settings and keys (see signing.local.env.example)
+signing.local.env
+.signing/
+*.mobileprovision
+*.p12
+*.cer
+
+# Apple's software: macOS restore images, disk images and firmware are downloaded, never committed
+*.ipsw
+*.dmg
+*.img
+AVPBooter*.bin
+*.im4p
+
+# Logs and benchmark output
+*.log
+henge-bench*.jsonl

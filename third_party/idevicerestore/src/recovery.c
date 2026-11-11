@@ -21,6 +21,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,8 @@
 
 #include "idevicerestore.h"
 #include "img3.h"
+#include "img4.h"
+#include "ipsw.h"
 #include "restore.h"
 #include "recovery.h"
 
@@ -281,6 +284,110 @@ int recovery_send_ticket(struct idevicerestore_client_t* client)
 	return 0;
 }
 
+struct recovery_image_stream {
+	ipsw_file_handle_t file;
+	size_t remaining;
+	unsigned char opening[48]; /* IMG4 header followed by the prefetched IM4P fields */
+	size_t opening_size, opening_offset;
+	struct img4_envelope envelope;
+	size_t suffix_offset;
+	int checked_end;
+};
+
+static int read_archive_exact(ipsw_file_handle_t file, unsigned char* buf, size_t size)
+{
+	while (size) {
+		int64_t n = ipsw_file_read(file, buf, size);
+		if (n <= 0 || (uint64_t)n > size)
+			return -1;
+		buf += n;
+		size -= n;
+	}
+	return 0;
+}
+
+static size_t copy_part(unsigned char* dst, size_t size, const unsigned char* src, size_t length, size_t* offset)
+{
+	size_t n = length - *offset;
+	if (n > size)
+		n = size;
+	memcpy(dst, src + *offset, n);
+	*offset += n;
+	return n;
+}
+
+static int read_recovery_image(void* context, unsigned char* buf, size_t size)
+{
+	struct recovery_image_stream* stream = context;
+	size_t n = copy_part(buf, size, stream->opening, stream->opening_size, &stream->opening_offset);
+	buf += n;
+	size -= n;
+	if (stream->remaining && size) {
+		n = size < stream->remaining ? size : stream->remaining;
+		if (read_archive_exact(stream->file, buf, n) < 0)
+			return -1;
+		stream->remaining -= n;
+		buf += n;
+		size -= n;
+	}
+	if (!stream->remaining && !stream->checked_end) {
+		unsigned char extra;
+		if (ipsw_file_read(stream->file, &extra, 1) != 0)
+			return -1;
+		stream->checked_end = 1;
+	}
+	n = copy_part(buf, size, stream->envelope.suffix, stream->envelope.suffix_size, &stream->suffix_offset);
+	return n == size ? 0 : -1;
+}
+
+/* 0 sent, -1 failed, 1 this connection cannot stream (nothing was sent). */
+static int recovery_stream_ramdisk(struct idevicerestore_client_t* client, const char* path)
+{
+	struct recovery_image_stream stream = {0};
+	stream.file = ipsw_file_open(client->ipsw, path);
+	if (!stream.file) {
+		logger(LL_ERROR, "Unable to open RestoreRamDisk in the restore image\n");
+		return -1;
+	}
+
+	int rc = -1;
+	uint64_t length = ipsw_file_size(stream.file);
+	unsigned char component_prefix[32];
+	size_t head = length < sizeof(component_prefix) ? (size_t)length : sizeof(component_prefix);
+	if (!head || length > UINT32_MAX || read_archive_exact(stream.file, component_prefix, head) < 0) {
+		logger(LL_ERROR, "Unable to read the RestoreRamDisk header\n");
+		goto done;
+	}
+	if (img4_build_envelope("RestoreRamDisk", component_prefix, head, (size_t)length,
+		client->parameters, client->tss, &stream.envelope) < 0)
+		goto done;
+
+	stream.remaining = (size_t)length - head;
+	memcpy(stream.opening, stream.envelope.prefix, stream.envelope.prefix_size);
+	memcpy(stream.opening + stream.envelope.prefix_size, component_prefix, head);
+	stream.opening_size = stream.envelope.prefix_size + head;
+	if (length > ULONG_MAX - stream.envelope.prefix_size ||
+	    stream.envelope.suffix_size > ULONG_MAX - stream.envelope.prefix_size - length)
+		goto done;
+	unsigned long total = (unsigned long)length + stream.envelope.prefix_size + stream.envelope.suffix_size;
+	logger(LL_INFO, "Streaming RestoreRamDisk (%lu bytes)...\n", total);
+	register_progress('RECV', "Uploading");
+	irecv_error_t err = irecv_send_recovery_stream(client->recovery->client, total, read_recovery_image, &stream);
+	finalize_progress('RECV');
+	if (err == IRECV_E_SUCCESS)
+		rc = 0;
+	else if (err == IRECV_E_UNSUPPORTED) {
+		/* Refused before anything was sent: the caller sends it whole instead. */
+		logger(LL_INFO, "This connection cannot stream RestoreRamDisk; sending it whole\n");
+		rc = 1;
+	} else
+		logger(LL_ERROR, "Unable to stream RestoreRamDisk: %s\n", irecv_strerror(err));
+done:
+	free(stream.envelope.suffix);
+	ipsw_file_close(stream.file);
+	return rc;
+}
+
 int recovery_send_component(struct idevicerestore_client_t* client, plist_t build_identity, const char* component)
 {
 	size_t size = 0;
@@ -298,6 +405,17 @@ int recovery_send_component(struct idevicerestore_client_t* client, plist_t buil
 			logger(LL_ERROR, "Unable to get path for component '%s'\n", component);
 			free(path);
 			return -1;
+		}
+	}
+
+	/* The embedded Mac restore shares memory with the running VM. Keeping
+	 * the ramdisk and its personalized copy in memory can exhaust it. */
+	if (client->macos_variant && !strcmp(component, "RestoreRamDisk") &&
+	    !(client->flags & FLAG_KEEP_PERS) && client->tss && plist_dict_get_item(client->tss, "ApImg4Ticket")) {
+		int ret = recovery_stream_ramdisk(client, path);
+		if (ret <= 0) {
+			free(path);
+			return ret;
 		}
 	}
 

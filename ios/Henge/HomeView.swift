@@ -6,6 +6,8 @@ struct HomeView: View {
     @ObservedObject private var machines = Machines.shared
     @ObservedObject private var jit = JITCoordinator.shared
     @ObservedObject private var installer = Installer.shared
+    @ObservedObject private var downloads = ImageDownloads.shared
+    @ObservedObject private var suspendedMacs = SuspendedMacs.shared
     @Binding var running: VirtualMac?
     @Binding var tab: RootView.Tab
     @State private var picking = false
@@ -24,8 +26,8 @@ struct HomeView: View {
                 VStack(spacing: 14) {
                     notices
                     if let mac {
-                        MacHero(mac: mac, jitReady: jitReady, start: { running = mac }, turnOnJIT: { jit.enable() },
-                                jitNote: jitReady ? nil : (JITBootstrap.lastFailure ?? jit.automaticDescription))
+                        MacHero(mac: mac, jitReady: jitReady, start: { running = mac },
+                                jitNote: jitReady || jit.error != nil ? nil : JITBootstrap.lastFailure)
                         HStack(spacing: 10) {
                             FactTile(title: "Disk", value: ByteText.string(UInt64(max(mac.bytesUsed, 0))))
                             FactTile(title: "Last used", value: mac.lastUsedText)
@@ -74,6 +76,15 @@ struct HomeView: View {
                 NoticeRow(symbol: "arrow.down.circle.fill", text: "Installing \(installer.machineName)…", trailing: "See")
             }
         }
+        if !installer.busy {
+            ForEach(MacOSRelease.all.filter { downloads.status[$0.id] != nil }) { r in
+                let s = downloads.status[r.id]!
+                Button { tab = .install } label: {
+                    NoticeRow(symbol: s.paused ? "pause.circle.fill" : "arrow.down.circle.fill",
+                              text: "\(r.name): \(s.paused ? "download paused at" : "downloading,") \(Int(s.fraction * 100))%", trailing: "See")
+                }
+            }
+        }
         if let name = machines.importing {
             NoticeRow(symbol: "square.and.arrow.down.fill",
                       text: machines.unpacked > 0 ? String(format: "Unpacking %@'s disk… %.0f%%", name, machines.unpacked * 100) : "Bringing in \(name)…")
@@ -112,7 +123,8 @@ struct HomeView: View {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(other.name).font(.system(size: 16, weight: .medium)).foregroundStyle(Desk.text)
-                                Text(other.summary).font(.system(size: 13)).foregroundStyle(Desk.dim)
+                                Text(suspendedMacs.ids.contains(other.id) ? "Suspended · \(other.summary)" : other.summary)
+                                    .font(.system(size: 13)).foregroundStyle(Desk.dim)
                             }
                             Spacer()
                             Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold)).foregroundStyle(Desk.faint)
@@ -153,10 +165,14 @@ extension VirtualMac {
 private struct MacHero: View {
     let mac: VirtualMac
     let jitReady: Bool
+    /// Runs once JIT is on: NeedsJITButton turns it on first when it is off.
     let start: () -> Void
-    let turnOnJIT: () -> Void
     let jitNote: String?
     @AppStorage("henge.cpus") private var cpus = 4
+
+    @ObservedObject private var suspendedMacs = SuspendedMacs.shared
+    /// Suspended: Start carries on from where it was (MacSuspend.boot), so it says Resume.
+    private var suspended: Bool { suspendedMacs.ids.contains(mac.id) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -166,12 +182,7 @@ private struct MacHero: View {
                     HStack {
                         Text(mac.name).font(.system(size: 24, weight: .bold)).foregroundStyle(Desk.text).lineLimit(1)
                         Spacer()
-                        Text(jitReady ? "JIT on" : "JIT off")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(jitReady ? Desk.good : Desk.warn)
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 5)
-                            .background((jitReady ? Desk.good : Desk.warn).opacity(0.13), in: Capsule())
+                        JITBadge(ready: jitReady)
                         Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold)).foregroundStyle(Desk.faint)
                     }
                     .padding(.top, 15)
@@ -185,37 +196,45 @@ private struct MacHero: View {
                 }
             }
             .buttonStyle(.plain)
-            if jitReady {
-                Button(action: start) {
-                    Label("Start", systemImage: "play.fill")
-                }
-                .buttonStyle(DeskButtonStyle())
-                .padding(.top, 15)
-            } else {
-                if let jitNote {
-                    Text(jitNote).font(.system(size: 13)).foregroundStyle(Desk.dim)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 5)
-                        .padding(.top, 10)
-                }
-                Button("Turn On JIT", action: turnOnJIT)
-                    .buttonStyle(DeskButtonStyle())
-                    .padding(.top, 15)
+            if suspended {
+                Label("Suspended. Resume carries on where you left off, with its apps and windows open.", systemImage: "moon.zzz.fill")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(Desk.accentLight)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 5)
+                    .padding(.top, 10)
             }
+            if let jitNote {
+                Text(jitNote).font(.system(size: 13)).foregroundStyle(Desk.dim)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 5)
+                    .padding(.top, 10)
+            }
+            NeedsJITButton(title: suspended ? "Resume" : "Start", systemImage: "play.fill", takeOver: {
+                if suspended { ResumePicture.preload(ResumePicture.screen(for: mac)) } // ready for the session's first frame
+                guard Relaunch.needed else { return false }
+                Relaunch.shared.start(mac) // a Mac has run in this launch: a fresh Henge starts this one
+                return true
+            }, action: start)
+                .padding(.top, 15)
         }
         .padding(14)
         .deskCard(radius: 30)
     }
 
+    /// What the Mac's screen shows now, as a Mac in a dock would: a suspended Mac's screen as it was, frozen;
+    /// a Mac that is off, a dark screen. Its last desktop would say it is still on.
     @ViewBuilder private var preview: some View {
         ZStack {
-            Desk.raised.opacity(0.5)
-            if let image = UIImage(contentsOfFile: MacPreview.file(for: mac).path) {
+            if suspended, let image = UIImage(contentsOfFile: MacPreview.file(for: mac).path) {
                 Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
             } else {
-                Image(systemName: "macwindow.on.rectangle")
-                    .font(.system(size: 46, weight: .light))
-                    .foregroundStyle(Desk.faint)
+                Color.black
+                VStack(spacing: 8) {
+                    Image(systemName: "power").font(.system(size: 34, weight: .light))
+                    Text(mac.lastUsed == nil ? "Never Started" : "Shut Down").font(.system(size: 14, weight: .medium))
+                }
+                .foregroundStyle(Color.white.opacity(0.3))
             }
         }
         .aspectRatio(mac.aspect, contentMode: .fit)

@@ -46,6 +46,8 @@ import UserNotifications
     @Published private(set) var phase: Phase = .idle
     /// iOS refused the continued-processing task: Henge can only wait briefly in the background.
     @Published private(set) var backgroundLimited = false
+    /// Still waiting after a while: the passcode prompt in Settings was probably closed.
+    @Published private(set) var waitedLong = false
 
     static var isSupported: Bool {
         ProcessInfo.processInfo.isOperatingSystemAtLeast(
@@ -70,6 +72,10 @@ import UserNotifications
     private var registered: String?
     private var grace: UIBackgroundTaskIdentifier = .invalid
     private var deadline: Timer?
+    /// Ticks the continued task's progress: iOS expires continued tasks that look stalled.
+    private var ticker: Timer?
+    private var startedAt = Date()
+    private var activeObserver: NSObjectProtocol?
 
     private init() {}
 
@@ -85,6 +91,8 @@ import UserNotifications
         self.session = session
         phase = .waiting
         backgroundLimited = false
+        waitedLong = false
+        startedAt = Date()
         log("started")
         requestNotifications()
         guard publish(session) else {
@@ -97,6 +105,14 @@ import UserNotifications
             MainActor.assumeIsolated {
                 OnDevicePairing.shared.cancel(reason: "Pairing timed out. Try again when you are ready to pair from Settings.")
             }
+        }
+        ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+            MainActor.assumeIsolated { OnDevicePairing.shared.tick() }
+        }
+        // Back in Henge: renew background time that iOS took away, so the next Settings tap still works.
+        activeObserver = activeObserver ?? NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { OnDevicePairing.shared.renewBackground() }
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
@@ -124,6 +140,7 @@ import UserNotifications
         guard let session else { return }
         husk_rppairing_cancel(session)
         stopAdvertising()
+        stopTimers()
         phase = reason.map(Phase.failed) ?? .idle
         log(reason == nil ? "cancelled" : "stopped")
     }
@@ -137,14 +154,15 @@ import UserNotifications
     private func showPin(_ pin: String) {
         guard active else { return }
         phase = .pin(pin)
+        waitedLong = false
         log("code shown")
         #if compiler(>=6.2)
         if #available(iOS 26.0, *), let task = continued as? BGContinuedProcessingTask {
             task.updateTitle("Pairing code \(pin)", subtitle: "Enter it on this \(Self.deviceKind) to pair with Henge")
-            task.progress.completedUnitCount = 1
         }
         #endif
-        if UIApplication.shared.applicationState != .active {
+        // The system's progress banner already shows the code; a notification only when that banner is not there.
+        if continued == nil, UIApplication.shared.applicationState != .active {
             notify("Henge pairing code: \(pin)", body: "Enter this code on your \(Self.deviceKind) to finish pairing.")
         }
     }
@@ -153,8 +171,7 @@ import UserNotifications
         if let session { husk_rppairing_free(session) }
         session = nil
         stopAdvertising()
-        deadline?.invalidate()
-        deadline = nil
+        stopTimers()
         switch status {
         case 0:
             do {
@@ -179,9 +196,31 @@ import UserNotifications
     private func fail(_ message: String) {
         if let session { husk_rppairing_cancel(session) }
         stopAdvertising()
+        stopTimers()
         phase = .failed(message)
         log("failed")
         endBackground(success: false)
+    }
+
+    private func stopTimers() {
+        deadline?.invalidate()
+        deadline = nil
+        ticker?.invalidate()
+        ticker = nil
+    }
+
+    private func tick() {
+        guard active else { return }
+        let elapsed = Date().timeIntervalSince(startedAt)
+        if phase == .waiting, elapsed >= 45, !waitedLong {
+            waitedLong = true
+            log("still waiting")
+        }
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *), let task = continued as? BGContinuedProcessingTask {
+            task.progress.completedUnitCount = min(Int64(elapsed), task.progress.totalUnitCount - 1)
+        }
+        #endif
     }
 
     static var deviceKind: String { UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone" }
@@ -243,6 +282,27 @@ import UserNotifications
     }
 
     private func beginBackground() {
+        beginGrace()
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) { submitContinued() } else { backgroundLimited = true }
+        #else
+        backgroundLimited = true
+        #endif
+    }
+
+    /// Henge is in front again while still waiting: take fresh background time for the next trip to Settings.
+    private func renewBackground() {
+        guard active, session != nil else { return }
+        if grace == .invalid { beginGrace() }
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *), continued == nil, !backgroundLimited {
+            log("continued-processing renewed")
+            submitContinued()
+        }
+        #endif
+    }
+
+    private func beginGrace() {
         grace = UIApplication.shared.beginBackgroundTask(withName: "Henge pairing") {
             MainActor.assumeIsolated {
                 let pairing = OnDevicePairing.shared
@@ -253,11 +313,6 @@ import UserNotifications
                 pairing.endGrace()
             }
         }
-        #if compiler(>=6.2)
-        if #available(iOS 26.0, *) { submitContinued() } else { backgroundLimited = true }
-        #else
-        backgroundLimited = true
-        #endif
     }
 
     #if compiler(>=6.2)
@@ -288,15 +343,21 @@ import UserNotifications
     private func attach(_ task: BGContinuedProcessingTask) {
         guard active else { task.setTaskCompleted(success: false); return }
         continued = task
-        task.progress.totalUnitCount = 2
+        // A countdown to the timeout: steady progress keeps iOS from treating the wait as stalled.
+        task.progress.totalUnitCount = Int64(Self.timeout) + 1
+        task.progress.completedUnitCount = Int64(Date().timeIntervalSince(startedAt))
         if case .pin(let pin) = phase {
             task.updateTitle("Pairing code \(pin)", subtitle: "Enter it on this \(Self.deviceKind) to pair with Henge")
-            task.progress.completedUnitCount = 1
         }
-        task.expirationHandler = {
+        // iOS can end this early (for example when the user dismisses it). Keep pairing on whatever
+        // background time is left; Henge renews the task when it comes back to the front.
+        task.expirationHandler = { [weak task] in
             DispatchQueue.main.async {
-                OnDevicePairing.shared.continued = nil
-                OnDevicePairing.shared.cancel(reason: "iOS stopped the pairing in the background. Try again.")
+                let pairing = OnDevicePairing.shared
+                guard let task, pairing.continued === task else { return }
+                pairing.continued = nil
+                task.setTaskCompleted(success: false)
+                pairing.log("continued-processing expired; still listening")
             }
         }
         log("continued-processing running")

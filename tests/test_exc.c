@@ -2,11 +2,14 @@
 
 #include <mach/mach_time.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 DECLARE_PROGRAM(p_svc);
 DECLARE_PROGRAM(p_brk_undef);
 DECLARE_PROGRAM(p_dabt);
+DECLARE_PROGRAM(p_align);
 DECLARE_PROGRAM(p_el0);
+DECLARE_PROGRAM(p_dze);
 DECLARE_PROGRAM(p_sysregs);
 DECLARE_PROGRAM(p_irq);
 DECLARE_PROGRAM(p_fptrap);
@@ -86,6 +89,26 @@ int main(void) {
         check("dabt", "no writeback on a fault", c.x[10], 0x10000);
     }
 
+    static const TestProgram al = TEST_PROGRAM(p_align);
+    alarm(60); /* a misaligned access the light TLB refill retried for ever hung here */
+    if (!run(&al, &c, ADDR(stack) + 4096)) {
+        check("align", "LDAR ESR", c.x[1], 0x96000021);
+        check("align", "LDAR FAR", c.x[2], ADDR(stack) + 4097);
+        check("align", "LDAR ELR", c.x[4], c.x[3]);
+        check("align", "LDADD ESR (WnR)", c.x[5], 0x96000061);
+        check("align", "LDADD FAR", c.x[6], ADDR(stack) + 4099);
+        check("align", "LDADD ELR", c.x[13], c.x[12]);
+        check("align", "faults", c.x[14], 2);
+    }
+    alarm(0);
+
+    static const TestProgram dze = TEST_PROGRAM(p_dze);
+    if (!run(&dze, &c, ADDR(stack) + 49152 + 256)) {
+        check("dze", "DC ZVA at EL0 with DZE clear: ESR", c.x[2], 0x02000000);
+        check("dze", "one exception", c.x[3], 1);
+        check("dze", "nothing zeroed", c.x[4], 0x55);
+    }
+
     static const TestProgram el0 = TEST_PROGRAM(p_el0);
     uint64_t sp0 = ADDR(stack) + 8192;
     uint64_t sp1 = ADDR(stack) + 32768;
@@ -139,6 +162,11 @@ int main(void) {
     if (!run(&fp, &c, 0)) {
         check("fptrap", "ESR", c.x[1], 0x1fe00000);
         check("fptrap", "one trap", c.x[2], 1);
+        check("fptrap", "MSR FPCR with FP off traps", c.x[5], 2);
+        check("fptrap", "MRS FPSR with FP off traps", c.x[7], 3);
+        check("fptrap", "its ESR", c.x[8], 0x1fe00000);
+        check("fptrap", "MRS FPCR with FP off traps", c.x[10], 4);
+        check("fptrap", "FPCR written after the trap", c.x[9] & (1u << 24), 1u << 24);
         double d1, d2, d0;
         memcpy(&d1, &seeded.v[1], 8);
         memcpy(&d2, &seeded.v[2], 8);

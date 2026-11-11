@@ -15,30 +15,23 @@ enum EngineTuning {
         "HV_HZ": "60",         // the refresh rate macOS is told its display has
         "HV_WFI_SPIN": "0",    // microseconds an idle CPU watches for work before sleeping
         "HV_FLUSH": "2",       // disk flush: F_BARRIERFSYNC, ordered but without a full fsync
-        "HV_STATS": "10",      // seconds between engine stats lines in the log; 0 = off
+        // No HV_STATS: the engine's detailed statistics (a stats block in the log every N seconds, and the extra
+        // probes behind it) are for diagnosis, opted into with HV_STATS=10 in henge-env.txt. The counters the
+        // freeze and lag records use are counted per CPU without it.
     ]
 
     static func apply() {
         var env = defaults
+        unsetenv("HV_STATS") // only while henge-env.txt asks for it: removing the line turns it off at the next start
         let d = UserDefaults.standard
         if d.integer(forKey: refreshKey) == 120 { env["HV_HZ"] = "120" }
         if d.bool(forKey: superblocksKey) { env["HV_SUPERBLOCKS"] = "1" } else { unsetenv("HV_SUPERBLOCKS") }
         if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        // GPU command trace: on while Documents/trace-on exists (it is checked every frame, so it can be toggled live).
+        let docs = EnvFile.documents
+        // GPU command trace: on while Documents/trace-on exists (looked for once a second, so it can be toggled live).
         env["HV_PVG_TRACE_FILE"] = docs.appendingPathComponent("trace-on").path
-        let url = docs.appendingPathComponent("henge-env.txt")
-        if let text = try? String(contentsOf: url, encoding: .utf8) {
-            for raw in text.split(whereSeparator: \.isNewline) {
-                let line = raw.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init)?
-                    .trimmingCharacters(in: .whitespaces) ?? ""
-                guard let eq = line.firstIndex(of: "="), eq != line.startIndex else { continue }
-                // {Documents} stands for this folder: its absolute path changes when Henge is reinstalled.
-                env[String(line[..<eq]).trimmingCharacters(in: .whitespaces)] = String(line[line.index(after: eq)...])
-                    .trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "{Documents}", with: docs.path)
-            }
-        }
+        env.merge(EnvFile.read()) { _, file in file }
         for (k, v) in env.sorted(by: { $0.key < $1.key }) {
             setenv(k, v, 1)
             HengeLog.log("tuning", "\(k)=\(v)")

@@ -8,6 +8,7 @@ struct MacSettingsView: View {
     @State private var confirmDelete = false
     @State private var movingExport = false
     @AppStorage("henge.cpus") private var cpus = 4
+    private let rosettaSupported = henge_vm_rosetta_supported() != 0
 
     init(mac: VirtualMac) { _mac = State(initialValue: mac) }
 
@@ -28,14 +29,12 @@ struct MacSettingsView: View {
                     HStack(alignment: .firstTextBaseline) {
                         Text("\(mac.ramMB / 1024) GB").font(.system(size: 26, weight: .bold))
                         Spacer()
-                        Text(Entitlements.increasedMemory ? "Outside the app's limit once JIT is on" : "Used from free storage if needed")
+                        Text("Up to \(Device.suggestedRAMGB) GB suggested on this \(Device.name)")
                             .font(.system(size: 13)).foregroundStyle(Desk.dim).multilineTextAlignment(.trailing)
                     }
                     Stepper("Memory", value: Binding(get: { mac.ramMB / 1024 }, set: { mac.ramMB = $0 * 1024; save() }), in: Device.memoryChoices)
                         .font(.system(size: 16))
-                    if let note = Device.memoryNote(mac.ramMB / 1024) {
-                        Text(note).font(.system(size: 13)).foregroundStyle(Desk.dim)
-                    }
+                    MemoryNote(gb: mac.ramMB / 1024)
                 }
                 .padding(17)
                 .deskCard()
@@ -79,12 +78,29 @@ struct MacSettingsView: View {
                             Text("16:9").tag("wide")
                         }
                         .pickerStyle(.segmented)
-                        Text("\(mac.screen.width) × \(mac.screen.height). \(Device.isPad ? "Performance renders about 30% fewer pixels. " : "")Changes apply the next time this Mac starts.")
+                        Text(mac.isRetina
+                             ? "This \(Device.name)'s own \(mac.screen.width) × \(mac.screen.height) pixels, as sharp as its own apps. To make things larger or fit more on screen, choose a size in macOS System Settings › Displays; it changes straight away. Changes here apply the next time this Mac starts."
+                             : "\(mac.screen.width) × \(mac.screen.height). \(Device.isPad ? "Performance renders about 30% fewer pixels. " : "")Changes apply the next time this Mac starts.")
                             .font(.system(size: 13)).foregroundStyle(Desk.dim)
                     }
                     .padding(17)
                     .deskCard()
                 }
+
+                DeskHeading("Experimental")
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle(isOn: Binding(get: { rosettaSupported && mac.rosetta == true },
+                                         set: { mac.rosetta = $0 ? true : nil; save() })) {
+                        Text("Rosetta for Intel apps").font(.system(size: 16))
+                    }
+                    .disabled(!rosettaSupported)
+                    Text(rosettaSupported
+                         ? "Lets this Mac run apps made for Intel Macs. Experimental: those apps are slower and some may not work. It applies the next time this Mac starts afresh; a suspended Mac carries on as it was."
+                         : "Not available on this \(Device.name): its chip lacks a feature this needs (M2 and later have it).")
+                        .font(.system(size: 13)).foregroundStyle(Desk.dim)
+                }
+                .padding(17)
+                .deskCard()
 
                 DeskHeading("Storage")
                 VStack(spacing: 11) {
@@ -97,6 +113,8 @@ struct MacSettingsView: View {
                 }
                 .padding(17)
                 .deskCard()
+
+                KeptDisks(mac: mac)
 
                 DeskHeading("Manage")
                 manage
@@ -171,5 +189,88 @@ struct MacSettingsView: View {
     private func save() {
         if mac.name.isEmpty { mac.name = "Mac" }
         machines.update(mac)
+    }
+}
+
+/// The disks Carry On kept aside for this Mac (MacAutoSave.asideDisk): the person's own work from after an auto-save,
+/// never deleted by Henge. Shown only when there are any: when each was last written, what deleting it would free,
+/// and Use This Disk (swapped with the Mac's) or Delete.
+private struct KeptDisks: View {
+    let mac: VirtualMac
+    @State private var disks: [(url: URL, stamp: MacAutoSave.Stamp, frees: Int64)] = []
+    @State private var deleting: (URL, MacAutoSave.Stamp)?
+    @State private var using: (URL, MacAutoSave.Stamp)?
+    @State private var problem: String?
+
+    var body: some View {
+        Group {
+            if !disks.isEmpty {
+                DeskHeading("Disks Kept by Carry On")
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("When \(mac.name) carried on from an auto-save, the disk it had then was kept here, so nothing on it was lost. "
+                         + "Use This Disk puts one back (the disk it has now is kept here instead).")
+                        .font(.system(size: 13)).foregroundStyle(Desk.dim)
+                        .padding(17)
+                    ForEach(disks, id: \.url) { disk in
+                        let written = disk.stamp.date
+                        Rectangle().fill(Desk.hairline).frame(height: 0.5)
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack(alignment: .firstTextBaseline) {
+                                Text("Last written \(written.formatted(date: .abbreviated, time: .shortened))").font(.system(size: 16))
+                                Spacer()
+                                Text("\(ByteText.string(UInt64(max(disk.frees, 0)))) of storage")
+                                    .font(.system(size: 13)).foregroundStyle(Desk.dim)
+                            }
+                            HStack(spacing: 22) {
+                                Button("Use This Disk") { using = (disk.url, disk.stamp) }
+                                    .foregroundStyle(Desk.accentLight)
+                                Button("Delete") { deleting = (disk.url, disk.stamp) }
+                                    .foregroundStyle(Desk.bad)
+                            }
+                            .font(.system(size: 15, weight: .semibold))
+                            .buttonStyle(.borderless)
+                        }
+                        .padding(17)
+                    }
+                    if let problem {
+                        Text(problem).font(.system(size: 13)).foregroundStyle(Desk.bad).padding([.horizontal, .bottom], 17)
+                    }
+                }
+                .deskCard()
+            }
+        }
+        .task { await load() }
+        .confirmationDialog("Delete this disk?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+                            titleVisibility: .visible) {
+            Button("Delete", role: .destructive) {
+                if let (url, stamp) = deleting { problem = MacAutoSave.deleteAside(url, listed: stamp, for: mac) }
+                deleting = nil
+                Task { await load() }
+            }
+        } message: {
+            Text("Anything saved on it that isn't on \(mac.name)'s disk now is gone for good.")
+        }
+        .confirmationDialog("Use this disk?", isPresented: Binding(get: { using != nil }, set: { if !$0 { using = nil } }),
+                            titleVisibility: .visible) {
+            Button("Use This Disk") {
+                if let (url, stamp) = using { problem = MacAutoSave.useAside(url, listed: stamp, for: mac) }
+                using = nil
+                Task { await load() }
+            }
+        } message: {
+            Text("\(mac.name) starts from this disk next time. The disk it has now is kept here in its place, and its auto-save, if it has one, is deleted.")
+        }
+    }
+
+    private func load() async {
+        let mac = mac
+        // A Carry On that didn't finish is undone first: until then a disk listed here may be the Mac's newest
+        if MacAutoSave.starting == nil, henge_vm_state() != 1 { MacAutoSave.undoUnfinished(mac) }
+        disks = await Task.detached(priority: .utility) {
+            MacAutoSave.asideDisks(mac.id).compactMap { url in
+                guard let stamp = MacAutoSave.Stamp.of(url) else { return nil }
+                return (url, stamp, MacAutoSave.privateSize(url.path))
+            }.sorted { $0.stamp.date > $1.stamp.date }
+        }.value
     }
 }

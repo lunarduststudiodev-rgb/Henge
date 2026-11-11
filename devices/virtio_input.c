@@ -14,6 +14,11 @@
 #define CFG_ID_DEVIDS 0x03
 #define CFG_PROP_BITS 0x10
 #define CFG_EV_BITS 0x11
+#define CFG_ABS_INFO 0x12
+
+static const char *kind_name(int kind) {
+    return kind == HV_VINPUT_KEYBOARD ? "keyboard" : kind == HV_VINPUT_MOUSE ? "mouse" : "tablet";
+}
 
 static void set_bit(uint8_t *bits, unsigned n) {
     bits[n / 8] |= (uint8_t)(1u << (n % 8));
@@ -26,10 +31,10 @@ static void answer(HvVirtioInput *d) {
     uint8_t *data = c + 8;
     memset(c + 2, 0, 6 + 128);
     uint32_t size = 0;
-    int kbd = d->kind == HV_VINPUT_KEYBOARD;
+    int kbd = d->kind == HV_VINPUT_KEYBOARD, tablet = d->kind == HV_VINPUT_TABLET;
     switch (select) {
     case CFG_ID_NAME: {
-        const char *name = kbd ? "HengeVM Keyboard" : "HengeVM Mouse";
+        const char *name = kbd ? "HengeVM Keyboard" : tablet ? "HengeVM Touch" : "HengeVM Mouse";
         size = (uint32_t)strlen(name);
         memcpy(data, name, size);
         break;
@@ -41,7 +46,7 @@ static void answer(HvVirtioInput *d) {
     case CFG_ID_DEVIDS: { /* bustype BUS_VIRTUAL, vendor, product, version */
         /* AppleVirtIOInputKeyboard always says vendor Apple (0x5ac) and takes the
            product from here; HV_KBD_PRODUCT tries others (experiment). */
-        uint16_t prod = (uint16_t)(kbd ? (getenv("HV_KBD_PRODUCT") ? atoi(getenv("HV_KBD_PRODUCT")) : 1) : 2);
+        uint16_t prod = (uint16_t)(kbd ? (getenv("HV_KBD_PRODUCT") ? atoi(getenv("HV_KBD_PRODUCT")) : 1) : tablet ? 3 : 2);
         uint16_t ids[4] = {0x06, 0x0627, prod, 1};
         memcpy(data, ids, sizeof ids);
         size = sizeof ids;
@@ -62,7 +67,13 @@ static void answer(HvVirtioInput *d) {
             set_bit(data, HV_BTN_RIGHT);
             set_bit(data, HV_BTN_MIDDLE);
             size = HV_BTN_MIDDLE / 8 + 1;
-        } else if (!kbd && subsel == HV_EV_REL) {
+        } else if (tablet && subsel == HV_EV_ABS) {
+            set_bit(data, HV_ABS_X);
+            set_bit(data, HV_ABS_Y);
+            size = 1;
+        } else if (!kbd && !tablet && subsel == HV_EV_REL) {
+            /* Relative X and Y are what make macOS call it a mouse: the tablet has none, and
+               no wheel either (the mouse scrolls, in both directions). */
             set_bit(data, HV_REL_X);
             set_bit(data, HV_REL_Y);
             set_bit(data, HV_REL_HWHEEL);
@@ -70,12 +81,21 @@ static void answer(HvVirtioInput *d) {
             size = 2;
         }
         break;
+    case CFG_ABS_INFO: /* struct virtio_input_absinfo: min, max, fuzz, flat, res */
+        if (tablet && (subsel == HV_ABS_X || subsel == HV_ABS_Y)) {
+            uint32_t info[5] = {0, HV_TABLET_MAX, 0, 0, 0};
+            memcpy(data, info, sizeof info);
+            size = sizeof info;
+            if (!d->asked_range) fprintf(stderr, "virtio-input tablet: the guest's trackpad driver took it\n");
+            d->asked_range = 1;
+        }
+        break;
     default:
         break;
     }
     c[2] = (uint8_t)size;
     if (getenv("HV_INPUT_LOG")) /* debugging: what the guest driver asks */
-        fprintf(stderr, "virtio-input %s: select %#x subsel %u -> size %u\n", kbd ? "keyboard" : "mouse", select, subsel, size);
+        fprintf(stderr, "virtio-input %s: select %#x subsel %u -> size %u\n", kind_name(d->kind), select, subsel, size);
 }
 
 static void config_write(HvVirtio *v, uint32_t off, uint64_t val, unsigned size) {
@@ -86,7 +106,7 @@ static void config_write(HvVirtio *v, uint32_t off, uint64_t val, unsigned size)
 
 /* The status queue carries LED changes: hand the buffers straight back. */
 static void notify(HvVirtio *v, int q) {
-    if (getenv("HV_INPUT_LOG")) fprintf(stderr, "virtio-input %s: notify queue %d\n", ((HvVirtioInput *)v->dev)->kind == HV_VINPUT_KEYBOARD ? "keyboard" : "mouse", q);
+    if (getenv("HV_INPUT_LOG")) fprintf(stderr, "virtio-input %s: notify queue %d\n", kind_name(((HvVirtioInput *)v->dev)->kind), q);
     if (q != STATUSQ) return; /* new event buffers: delivered at the next poll */
     static HvVirtqElem e;
     int any = 0;
@@ -129,10 +149,39 @@ void hv_virtio_input_poll(HvVirtioInput *d) {
         hv_virtq_write(v, &e, 0, ev, 8);
         hv_virtq_push(v, EVENTQ, &e, 8);
         d->delivered++;
+        uint16_t code = d->ring[i].code;
+        if (d->ring[i].type == HV_EV_KEY && code < HV_VINPUT_KEYS && d->ring[i].value != 2) { /* 2: a repeat */
+            uint8_t bit = (uint8_t)(1u << (code % 8));
+            d->down[code / 8] = d->ring[i].value ? d->down[code / 8] | bit : d->down[code / 8] & (uint8_t)~bit;
+        }
         any = 1;
     }
     pthread_mutex_unlock(&d->mu);
     if (any) hv_virtio_interrupt(v);
+}
+
+void hv_virtio_input_release_all(HvVirtioInput *d) {
+    if (!d) return;
+    /* What the guest will have been told once the events still waiting reach it: the releases go after them */
+    uint8_t down[HV_VINPUT_KEYS / 8];
+    pthread_mutex_lock(&d->mu);
+    memcpy(down, d->down, sizeof down);
+    for (uint32_t h = d->head; h != d->tail; h++) {
+        uint32_t i = h % HV_VINPUT_RING;
+        uint16_t code = d->ring[i].code;
+        if (d->ring[i].type != HV_EV_KEY || code >= HV_VINPUT_KEYS || d->ring[i].value == 2) continue;
+        uint8_t bit = (uint8_t)(1u << (code % 8));
+        down[code / 8] = d->ring[i].value ? down[code / 8] | bit : down[code / 8] & (uint8_t)~bit;
+    }
+    pthread_mutex_unlock(&d->mu);
+    int any = 0;
+    for (unsigned code = 0; code < HV_VINPUT_KEYS; code++)
+        if (down[code / 8] & (1u << (code % 8))) hv_virtio_input_send(d, HV_EV_KEY, (uint16_t)code, 0), any = 1;
+    if (any) hv_virtio_input_send(d, HV_EV_SYN, 0, 0);
+}
+
+int hv_virtio_input_ready(HvVirtioInput *d) {
+    return d && (d->vio.status & 4) && d->vio.q[EVENTQ].enabled;
 }
 
 HvVirtioInput *hv_virtio_input_create(HvMachine *m, HvPcie *bus, int kind) {

@@ -15,7 +15,9 @@ struct JITSetupFlow: View {
     @ObservedObject private var pairing = OnDevicePairing.shared
     @State private var path: [Step] = []
     @State private var importing = false
+    @State private var vpnTick = 0
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
 
     private var device: String { OnDevicePairing.deviceKind }
 
@@ -42,6 +44,15 @@ struct JITSetupFlow: View {
                 HengeLog.log("jit", "pairing import failed: \(failure.localizedDescription)")
             }
         }
+        // A new pairing (made here or imported) goes straight on: no Continue to tap.
+        .onChange(of: jit.pairingSource) { source in
+            guard source != nil, let last = path.last, last == .importFile || last == .pairOnDevice else { return }
+            Task {
+                try? await Task.sleep(nanoseconds: 900_000_000) // long enough to see the tick
+                if path.last == last { path.append(afterPairing) }
+            }
+        }
+        .onChange(of: scenePhase) { phase in if phase == .active { vpnTick += 1 } }
         .onAppear {
             jit.refreshPairingStatus()
             pairing.reset()
@@ -56,6 +67,9 @@ struct JITSetupFlow: View {
         .onDisappear { jit.showSetup = false }
     }
 
+    /// LocalDevVPN's page only when it still has to be installed: Turn On JIT connects an installed one by itself.
+    private var afterPairing: Step { LocalDevVPN.isInstalled ? .enable : .connect }
+
     private func close() {
         jit.showSetup = false
         dismiss()
@@ -68,6 +82,13 @@ struct JITSetupFlow: View {
              subtitle: "A Mac needs memory it can write and then run, which on iOS only an attached "
                      + "debugger can grant. Choose how your \(device) gets one.") {
             VStack(spacing: 10) {
+                if JITBootstrap.signedWithoutDebugging {
+                    notice(JITBootstrap.withoutDebuggingFailure, symbol: "exclamationmark.triangle.fill", warning: true)
+                } else if JITBootstrap.isInLiveContainer {
+                    notice("Henge is running inside LiveContainer. In LiveContainer's settings choose StikDebug as the JIT "
+                           + "enabler and open Henge with Launch with JIT, or use StikDebug below: Henge asks it to attach "
+                           + "with Henge's own script.", symbol: "shippingbox")
+                }
                 let builtIn = HengeBuiltInJIT.unavailableReason
                 way("Pair on this \(device)", symbol: "iphone.radiowaves.left.and.right",
                     detail: builtIn ?? (!OnDevicePairing.isSupported ? "Needs iOS 27 or later."
@@ -82,6 +103,7 @@ struct JITSetupFlow: View {
                     enabled: builtIn == nil) { path.append(.importFile) }
                 way("Use StikDebug", symbol: "ant",
                     detail: JITBootstrap.isStikDebugInstalled ? "StikDebug is installed."
+                        : JITBootstrap.isInLiveContainer ? "The way in from LiveContainer."
                         : "Enable JIT through the StikDebug app.",
                     done: jit.method == .stikDebug) { path.append(.stikDebug) }
                 way("Use TrollStore", symbol: "sparkles",
@@ -94,18 +116,31 @@ struct JITSetupFlow: View {
                         : "Dopamine can give every app JIT with one setting.",
                     done: jit.method == .jailbreak || JITBootstrap.debuggedAtLaunch) { path.append(.jailbreak) }
             }
-            if jit.hasPairing && HengeBuiltInJIT.isAvailable {
-                Button { path.append(.connect) } label: {
-                    Label("Continue with the current pairing", systemImage: "arrow.right")
-                        .font(.system(size: 14, weight: .semibold))
-                }
-                .padding(.top, 4)
-            }
         } actions: {
+            if jit.hasPairing && HengeBuiltInJIT.isAvailable {
+                Button { path.append(afterPairing) } label: {
+                    Label("Turn On JIT", systemImage: "bolt.fill")
+                }
+                .buttonStyle(PrimaryButtonStyle())
+            }
             Button("Not now") { close() }
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(Theme.textDim)
         }
+    }
+
+    /// Something about this install that decides how, or whether, JIT can come on.
+    private func notice(_ text: String, symbol: String, warning: Bool = false) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: symbol)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(warning ? Color.orange : Theme.accent)
+            Text(text).font(.system(size: 13)).foregroundStyle(Theme.text)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(14)
+        .hengeCard()
     }
 
     private func way(_ title: String, symbol: String, detail: String, done: Bool,
@@ -154,10 +189,13 @@ struct JITSetupFlow: View {
                 point(2, "Open **Settings › Privacy & Security › Developer Mode**, scroll down and tap "
                        + "**Pair with \(OnDevicePairing.hostName)**.",
                       done: pairing.isShowingPin || pairedOnDevice)
-                point(3, "Enter the code Henge shows. It also appears in a banner and a notification, "
+                point(3, "Settings first asks for **your \(device)'s own passcode** (the one you unlock it with). "
+                       + "Enter it and stay in Settings: closing that prompt cancels the pairing.",
+                      done: pairing.isShowingPin || pairedOnDevice)
+                point(4, "Then enter the 6-digit code Henge shows. It also appears at the top of the screen, "
                        + "so you don't have to switch back.",
                       done: pairedOnDevice)
-                point(4, "Come back to Henge.", done: pairedOnDevice)
+                point(5, "Come back to Henge.", done: pairedOnDevice)
             }
             .padding(16).hengeCard()
             pairingStatus
@@ -173,7 +211,7 @@ struct JITSetupFlow: View {
                     .font(.system(size: 15, weight: .medium))
                     .foregroundStyle(Theme.textDim)
             case .paired:
-                Button("Continue") { path.append(.connect) }
+                Button("Continue") { path.append(afterPairing) }
                     .buttonStyle(PrimaryButtonStyle())
             }
         }
@@ -194,6 +232,12 @@ struct JITSetupFlow: View {
                     if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
                 }
                 .font(.system(size: 14, weight: .semibold))
+                if pairing.waitedLong {
+                    Text("No pairing request yet. If Settings asked for your \(device) passcode and you closed it, "
+                       + "tap Pair with \(OnDevicePairing.hostName) again and enter the passcode.")
+                        .font(.system(size: 13)).foregroundStyle(Theme.textDim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if pairing.backgroundLimited {
                     Text("This installation can only wait about 30 seconds in the background, "
                        + "so go to Settings straight away.")
@@ -241,7 +285,7 @@ struct JITSetupFlow: View {
             if let error = jit.error { outcome(error, ok: false) }
         } actions: {
             if jit.pairingSource == .imported {
-                Button("Continue") { path.append(.connect) }.buttonStyle(PrimaryButtonStyle())
+                Button("Continue") { path.append(afterPairing) }.buttonStyle(PrimaryButtonStyle())
                 Button("Choose another file") { importing = true }
                     .font(.system(size: 15, weight: .medium))
             } else {
@@ -260,16 +304,23 @@ struct JITSetupFlow: View {
             VStack(alignment: .leading, spacing: 14) {
                 point(1, "Install [LocalDevVPN](\(LocalDevVPN.appStore.absoluteString)) from the App Store.",
                       done: LocalDevVPN.isInstalled)
-                point(2, "Tap **Connect LocalDevVPN**. It switches the VPN on and comes straight back to Henge.")
-                point(3, "Leave it connected whenever you turn JIT on.")
+                point(2, "Come back to Henge. From then on Henge connects it by itself whenever it turns JIT on.",
+                      done: LocalDevVPN.isConnected)
             }
             .padding(16).hengeCard()
+            .id(vpnTick) // re-checked each time Henge comes back to the front
         } actions: {
-            Button(LocalDevVPN.actionTitle) { LocalDevVPN.open() }
-                .buttonStyle(PrimaryButtonStyle())
-            Button("It's connected") { path.append(.enable) }
-                .font(.system(size: 15, weight: .medium))
+            if LocalDevVPN.isInstalled {
+                Button { path.append(.enable) } label: { Label("Turn On JIT", systemImage: "bolt.fill") }
+                    .buttonStyle(PrimaryButtonStyle())
+            } else {
+                Button("Get LocalDevVPN") { LocalDevVPN.open() }
+                    .buttonStyle(PrimaryButtonStyle())
+                Button("Continue without checking") { path.append(.enable) }
+                    .font(.system(size: 15, weight: .medium))
+            }
         }
+        .id(vpnTick)
     }
 
     // MARK: Enable
@@ -278,14 +329,9 @@ struct JITSetupFlow: View {
 
     private var enable: some View {
         page(symbol: "bolt.badge.checkmark", title: "Turn on JIT",
-             subtitle: "The first check downloads and mounts Apple's Developer Disk Image, "
-                     + "which can take a minute.") {
-            VStack(alignment: .leading, spacing: 14) {
-                point(1, "Tap **Check setup**. Henge checks LocalDevVPN and prepares the Developer Disk Image.",
-                      done: jit.prepared || attached)
-                point(2, "Tap **Enable JIT**. Henge's helper attaches and a Mac can start.", done: attached)
-            }
-            .padding(16).hengeCard()
+             subtitle: "Henge connects LocalDevVPN if it is off, prepares Apple's Developer Disk Image and attaches "
+                     + "its helper. The first time can take a minute; after that it takes seconds, and starting a Mac "
+                     + "does it by itself.") {
 
             if jit.busy {
                 HStack(spacing: 11) {
@@ -295,7 +341,7 @@ struct JITSetupFlow: View {
                 }
                 .padding(16).hengeCard(high: true)
             } else if attached {
-                outcome("JIT is on. a Mac can start.", ok: true)
+                outcome("JIT is on. A Mac can start.", ok: true)
             } else if let error = jit.error {
                 VStack(alignment: .leading, spacing: 10) {
                     outcome(error, ok: false)
@@ -323,14 +369,20 @@ struct JITSetupFlow: View {
         } actions: {
             if attached {
                 Button("Done") { close() }.buttonStyle(PrimaryButtonStyle())
-            } else if jit.prepared {
-                Button { jit.enableBuiltIn() } label: { Label("Enable JIT", systemImage: "bolt.fill") }
-                    .buttonStyle(PrimaryButtonStyle(enabled: !jit.busy))
-                    .disabled(jit.busy)
             } else {
-                Button("Check setup") { jit.prepareBuiltIn() }
-                    .buttonStyle(PrimaryButtonStyle(enabled: !jit.busy))
-                    .disabled(jit.busy)
+                Button { jit.turnOnBuiltIn() } label: {
+                    Label(jit.error == nil ? "Turn On JIT" : "Try Again", systemImage: "bolt.fill")
+                }
+                .buttonStyle(PrimaryButtonStyle(enabled: !jit.busy))
+                .disabled(jit.busy)
+            }
+        }
+        // Arriving here is the request: start at once, unless the last try failed (then the advice shows first).
+        .onAppear { if !attached && !jit.busy && jit.error == nil { jit.turnOnBuiltIn() } }
+        .onChange(of: jit.attachGeneration) { _ in
+            Task {
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                close()
             }
         }
     }
@@ -349,6 +401,11 @@ struct JITSetupFlow: View {
                 point(4, "Whenever you start a Mac, Henge opens StikDebug, which attaches and comes back.")
             }
             .padding(16).hengeCard()
+            Label("To open Henge from StikDebug's app list instead, assign it a script once: in StikDebug long-press Henge, "
+                  + "choose Assign Script and pick universal.js. Opened from the list without one, JIT stays off.",
+                  systemImage: "info.circle")
+                .font(.system(size: 13)).foregroundStyle(Theme.textDim)
+                .fixedSize(horizontal: false, vertical: true)
         } actions: {
             Button("Use StikDebug") {
                 jit.method = .stikDebug

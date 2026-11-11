@@ -25,6 +25,7 @@
 extern "C" {
 #endif
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifndef IRECV_API
@@ -178,6 +179,11 @@ IRECV_API irecv_error_t irecv_event_unsubscribe(irecv_client_t client, irecv_eve
 IRECV_API irecv_error_t irecv_send_file(irecv_client_t client, const char* filename, unsigned int options);
 IRECV_API irecv_error_t irecv_send_command(irecv_client_t client, const char* command);
 IRECV_API irecv_error_t irecv_send_command_breq(irecv_client_t client, const char* command, uint8_t b_request);
+/* A reader fills each requested chunk and returns 0, or returns -1 on error.
+ * Available for standard USB recovery uploads, not DFU or KIS. */
+typedef int (*irecv_stream_read_cb_t)(void* context, unsigned char* buffer, size_t size);
+IRECV_API irecv_error_t irecv_send_recovery_stream(irecv_client_t client, unsigned long length,
+	irecv_stream_read_cb_t read, void* context);
 IRECV_API irecv_error_t irecv_send_buffer(irecv_client_t client, unsigned char* buffer, unsigned long length, unsigned int options);
 IRECV_API irecv_error_t irecv_recv_buffer(irecv_client_t client, char* buffer, unsigned long length);
 

@@ -54,9 +54,31 @@
 	<array>
 		<string>_remotepairing-pairable-host._tcp</string>
 		<string>_remotepairing._tcp</string>
+		<string>_device-info._tcp</string>
+		<string>_smb._tcp</string>
+		<string>_afpovertcp._tcp</string>
+		<string>_adisk._tcp</string>
+		<string>_rfb._tcp</string>
+		<string>_ssh._tcp</string>
+		<string>_sftp-ssh._tcp</string>
+		<string>_ipp._tcp</string>
+		<string>_ipps._tcp</string>
+		<string>_printer._tcp</string>
+		<string>_pdl-datastream._tcp</string>
+		<string>_uscan._tcp</string>
+		<string>_uscans._tcp</string>
+		<string>_scanner._tcp</string>
+		<string>_http._tcp</string>
+		<string>_https._tcp</string>
 	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>The Mac uses the iPad's front camera as its own camera (in FaceTime, Photo Booth or a browser), only while an app on the Mac has the camera on.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>The Mac uses the iPad's microphone as its own, only while an app on the Mac is recording. Henge also listens while you dictate, to type what you say.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Dictation turns what you say into text on this device, to type it into the Mac.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Henge uses the local network to pair with this iPhone for JIT, without a computer.</string>
+	<string>Henge uses the local network so your Mac can see the devices around it, and they can reach your Mac by its name, as with any Mac. It also pairs with this iPad for JIT without a computer.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -87,6 +109,7 @@
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arm64</string>
+		<string>iphone-ipad-minimum-performance-a12</string>
 	</array>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>

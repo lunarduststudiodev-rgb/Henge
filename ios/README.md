@@ -5,7 +5,8 @@ The Henge app on HengeVM's engine. Build: `ios/scripts/package_ipa.sh` (writes
 TrollStore Lite, without the entitlements TrollStore bans). Needs Xcode 27 or later, xcodegen,
 and the prebuilt pieces
 `ios/scripts/fetch_deps.sh` copies from Husk (StikJIT, the pairing library,
-libslirp and glib for iOS). `HENGE_ENTITLEMENTS` picks the app's entitlements file
+and glib for iOS; libslirp is built from `third_party/libslirp` against that glib's headers in
+`third_party/glib-ios`). `HENGE_ENTITLEMENTS` picks the app's entitlements file
 (default `Henge/Henge.entitlements`). A free personal team uses
 `Henge/Henge.personal.entitlements`: pass it to xcodebuild as a build setting
 (`xcodebuild ... HENGE_ENTITLEMENTS=Henge/Henge.personal.entitlements`, since

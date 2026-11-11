@@ -6,6 +6,7 @@
 #include "exception.h"
 #include "machine.h"
 #include "mmu.h"
+#include "saveguard.h"
 
 /* Decoding follows the "Loads and Stores" encoding index of the Arm ARM. */
 
@@ -187,7 +188,7 @@ int hv_mem_decode(uint32_t insn, HvMemOp *op) {
         } else {
             op->size = opc ? 3 : 2;
         }
-        op->imm = sext((insn >> 15) & 0x7f, 7) << op->size;
+        op->imm = sext((insn >> 15) & 0x7f, 7) * ((int64_t)1 << op->size);
         op->mode = mode == 1 ? HV_ADDR_POST : mode == 3 ? HV_ADDR_PRE : HV_ADDR_OFFSET;
         op->bytes = 2u << op->size;
         return 0;
@@ -300,14 +301,16 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
         if (chunk > len) chunk = len;
         uint64_t pa;
         int had_entry = 0;
+        unsigned pbits = HV_TLB_PAGE_BITS; /* the page an entry for va covers (4 KB in the 4 KB table) */
         if (cpu->m->stats_interval) { /* --stats: was the TLB entry there before this access? */
-            HvTlbEntry *t = hv_tlb_ent(cpu, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), hv_tlb_table(cpu, el));
+            int table = hv_tlb_where(cpu, va, el, &pbits); /* (sets pbits: before hv_tlb_at reads it) */
+            HvTlbEntry *t = hv_tlb_at(cpu, va, table, pbits);
             uint64_t tag = write ? t->write_tag : t->read_tag;
-            had_entry = tag != HV_TLB_INVALID && ((va - tag) >> HV_TLB_PAGE_BITS) == 0 ? 1 :
-                        tag != HV_TLB_INVALID && ((va - tag - HV_TLB_ADJ) >> HV_TLB_PAGE_BITS) == 0 ? 2 : 0;
+            had_entry = tag != HV_TLB_INVALID && ((va - tag) >> pbits) == 0 ? 1 :
+                        tag != HV_TLB_INVALID && ((va - tag - HV_TLB_ADJ) >> pbits) == 0 ? 2 : 0;
             if (!had_entry) {
                 int other = t->read_tag != HV_TLB_INVALID || t->write_tag != HV_TLB_INVALID || t->exec_tag != HV_TLB_INVALID;
-                cpu->m->stats.tlb_miss_kind[(el ? 2 : 0) + other]++;
+                HV_CPU_COUNT(cpu, tlb_miss_kind[(el ? 2 : 0) + other], 1);
             }
         }
         uint32_t fsc = hv_mmu_access(cpu, va, write ? HV_ACC_WRITE : HV_ACC_READ, el, &pa);
@@ -318,24 +321,21 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
         int rc = 0;
         if (cpu->m->stats_interval) {
             HvRam *ram = hv_ram_lookup(cpu->m, pa);
-            uint64_t inpage = va & ((1ull << HV_TLB_PAGE_BITS) - 1);
-            int why = !ram ? 0 : write && ram->code_pages[(pa - ram->pa) >> HV_TLB_PAGE_BITS] ? 1
-                    : inpage + len > (1ull << HV_TLB_PAGE_BITS) - HV_TLB_ADJ ? 2 : had_entry == 0 ? 3 : had_entry == 2 ? 5 : 4;
-            cpu->m->stats.slow_why[why]++;
+            uint64_t inpage = va & ((1ull << pbits) - 1);
+            int why = !ram ? 0 : write && ram->code_pages[(pa - ram->pa) >> HV_RAM_PAGE_BITS] ? 1
+                    : inpage + len > (1ull << pbits) - HV_TLB_ADJ ? 2 : had_entry == 0 ? 3 : had_entry == 2 ? 5 : 4;
+            HV_CPU_COUNT(cpu, slow_why[why], 1);
             if (why == 3) { /* a miss the light refill could not fill: a small guest page? */
                 HvWalk w;
                 hv_mmu_walk(cpu, va, write ? HV_ACC_WRITE : HV_ACC_READ, el, &w);
                 if (!w.fsc && w.block_size < (1ull << HV_TLB_PAGE_BITS)) {
-                    cpu->m->stats.small_pages++;
+                    HV_CPU_COUNT(cpu, small_pages, 1);
                     uint64_t key = (va >> 20) << 1 | (el ? 1 : 0);
-                    for (int i = 0; i < 8; i++) {
-                        if (cpu->m->stats.small_at[i].mb == key) { cpu->m->stats.small_at[i].n++; break; }
-                        if (!cpu->m->stats.small_at[i].mb) { cpu->m->stats.small_at[i].mb = key; cpu->m->stats.small_at[i].n = 1; break; }
-                    }
+                    if (cpu->pc_state) hv_stat_key(cpu->pc_state->small_at, key);
                 }
             }
         }
-        if (hv_phys_ptr(cpu->m, pa, chunk)) {
+        if (hv_phys_ptr_r(cpu->m, pa, chunk)) { /* is it RAM: a test, not a write (hv_phys_write claims for itself) */
             rc = write ? hv_phys_write(cpu->m, pa, b, chunk) : hv_phys_read(cpu->m, pa, b, chunk);
         } else {
             for (uint32_t off = 0; off < chunk && !rc; off += 8) { /* MMIO: at most 8 bytes at a time */
@@ -411,14 +411,19 @@ static int rmw_target(HvCpu *cpu, uint64_t va, uint32_t bytes, int el, uint64_t 
         *mmio_pa = pa;
         return 0;
     }
-    *host = hv_phys_ptr(cpu->m, pa, bytes);
-    if (*host) {
-        /* Same rule as other writes: drop translations made from this page. */
-        uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
-        if (ram->code_pages[pg]) hv_invalidate_code(cpu->m, pa);
-    }
+    *host = (void *)hv_phys_ptr_r(cpu->m, pa, bytes); /* not lent: rmw_written marks the page after the write */
+    /* An auto-save keeps the page as it was before the atomic changes it (core/saveguard.h). */
+    if (*host) hv_guard_write(cpu->m, ram, ram->save_guard, pa - ram->pa, bytes, 0);
     *mmio_pa = pa;
     return 0;
+}
+
+/* After an atomic has written RAM through rmw_target's host pointer: the same rule as
+   every other write made in C (hv_phys_written), checked after the bytes change so a CPU
+   translating the page at the same moment cannot keep the old code. Writes that went
+   through hv_phys_write are already covered there. */
+static void rmw_written(HvCpu *cpu, void *host, uint64_t pa, uint32_t bytes) {
+    if (host) hv_phys_written(cpu->m, pa, bytes);
 }
 
 static int cas_host(void *p, int size, uint64_t *expected, uint64_t desired) {
@@ -471,7 +476,7 @@ static int do_atomic(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_
         uint64_t desired = gpr(cpu, op->rt) & mask;
         if (host) {
             old = s & mask;
-            cas_host(host, size, &old, desired);
+            if (cas_host(host, size, &old, desired)) rmw_written(cpu, host, pa, bytes);
         } else {
             old = 0;
             if (hv_phys_read(cpu->m, pa, &old, bytes)) goto external;
@@ -484,6 +489,7 @@ static int do_atomic(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_
         old = load_host(host, size);
         while (!cas_host(host, size, &old, atomic_result(op->atomic_op, size, old, s))) {
         }
+        rmw_written(cpu, host, pa, bytes);
     } else {
         old = 0;
         if (hv_phys_read(cpu->m, pa, &old, bytes)) goto external;
@@ -509,13 +515,14 @@ static int do_casp(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_t 
     uint64_t o0, o1;
     if (host && esize == 4) {
         uint64_t old = c0 | c1 << 32;
-        cas_host(host, 3, &old, n0 | n1 << 32);
+        if (cas_host(host, 3, &old, n0 | n1 << 32)) rmw_written(cpu, host, pa, bytes);
         o0 = old & mask;
         o1 = old >> 32;
     } else if (host) {
         __uint128_t old = (__uint128_t)c1 << 64 | c0;
-        __atomic_compare_exchange_n((__uint128_t *)host, &old, (__uint128_t)n1 << 64 | n0, 0, __ATOMIC_SEQ_CST,
-                                    __ATOMIC_SEQ_CST);
+        if (__atomic_compare_exchange_n((__uint128_t *)host, &old, (__uint128_t)n1 << 64 | n0, 0, __ATOMIC_SEQ_CST,
+                                        __ATOMIC_SEQ_CST))
+            rmw_written(cpu, host, pa, bytes);
         o0 = (uint64_t)old;
         o1 = (uint64_t)(old >> 64);
     } else {
@@ -572,6 +579,7 @@ static int do_exclusive(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint
                                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
         }
     }
+    if (ok) rmw_written(cpu, host, pa, bytes);
     cpu->excl_addr = ~0ull;
     set_gpr(cpu, op->rs, ok ? 0 : 1);
     return 0;

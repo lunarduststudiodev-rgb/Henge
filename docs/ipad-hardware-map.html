@@ -1,0 +1,279 @@
+<title>iPad-to-Mac Hardware Map</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column; a verdict table up top, then one section per feature, evidence at the end. */
+:root {
+  --bg: #f6f7fa;
+  --surface: #ffffff;
+  --fg: #141824;
+  --muted: #5a6274;
+  --line: #dde1ea;
+  --accent: #2e6bff;
+  --accent-soft: #e6eeff;
+  --ok: #157a4a; --ok-bg: #e2f4ea;
+  --big: #2e57c9; --big-bg: #e4ebfc;
+  --test: #8a5a00; --test-bg: #fbefd5;
+  --no: #8f2a2a; --no-bg: #f8e3e3;
+  --code-bg: #eef0f5;
+  --display: "Schibsted Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --body: "Schibsted Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0f121a; --surface: #171b26; --fg: #e8ebf2; --muted: #9aa3b5; --line: #2a3040;
+  --accent: #6d97ff; --accent-soft: #1c2847;
+  --ok: #5fd39a; --ok-bg: #12301f; --big: #8eaeff; --big-bg: #1b2747;
+  --test: #f0c060; --test-bg: #33270d; --no: #f09090; --no-bg: #3a1717; --code-bg: #1f2432;
+  color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0f121a; --surface: #171b26; --fg: #e8ebf2; --muted: #9aa3b5; --line: #2a3040;
+  --accent: #6d97ff; --accent-soft: #1c2847;
+  --ok: #5fd39a; --ok-bg: #12301f; --big: #8eaeff; --big-bg: #1b2747;
+  --test: #f0c060; --test-bg: #33270d; --no: #f09090; --no-bg: #3a1717; --code-bg: #1f2432;
+  color-scheme: dark }
+
+body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 16px; line-height: 1.6; }
+.wrap { max-width: 860px; margin: 0 auto; padding-block: 40px 72px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 48px; }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; line-height: 1.2; margin: 0; }
+h1 { font-size: clamp(30px, 5vw, 42px); font-weight: 800; letter-spacing: -0.02em; }
+h2 { font-size: 24px; font-weight: 700; letter-spacing: -0.01em; }
+h3 { font-size: 19px; font-weight: 700; }
+p { margin: 0; max-width: 68ch; }
+a { color: var(--accent); }
+code, .mono { font-family: var(--mono); font-size: 0.86em; }
+code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+.eyebrow { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.stack { display: grid; gap: 14px; }
+.lede { font-size: 18px; color: var(--muted); }
+
+.rule { background: var(--accent-soft); border-radius: 10px; padding: 16px 18px; display: grid; gap: 6px; }
+.rule strong { color: var(--fg); }
+
+.pill { display: inline-block; font-size: 12.5px; font-weight: 600; padding: 2px 9px; border-radius: 999px; white-space: nowrap; }
+.p-ok { color: var(--ok); background: var(--ok-bg); }
+.p-big { color: var(--big); background: var(--big-bg); }
+.p-test { color: var(--test); background: var(--test-bg); }
+.p-no { color: var(--no); background: var(--no-bg); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 14px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+
+.tablebox { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; min-width: 620px; font-size: 15px; }
+th, td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+tr:last-child td { border-bottom: 0; }
+td:first-child { font-weight: 600; white-space: nowrap; }
+td a { text-decoration: none; }
+
+.feature { border-top: 1px solid var(--line); padding-top: 28px; display: grid; gap: 14px; }
+.feature header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 14px; }
+.facts { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 8px 18px; margin: 0; }
+.facts dt { font-size: 13px; font-weight: 600; color: var(--muted); padding-top: 2px; }
+.facts dd { margin: 0; min-width: 0; }
+@media (max-width: 560px) { .facts { grid-template-columns: 1fr; gap: 2px; } .facts dd { margin-bottom: 10px; } }
+
+.order { display: grid; gap: 10px; margin: 0; padding-left: 22px; }
+.order li { padding-left: 4px; }
+.order li::marker { font-family: var(--mono); color: var(--accent); font-weight: 500; }
+
+.evidence { font-size: 14px; }
+.evidence table { min-width: 560px; font-size: 14px; }
+.foot { font-size: 13px; color: var(--muted); }
+</style>
+
+<main class="wrap">
+
+<header class="stack">
+  <div class="eyebrow">Henge research · 8 November 2026</div>
+  <h1>What the iPad can give the Mac, natively</h1>
+  <p class="lede">Battery, volume, brightness, network, Wi‑Fi, Bluetooth, AirDrop, location, Touch ID and Apple Account, each checked against the drivers macOS actually ships for a virtual Mac.</p>
+  <div class="rule">
+    <strong>The rule for this map</strong>
+    <p>"Native" means macOS sees a piece of hardware and its own built-in driver handles it, the same way it does on a real Mac. No helper app drawing a fake battery icon, no extra install inside macOS.</p>
+  </div>
+</header>
+
+<section class="stack">
+  <h2>The big finding</h2>
+  <p>macOS already contains Apple's own drivers for virtual-Mac hardware that Henge doesn't emulate yet. One is a <strong>virtual battery</strong>. Others cover <strong>Touch ID</strong>, an <strong>Apple Account identity device</strong>, and a device for plugging in any USB-style input device. The virtual Mac's kernel also carries Apple's <strong>Wi‑Fi driver</strong>, its <strong>Bluetooth chip driver</strong> and its <strong>USB speaker driver</strong>. Henge builds its own hardware, so it can offer any of these, and macOS will treat them as real.</p>
+  <p>All of this was checked directly: in the macOS 15.6.1 virtual-Mac kernel downloaded from Apple, in the drivers on this Mac (macOS 27.0.1), and in Apple's own Virtualization framework.</p>
+</section>
+
+<section class="stack">
+  <h2>At a glance</h2>
+  <div class="legend">
+    <span><span class="pill p-ok">Native · buildable</span> clear path, weeks</span>
+    <span><span class="pill p-test">Native · needs a test first</span> path exists, one unknown</span>
+    <span><span class="pill p-big">Native · big project</span> months of reverse-engineering</span>
+    <span><span class="pill p-no">No native path</span> blocked by Apple or the iPad</span>
+  </div>
+  <div class="tablebox">
+    <table>
+      <thead><tr><th>Feature</th><th>Verdict</th><th>What the Mac would show</th></tr></thead>
+      <tbody>
+        <tr><td><a href="#battery">Battery</a></td><td><span class="pill p-ok">Native · buildable</span></td><td>A real battery in the menu bar and System Settings, charging or not, from Apple's own VM battery device</td></tr>
+        <tr><td><a href="#volume">Volume</a></td><td><span class="pill p-ok">Native · buildable</span></td><td>A USB speaker whose volume <em>is</em> the iPad's volume, both ways, like a Bluetooth speaker</td></tr>
+        <tr><td><a href="#brightness">Brightness</a></td><td><span class="pill p-test">Native · needs a test first</span></td><td>The Mac's own brightness slider and keys, moving the iPad's real screen brightness</td></tr>
+        <tr><td><a href="#network">Network</a></td><td><span class="pill p-ok">Native · buildable</span></td><td>Ethernet (already native today), unplugging and replugging itself as the iPad loses or gets internet</td></tr>
+        <tr><td><a href="#camera">Camera and mic</a></td><td><span class="pill p-ok">Native · buildable</span></td><td>The iPad's camera as a webcam in FaceTime or Zoom, and its microphone as a Mac input</td></tr>
+        <tr><td><a href="#touchid">Touch ID</a></td><td><span class="pill p-test">Native · needs a test first</span></td><td>Touch ID prompts on the Mac, answered by the iPad's Face ID or Touch ID (macOS 26/27 Macs)</td></tr>
+        <tr><td><a href="#wifi">Wi‑Fi</a></td><td><span class="pill p-big">Native · big project</span></td><td>A real Wi‑Fi menu, connected to one network: the one the iPad is on</td></tr>
+        <tr><td><a href="#bluetooth">Bluetooth</a></td><td><span class="pill p-big">Native · big project</span></td><td>Bluetooth on, with Bluetooth Low Energy devices only</td></tr>
+        <tr><td><a href="#airdrop">AirDrop</a></td><td><span class="pill p-big">Native · big project</span></td><td>The Mac's AirDrop window showing the iPad, which passes files on to real nearby devices</td></tr>
+        <tr><td><a href="#location">Location</a></td><td><span class="pill p-ok">Native · buildable</span></td><td>A USB GPS receiver fed by the iPad's GPS, read by navigation and mapping apps. Whether every app sees it (Maps, Weather) needs a test</td></tr>
+        <tr><td><a href="#account">Apple Account</a></td><td><span class="pill p-no">No native path</span></td><td>Needs a certificate only a real Mac's security chip can get</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<article class="feature" id="battery">
+  <header><h2>Battery</h2><span class="pill p-ok">Native · buildable</span></header>
+  <p>Apple built a battery device for virtual Macs, and macOS ships its driver (<code>AppleVirtualPlatformPowerSource</code>). Apple's Virtualization framework drives it with two values: <strong>charge</strong> and <strong>plugged in or not</strong>. It can also follow the host's own battery. Those are exactly the two things the iPad reports.</p>
+  <dl class="facts">
+    <dt>On the Mac</dt><dd>macOS's own battery: menu bar icon, Battery settings, and its battery behaviour (sleep timings, Low Power Mode "only on battery", warnings when low). Nothing installed inside macOS.</dd>
+    <dt>From the iPad</dt><dd>Battery level and charging state (public iOS API, read every few seconds).</dd>
+    <dt>Work</dt><dd>Add one new virtual PCI device to Henge (Apple ID <code>106b:1a07</code>, a virtio device like the disk and network Henge already has). Learn its message format from Apple's driver and from Apple's own VM app on this Mac, the same way Henge learned the graphics protocol.</dd>
+    <dt>Unknown</dt><dd>Whether it draws the menu bar battery exactly like a laptop's. Apple's own code treats it as a battery, so this is very likely. The first test answers it.</dd>
+    <dt>Proof</dt><dd>Driver present in the macOS 15.6.1 virtual-Mac kernel. Apple's Virtualization framework has <code>_VZMacSyntheticBatterySource</code> (charge, connectivity) and <code>_VZMacHostBatterySource</code>.</dd>
+  </dl>
+</article>
+
+<article class="feature" id="volume">
+  <header><h2>Volume</h2><span class="pill p-ok">Native · buildable</span></header>
+  <p>Your Bluetooth-speaker idea is the right model, and macOS supports it natively, but not through the sound device Henge uses today. Apple's virtual sound device does its volume <strong>in software inside the Mac</strong>: it makes the audio quieter before sending it out. Tying that to the iPad's volume would turn the sound down twice.</p>
+  <p>A <strong>USB speaker with its own volume control</strong> works the way you described. The Mac's slider and volume keys send "set volume to 40%" to the speaker, and the sound arrives at full strength. When the speaker's own knob moves, it tells the Mac, and the Mac's slider follows. Apple documents this in Technical Note TN2274.</p>
+  <dl class="facts">
+    <dt>On the Mac</dt><dd>An output called "iPad" (or the device's name). The menu bar slider, Control Center and volume keys all control the iPad's real volume. Pressing the iPad's volume buttons moves the Mac's slider, with macOS's own volume display.</dd>
+    <dt>From the iPad</dt><dd>Reading the system volume is public API. Setting it uses iOS's system volume control (the same one music apps embed).</dd>
+    <dt>Work</dt><dd>Henge already emulates a USB controller with a USB drive on it. A speaker needs one thing it lacks: steady streaming transfers (USB "isochronous" transfers). Then add the speaker itself, route Mac audio to it, and wire the volume both ways.</dd>
+    <dt>Proof</dt><dd>macOS's USB audio driver (<code>AppleUSBAudio</code>) is in the virtual-Mac kernel. Apple's VM sound plug-in contains a software volume processor (<code>AVIOVolumeProcessor</code>), which confirms why the current device can't do this.</dd>
+  </dl>
+</article>
+
+<article class="feature" id="brightness">
+  <header><h2>Brightness</h2><span class="pill p-test">Native · needs a test first</span></header>
+  <p>Apple's virtual-display protocol has brightness built in. On this Mac, both Apple's Virtualization code and the paravirtual graphics framework carry display brightness settings (<code>MinNits</code>, <code>MaxNits</code>, <code>setBrightnessCaps</code>) and brightness change requests. When the virtual screen says "I have brightness from X to Y", macOS should show its normal brightness slider and accept the brightness keys, sending each change back to the host.</p>
+  <dl class="facts">
+    <dt>On the Mac</dt><dd>The Displays brightness slider, the Control Center slider and the brightness keys. Each sets the iPad's real backlight.</dd>
+    <dt>From the iPad</dt><dd>Screen brightness, read and set (public API).</dd>
+    <dt>Work</dt><dd>Henge implements this display protocol itself. On this Mac, turn on brightness in Apple's graphics framework, record what changes in the messages, and add the same to Henge.</dd>
+    <dt>Unknown</dt><dd>Whether macOS 15 guests already use it, or only newer ones. The recording answers it. Henge's current "dim the Mac's screen" slider stays as the fallback.</dd>
+  </dl>
+</article>
+
+<article class="feature" id="network">
+  <header><h2>Network</h2><span class="pill p-ok">Native · buildable</span></header>
+  <p>This is already native. Henge's network card is the one Apple uses for virtual Macs, and macOS lists it as <strong>Ethernet</strong>. The small native addition: when the iPad loses internet, the Mac sees the cable unplugged; when it comes back, the cable is plugged back in and the Mac reconnects at once. Henge already has the unplug/replug code (it's used after resuming a paused Mac).</p>
+  <dl class="facts">
+    <dt>Work</dt><dd>Days. Watch the iPad's connection and flip the virtual cable.</dd>
+  </dl>
+</article>
+
+<article class="feature" id="camera">
+  <header><h2>Camera and microphone</h2><span class="pill p-ok">Native · buildable</span></header>
+  <p>Not on your list, but the same idea. macOS supports standard USB webcams with no install, so the iPad's camera can appear as a USB camera on Henge's USB controller. For the microphone, Apple's VM sound device already supports an input. Henge would add the input side.</p>
+  <dl class="facts">
+    <dt>On the Mac</dt><dd>"iPad Camera" in FaceTime, Photo Booth, Zoom and browsers; "iPad Microphone" in Sound settings.</dd>
+    <dt>Work</dt><dd>Weeks. The camera can use simpler USB transfers than the speaker, so it doesn't wait on the speaker work.</dd>
+  </dl>
+</article>
+
+<article class="feature" id="touchid">
+  <header><h2>Touch ID from Face ID</h2><span class="pill p-test">Native · needs a test first</span></header>
+  <p>macOS 27 includes a Touch ID driver for virtual Macs (<code>AppleVirtIOBiometrics</code>, Apple ID <code>106b:1a0a</code>), and Apple's Virtualization framework has a private Touch ID setting for it. The 15.6.1 virtual-Mac kernel does not have it, so this is for Tahoe or macOS 27 Macs.</p>
+  <dl class="facts">
+    <dt>On the Mac</dt><dd>Touch ID for unlocking, sudo, password fills and app prompts, answered by a Face ID scan on the iPad.</dd>
+    <dt>Unknown</dt><dd>Whether Apple's design needs the host Mac's security chip to sign the answer. If it does, an iPad can't stand in. Reading the driver answers it before any building.</dd>
+  </dl>
+</article>
+
+<article class="feature" id="wifi">
+  <header><h2>Wi‑Fi</h2><span class="pill p-big">Native · big project</span></header>
+  <p>More possible than I first said. The virtual-Mac kernel ships Apple's full Wi‑Fi driver, and it will attach to <strong>any Broadcom PCI device</strong> (vendor <code>14e4</code>), no special board wiring needed. If Henge pretends to be the Broadcom Wi‑Fi chip Macs use, macOS shows a real Wi‑Fi menu.</p>
+  <dl class="facts">
+    <dt>On the Mac</dt><dd>Wi‑Fi on, connected to one network: the one the iPad is on, by name. Traffic still flows the way it does today.</dd>
+    <dt>Why it's big</dt><dd>The chip's protocol isn't public. Asahi Linux and Linux's <code>brcmfmac</code> driver document most of it, but Apple's driver asks the chip far more questions than Linux does, and it normally reads calibration data that real Macs keep elsewhere. Expect months, with a real chance of a wall.</dd>
+    <dt>From the iPad</dt><dd>Only the current network's name, and only with Location permission plus Apple's Wi‑Fi information entitlement. iPad apps can't scan for other networks, so the list would hold one network.</dd>
+  </dl>
+</article>
+
+<article class="feature" id="bluetooth">
+  <header><h2>Bluetooth</h2><span class="pill p-big">Native · big project</span></header>
+  <p>Also reachable. macOS has a driver (<code>AppleConvergedPCI</code>) for the Bluetooth half of Apple's Broadcom chips, matched by their PCI IDs, and Asahi Linux has documented that chip's protocol. The limit is the iPad: apps only get <strong>Bluetooth Low Energy</strong> (fitness sensors, some accessories) through Core Bluetooth. Classic Bluetooth, such as headphones and older keyboards, stays with iPadOS. Your AirPods already play the Mac's sound, because Henge's audio goes out through the iPad.</p>
+</article>
+
+<article class="feature" id="airdrop">
+  <header><h2>AirDrop</h2><span class="pill p-big">Native · big project</span></header>
+  <p>You're right that others have done it, but each owned the radio. Google's Pixel 10 speaks AirDrop because Google controls the phone's Wi‑Fi chip. OpenDrop on Linux needs a Wi‑Fi card put into a special raw mode. AirDrop uses Bluetooth Low Energy to find devices and Apple's own Wi‑Fi link to send files. An iPad app can use neither directly.</p>
+  <p>A design that still feels native, once Wi‑Fi and Bluetooth emulation exist: the emulated chips make the iPad appear as a nearby device in the Mac's own AirDrop window. Drop a file on it, and Henge opens the iPad's share sheet with that file so you can AirDrop it to anyone. Incoming works the other way: AirDrop to the iPad, choose Henge, and the Mac receives a normal AirDrop. This only makes sense after the Wi‑Fi and Bluetooth work.</p>
+</article>
+
+<article class="feature" id="location">
+  <header><h2>Location</h2><span class="pill p-ok">Native · buildable</span></header>
+  <p>Macs have no GPS chip of their own; macOS normally finds its location from nearby Wi‑Fi. But Macs do accept <strong>plug-in GPS receivers</strong>, and Henge can be one. It would show up as a USB GPS (the common u‑blox kind) and send the iPad's real GPS position in the standard format GPS receivers use (NMEA). macOS's built-in USB serial driver handles it with nothing installed.</p>
+  <dl class="facts">
+    <dt>Who sees it</dt><dd>Navigation, marine, flight and mapping software that reads GPS receivers directly (the apps people buy those dongles for). Maps, Weather, Find My and websites normally don't read a plain USB GPS.</dd>
+    <dt>Work</dt><dd>Small. A GPS sends only a few lines of text a second, using the same simple USB transfers as Henge's USB drive. The iPad's position comes from Core Location.</dd>
+    <dt>System-wide</dt><dd>macOS 27 has a second, hidden route. Its accessory service (<code>accessoryd</code>, Apple's CarPlay and MFi accessory protocol, iAP2) has a location feature that takes GPS sentences from an accessory, and Location Services has an "accessory location provider" that uses them. That would give every app the iPad's position. The catch: Apple only trusts accessories that pass MFi authentication, a signature from an Apple-issued chip that Henge can't produce. A short test will show whether macOS insists on it for location.</dd>
+    <dt>Last fallback</dt><dd>macOS's location simulation service (<code>CLSimulationManager</code>, what Xcode uses), fed with the iPad's GPS. Software, not hardware, and also untested.</dd>
+  </dl>
+</article>
+
+<article class="feature" id="account">
+  <header><h2>Apple Account sign-in</h2><span class="pill p-no">No native path</span></header>
+  <p>The virtual Mac does have an identity device (<code>106b:1a0c</code>), the one that lets Apple's own VMs sign in. On a real host Mac, Apple's identity service gets a certificate from Apple for a key held in the Mac's Secure Enclave (Apple calls this Basic Attestation), and the VM's sign-in is vouched for with it. The strings in Apple's code spell this out: "host certificate", "attestation key", "BAA certificate refresh".</p>
+  <p>The Hackintosh trick worked because Intel Macs proved their identity in software, with serial numbers that could be copied. Apple Silicon Macs prove it with that security chip, and an iPad app can't get a Mac's certificate. Copying a real Mac's identity would also break Apple's terms and risks getting the Apple Account locked. The App Store's FairPlay device (<code>106b:1a08</code>) likely depends on the same host trust.</p>
+</article>
+
+<section class="stack">
+  <h2>Other native pieces found along the way</h2>
+  <p><strong>Native trackpad.</strong> macOS ships a virtual multi-touch trackpad driver (<code>AppleVirtIOInputTrackpad</code>). Touch on the iPad could become real trackpad gestures that macOS handles itself (pinch, swipe between spaces, Mission Control), instead of the helper's scroll injection. Check with whoever is working on touch input before starting this.</p>
+  <p><strong>Automatic setup (macOS 27).</strong> Apple's new provisioning device (<code>106b:1a11</code>) can create the user account during install, skipping Setup Assistant.</p>
+  <p><strong>Plug-in input devices.</strong> Apple's HID bridge (<code>AppleVirtualPlatformHIDBridge</code>) lets the host present any keyboard-style device, such as volume and brightness media keys.</p>
+</section>
+
+<section class="stack">
+  <h2>Suggested order</h2>
+  <ol class="order">
+    <li><strong>Battery.</strong> Most visible, one new device, Apple's own driver.</li>
+    <li><strong>Network follows the iPad.</strong> Days of work, and it removes a confusing state.</li>
+    <li><strong>USB GPS receiver.</strong> Small, and it builds the USB-device groundwork the speaker and camera reuse. Test the system-wide accessory route at the same time.</li>
+    <li><strong>Brightness.</strong> Start with the recording on this Mac; build if macOS 15 responds.</li>
+    <li><strong>USB speaker volume.</strong> The streaming transfers it needs also help the camera and mic later.</li>
+    <li><strong>Camera and microphone.</strong></li>
+    <li><strong>Touch ID.</strong> Read the driver first; build only if it doesn't need a Mac's security chip.</li>
+    <li><strong>Wi‑Fi, then Bluetooth, then AirDrop.</strong> A separate long research track, best started once the items above ship.</li>
+  </ol>
+</section>
+
+<section class="stack evidence">
+  <h2>Evidence</h2>
+  <p>Apple virtual-Mac PCI devices and whether Henge has them. "In 15.6.1" means the driver is in the virtual-Mac kernel from Apple's macOS 15.6.1 restore image (<code>kernelcache.release.vma2</code>).</p>
+  <div class="tablebox">
+    <table>
+      <thead><tr><th>PCI ID</th><th>macOS driver</th><th>What it is</th><th>In 15.6.1</th><th>Henge today</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">1af4:*</td><td>AppleVirtIO*</td><td>Disk, network, input, sound, shared folders</td><td>Yes</td><td>Yes</td></tr>
+        <tr><td class="mono">106b:1a07</td><td>AppleVirtualPlatformPowerSource</td><td>Battery or wall power</td><td>Yes</td><td>No</td></tr>
+        <tr><td class="mono">106b:1a0a</td><td>AppleVirtIOBiometrics</td><td>Touch ID</td><td>No (macOS 27: yes)</td><td>No</td></tr>
+        <tr><td class="mono">106b:1a0c</td><td>Identity messenger</td><td>Apple Account identity</td><td>Yes</td><td>No</td></tr>
+        <tr><td class="mono">106b:1a11</td><td>Provisioning messenger</td><td>Automatic account setup</td><td>Not checked</td><td>No</td></tr>
+        <tr><td class="mono">106b:1a08</td><td>AvpFairPlayDriver</td><td>FairPlay (App Store, DRM)</td><td>Yes</td><td>No</td></tr>
+        <tr><td class="mono">106b:1a01</td><td>AppleVirtIOUSBDeviceController</td><td>USB link used for installing</td><td>Yes</td><td>Yes</td></tr>
+        <tr><td class="mono">14e4:*</td><td>AppleBCMWLANBusInterfacePCIe</td><td>Broadcom Wi‑Fi</td><td>Yes</td><td>No</td></tr>
+        <tr><td class="mono">14e4:5fa0 …</td><td>AppleConvergedPCI</td><td>Broadcom Bluetooth</td><td>Yes</td><td>No</td></tr>
+        <tr><td class="mono">USB class 2</td><td>AppleUSBACM / AppleUSBSerial</td><td>USB GPS receiver (serial)</td><td>Not in boot kernel; loads from disk on real Macs</td><td>No (simple transfers it already has)</td></tr>
+        <tr><td class="mono">USB class 1</td><td>AppleUSBAudio</td><td>USB speaker and microphone</td><td>Yes</td><td>No (needs streaming transfers)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="foot">Sources: drivers in this Mac's <code>/System/Library/Extensions</code> (macOS 27.0.1); Apple's Virtualization framework classes and VM service strings; the macOS 15.6.1 virtual-Mac kernel. Volume notifications: Apple Technical Note TN2274. Pixel 10 AirDrop: Google's November 2025 announcement. Apple Account in VMs: Apple's macOS 15 VM sign-in requirements (Mac host and guest on macOS 15 or later).</p>
+</section>
+
+</main>

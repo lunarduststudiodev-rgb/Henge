@@ -80,71 +80,88 @@ enum JITBootstrap {
     /// recovering from that in-process -- without a debugger there is no
     /// executable memory at all, and asking again later is precisely what does
     /// not work. So claim it first and hold it.
+    ///
+    /// `retry`: a debugger may have attached since the last try failed for want of one (Henge asked for it, or came back to
+    /// the foreground with one). The native side then asks again, but only when the last probe came back to Henge's own trap
+    /// guard: a debugger that is attached and not answering is never trapped into twice.
     @discardableResult
-    static func prewarm() -> Bool {
-        if prewarmed { return true }
+    static func prewarm(retry: Bool = false) -> Bool {
+        if holdsRegion { prewarmed = true; return true }
+        if retry { henge_ios_jit_prewarm_rearm() }
         // Before iOS 26 Henge can make the region itself where the device allows it (a jailbreak,
         // a debugger that attached and let go such as TrollStore's enable-jit, or dynamic-codesigning),
         // so it does not wait for CS_DEBUGGED there if jailbroken: Dopamine hides that flag from apps unless
         // "Allow JIT in Apps" is on, while still letting them run code they wrote.
-        guard isDebuggerAttached || (canGrantOwnJIT && !selfGrantTried) else {
+        let attached = isDebuggerAttached
+        guard attached || (canGrantOwnJIT && !selfGrantTried) else {
             HengeLog.log("jit", "no debugger attached yet; not prewarming")
             return false
         }
-        if !isDebuggerAttached { selfGrantTried = true }
+        if !attached { selfGrantTried = true }
         // Before iOS 26, unless StikDebug's script is what attached, no brk: TrollStore's enable-jit (and its Open with JIT)
         // attaches for 100 ms and services nothing, and a brk in that window stops Henge for good (TrollStore then says
-        // "trollstorehelper returned 3"). A debugged process there makes its own executable memory anyway: QEMU maps its
-        // buffer with MAP_JIT and the translation layer makes its region itself.
+        // "trollstorehelper returned 3"). A debugged process there makes its own executable memory: MAP_JIT, or plain memory
+        // made executable, either way as the two views of one region the translator needs.
         if canGrantOwnJIT && !stikDebugMayServiceTraps {
             selfGrantTried = true
-            if mapJITWorks {
-                HengeLog.log("jit", "not trapping for a JIT region (no StikDebug); MAP_JIT executes here")
-                lastFailure = nil
-                return true
-            }
-            // MAP_JIT refused (no dynamic-codesigning after all, or Dopamine): plain memory made executable, which a debugged
-            // process or a jailbreak allows -- made here, with no brk for an attach that answers none (#148)
-            HengeLog.log("jit", "not trapping for a JIT region (no StikDebug); MAP_JIT does not execute here, trying plain memory")
-            prepareCompressedHeap()
-            if henge_ios_jit_prewarm_self(jitBytes) {
-                prewarmed = true
-                lastFailure = nil
-                HengeLog.log("jit", "JIT region made by Henge itself (\(henge_ios_jit_self_route().map { String(cString: $0) } ?? "self"))")
-                return true
-            }
-            releaseUnusedCompressedHeap()
+            HengeLog.log("jit", "not trapping for a JIT region (no StikDebug); making it here")
+            if claimSelf() { return true }
+            lastFailure = selfGrantFailure
             return false
         }
         HengeLog.log("jit", "claiming \(jitBytes / (1024 * 1024)) MiB of JIT memory now, "
                          + "before the guest download -- StikDebug does not stay attached")
         prepareCompressedHeap()
-        let ok = henge_ios_jit_prewarm(jitBytes)
+        var ok = henge_ios_jit_prewarm(jitBytes)
         if !ok { releaseUnusedCompressedHeap() }
         if ok {
             prewarmed = true
             lastFailure = nil
             detachIfDone()
-        }
-        else if mapJITWorks {
-            // Not a failure worth reporting: this is the ordinary shape of an
-            // iOS that does not need a trap servicer. QEMU maps its own buffer
-            // with MAP_JIT a moment later and runs exactly as well.
-            lastFailure = nil
-            HengeLog.log("jit", "no trap servicer, but MAP_JIT executes here -- "
-                             + "QEMU will map its own buffer")
+        } else if canGrantOwnJIT, claimSelf() {
+            // Before iOS 26 a debugged process can make the region itself when the debugger did not hand one out.
+            ok = true
         } else {
-            lastFailure = "The debugger is attached but is not answering trap "
-                        + "requests, and this device will not execute a MAP_JIT "
-                        + "mapping either, so no executable memory could be "
-                        + "claimed. This happens when Henge was opened from StikDebug's "
-                        + "app list, which attaches without Henge's script: open Henge "
-                        + "from the Home Screen and tap Turn On JIT. It also happens "
-                        + "inside another container app."
+            lastFailure = unansweredFailure
         }
-        HengeLog.log("jit", ok ? "JIT region secured; it will be handed to QEMU later"
-                              : "JIT prewarm FAILED -- StikDebug is not servicing traps")
+        HengeLog.log("jit", ok ? "JIT region secured; it will be handed to the Mac later"
+                              : "JIT prewarm FAILED -- no debugger answered Henge's JIT request")
         return ok
+    }
+
+    /// The region made by Henge itself, before iOS 26 (the native side refuses on 26 and later).
+    private static func claimSelf() -> Bool {
+        prepareCompressedHeap()
+        guard henge_ios_jit_prewarm_self(jitBytes) else {
+            releaseUnusedCompressedHeap()
+            return false
+        }
+        prewarmed = true
+        lastFailure = nil
+        HengeLog.log("jit", "JIT region made by Henge itself (\(henge_ios_jit_self_route().map { String(cString: $0) } ?? "self"))")
+        return true
+    }
+
+    /// Whether the translator's region is held. The Mac cannot start without it ("Henge has no JIT region"), whatever else
+    /// says JIT is on.
+    static var holdsRegion: Bool { henge_ios_jit_get_mapping() != nil }
+
+    private static var selfGrantFailure: String {
+        "Henge is marked as debugged, but this \(UIDevice.current.model) would not run code Henge wrote. "
+            + "Open Henge again with JIT from TrollStore or your jailbreak, or choose StikDebug in Set Up JIT."
+    }
+
+    /// Why a debugger was attached and still no region came: what answered (or did not) depends on how Henge was opened.
+    private static var unansweredFailure: String {
+        if isInLiveContainer {
+            return "LiveContainer marked Henge as debugged, but no debugger answered Henge's JIT request. In LiveContainer's "
+                + "settings choose StikDebug as the JIT enabler, then open Henge with Launch with JIT. Or tap Turn On JIT: "
+                + "Henge asks StikDebug to attach with Henge's own script."
+        }
+        return "A debugger attached, but it did not answer Henge's JIT request, so no code region could be claimed. This "
+            + "happens when Henge is opened from StikDebug's app list without a script. Tap Turn On JIT, or in StikDebug "
+            + "long-press Henge, choose Assign Script and pick universal.js once: then opening Henge from StikDebug's list "
+            + "turns JIT on by itself."
     }
 
     /// Whether to leave StikDebug attached after the region is held.
@@ -170,17 +187,26 @@ enum JITBootstrap {
     /// The one try at making the region without a debugger has been made (it is not repeated: the answer will not change).
     nonisolated(unsafe) static private var selfGrantTried = false
 
-    /// Whether Henge has JIT now: a debugger marked it, or the region is already held. Before iOS 26 this tries, once, to make
-    /// the region itself, which is all TrollStore and jailbroken devices need. Cheap after the first call, and logs nothing.
+    /// Whether Henge has JIT now: the region the Mac runs in is held. Before iOS 26 this tries, once, to make the region
+    /// itself, which is all TrollStore and jailbroken devices need. Cheap after the first call.
     static var ready: Bool {
-        if prewarmed || isLive { return true }
-        // On a TXM device the debugger must also answer the brk that claims the region. CS_DEBUGGED alone is what opening
-        // Henge from StikDebug's app list gives (no Henge script) or LiveContainer, and an install then stops at
-        // "Henge has no JIT region" (#23).
-        if debuggedFlag { return !deviceEnforcesTXM }
+        if prewarmed || holdsRegion { return true }
+        // CS_DEBUGGED alone is not JIT: it is also what opening Henge from StikDebug's app list without a script gives, or
+        // LiveContainer, and a Mac then stopped at "Henge has no JIT region" (#23, #49). On a TXM device only a debugger that
+        // answers the brk hands out the region, and the claim happens at launch or after an attach Henge asked for, never
+        // here: views ask this every second, and a brk into a debugger that does not answer stops the app. Without TXM a
+        // debugged process can be given the region in one try, made here once.
+        if debuggedFlag {
+            guard !deviceEnforcesTXM, !debuggedClaimTried else { return false }
+            debuggedClaimTried = true
+            return prewarm()
+        }
         guard canGrantOwnJIT, !selfGrantTried else { return false }
         return prewarm()
     }
+
+    /// `ready`'s one claim on a device without TXM has been made.
+    nonisolated(unsafe) static private var debuggedClaimTried = false
 
     /// True once this process has told StikDebug to let go.
     nonisolated(unsafe) static private(set) var detached = false
@@ -209,36 +235,6 @@ enum JITBootstrap {
     /// headroom. The crash looked like memory pressure and was nothing of the
     /// kind.
     nonisolated(unsafe) static var lastFailure: String?
-
-    /// Whether a plain MAP_JIT mapping executes in this process.
-    ///
-    /// Not run on a TXM device: MAP_JIT memory cannot execute there, and the
-    /// probe is not harmless. With a debugger attached, its fault goes to the
-    /// debugger as a stop, not to the probe's signal guard. If StikDebug is not
-    /// answering, that stop freezes the app. Views must never trigger this probe
-    /// directly.
-    static var mapJITWorks: Bool {
-        if let known = mapJITResult { return known }
-        let result: Bool
-        if deviceEnforcesTXM {
-            HengeLog.log("jit", "TXM device: MAP_JIT cannot execute here, not probing")
-            result = false
-        } else {
-            result = henge_ios_jit_mapjit_works()
-        }
-        mapJITResult = result
-        return result
-    }
-
-    /// The MAP_JIT answer if it has been worked out, without working it out.
-    /// For display only: views must never trigger the probe.
-    nonisolated(unsafe) static private(set) var mapJITResult: Bool?
-
-    /// True only after a JIT region has been allocated AND passed the execute
-    /// self-test — which happens inside `qemu_init`. It is therefore always false
-    /// before the guest starts, and must NOT be used to decide whether to start it.
-    /// Use `isDebuggerAttached` for that, and this afterwards to confirm it worked.
-    static var isLive: Bool { henge_ios_jit_is_available() }
 
     /// The actual precondition for starting the guest: StikDebug has attached.
     ///
@@ -304,6 +300,22 @@ enum JITBootstrap {
         }
     }
 
+    /// Whether Henge runs as a guest inside LiveContainer, which sets this for its guests (LCBootstrap.m). LiveContainer asks
+    /// StikDebug for JIT for its own process, with the universal script on iOS 26 and later; Henge's requests work there by
+    /// pid. It does not declare the stikjit scheme, so isStikDebugInstalled is always false inside it.
+    static var isInLiveContainer: Bool { getenv("LC_HOME_PATH") != nil }
+
+    /// Signed without get-task-allow: no debugger may attach to this copy, so StikDebug and the built-in helper can never turn
+    /// JIT on (#19). Some signing tools and services leave it out (iOS App Signer's "No get-task-allow"); SideStore and
+    /// AltStore keep it. TrollStore and a jailbreak do not need it. Unknown signatures are not reported.
+    static var signedWithoutDebugging: Bool {
+        Entitlements.debuggable == false && !isInstalledWithTrollStore && !isJailbroken && !debuggedAtLaunch
+    }
+
+    static let withoutDebuggingFailure = "This copy of Henge was signed without the get-task-allow entitlement, so no debugger "
+        + "is allowed to attach to it and JIT cannot turn on. Install Henge again with SideStore or AltStore (AltServer runs "
+        + "on Windows too), or with a signing tool that keeps get-task-allow (in iOS App Signer, turn off No get-task-allow)."
+
     /// A rootless jailbreak (Dopamine and its kin) puts its files in /var/jb and lets apps see it.
     static var isJailbroken: Bool { FileManager.default.fileExists(atPath: "/var/jb") }
 
@@ -311,7 +323,13 @@ enum JITBootstrap {
     /// jailbreak that allows JIT in apps does to every app it launches (Dopamine's "Allow JIT in Apps" setting), and it needs
     /// no hand-off at all. Read once, early (HengeApp.init), so a later attach is not mistaken for it.
     nonisolated(unsafe) static var debuggedAtLaunch = false
-    static func noteLaunchState() { debuggedAtLaunch = (csStatus() ?? 0) & CS_DEBUGGED != 0 }
+    static func noteLaunchState() {
+        debuggedAtLaunch = (csStatus() ?? 0) & CS_DEBUGGED != 0
+        HengeLog.log("jit", "debugged at launch: \(debuggedAtLaunch ? "yes" : "no"); get-task-allow: "
+                         + (Entitlements.debuggable.map { $0 ? "yes" : "NO" } ?? "unknown")
+                         + (isInLiveContainer ? "; running inside LiveContainer" : ""))
+        if signedWithoutDebugging { lastFailure = withoutDebuggingFailure }
+    }
 
     /// Whether this iOS lets a process that is marked as debugged make executable memory for itself, as opposed to needing a
     /// debugger to hand it out: true before iOS 26, which is when the Trusted Execution Monitor arrived. It is what makes
@@ -390,6 +408,15 @@ enum JITBootstrap {
             }
         }
         return true
+    }
+
+    /// StikDebug's enable-jit with no pid: StikDebug launches Henge itself, under its debugger, with Henge's script. For a
+    /// restart (Relaunch), when StikDebug is what opens Henge again; the pid path attaches to a Henge that is running.
+    static func stikDebugLaunchURL() -> URL? {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return nil }
+        var url = "stikjit://enable-jit?bundle-id=\(bundleID)"
+        if let script = loadScript(), let encoded = base64URLEncode(script) { url += "&script-data=\(encoded)" }
+        return URL(string: url)
     }
 
     private static func loadScript() -> String? {

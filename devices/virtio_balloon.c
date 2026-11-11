@@ -1,4 +1,7 @@
 #include "virtio_balloon.h"
+#include "machine.h"
+#include "ramfile.h"
+#include "saveguard.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -17,10 +20,17 @@
 
 /* Host pages [off, off + len) of guest RAM are no longer the guest's: give them back to the OS. A file's
    pages go at once (a hole); anonymous memory is marked reusable, which the kernel drops before compressing
-   anything under memory pressure (measured on the Mac: given-back pages were dropped, kept pages compressed). */
+   anything under memory pressure (measured on the Mac: given-back pages were dropped, kept pages compressed).
+   Memory with Quick Suspend's files (core/ramfile.h) is made zeros again, fresh, and marked dirty, so the files
+   follow (as holes): reusable pages could come back as zeros or as they were, which the files wouldn't know. */
 static void give_back(HvVirtioBalloon *b, uint64_t off, uint64_t len) {
+    /* The hole zeroes them, which no claim sees: an auto-save's guard keeps them as they were first */
+    hv_guard_claim_range(b->vio.m, b->ram_pa + off, len);
     int bad;
-    if (b->ram_fd >= 0) {
+    HvRam *r = hv_ram_lookup(b->vio.m, b->ram_pa);
+    if (r && r->file) {
+        bad = hv_ramfile_discard(r->file, off + (b->ram_pa - r->pa), len) != 0;
+    } else if (b->ram_fd >= 0) {
         struct fpunchhole ph = {.fp_flags = 0, .reserved = 0, .fp_offset = (off_t)off, .fp_length = (off_t)len};
         bad = fcntl(b->ram_fd, F_PUNCHHOLE, &ph) != 0;
         if (!bad) msync(b->ram + off, len, MS_INVALIDATE);
@@ -36,7 +46,9 @@ static void give_back(HvVirtioBalloon *b, uint64_t off, uint64_t len) {
 }
 
 static void take_back(HvVirtioBalloon *b, uint64_t off, uint64_t len) {
-    if (b->ram_fd < 0) madvise(b->ram + off, len, MADV_FREE_REUSE); /* the guest has them again: count them as used */
+    HvRam *r = hv_ram_lookup(b->vio.m, b->ram_pa);
+    /* the guest has them again: count them as used (fresh memory for Quick Suspend's: counted as it is touched) */
+    if (b->ram_fd < 0 && !(r && r->file)) madvise(b->ram + off, len, MADV_FREE_REUSE);
     b->taken_back += len / HOST_PAGE;
 }
 

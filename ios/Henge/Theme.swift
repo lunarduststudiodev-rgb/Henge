@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import ImageIO
 
 /// The Desk: a dark, quiet page, cards on it with a hairline edge, and one blue for what you press.
 /// A Mac's screen is the only colourful thing here.
@@ -110,8 +111,34 @@ enum MacPreview {
         Task.detached(priority: .utility) { write(to: url, height: height) }
     }
 
-    /// Before the machine stops, while there is still a screen to read.
-    static func saveNow(for mac: VirtualMac) { write(to: file(for: mac), height: Int(640 / mac.aspect)) }
+    /// Before the machine stops, while there is still a screen to read. Paused, the whole screen too, for a resume.
+    static func saveNow(for mac: VirtualMac) {
+        write(to: file(for: mac), height: Int(640 / mac.aspect))
+        if henge_vm_paused() != 0 { keepScreen(for: mac) }
+    }
+
+    /// The Mac's whole screen as it was paused, pixel for pixel: what a Mac going on from a suspend shows
+    /// until macOS draws again (BootDisplay), as a Mac waking from sleep shows what it had.
+    static func screenFile(for mac: VirtualMac) -> URL { mac.directory.appendingPathComponent("screen.png") }
+
+    /// The screen to show while this Mac goes on from where it was suspended; nil when it starts afresh.
+    static func resumeScreen(for mac: VirtualMac) -> URL? {
+        MacSuspend.hasSaved(for: mac.id) ? screenFile(for: mac) : nil
+    }
+
+    private static func keepScreen(for mac: VirtualMac) {
+        let url = screenFile(for: mac)
+        var w32: Int32 = 0, h32: Int32 = 0
+        guard henge_vm_picture_size(&w32, &h32) == 0, w32 > 0, h32 > 0, let image = capture(width: Int(w32), height: Int(h32)) else {
+            try? FileManager.default.removeItem(at: url) // an older one would be wrong
+            return
+        }
+        Task.detached(priority: .utility) { // the pixels are read; only the encoding is left
+            guard let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else { return }
+            CGImageDestinationAddImage(dest, image, nil)
+            if !CGImageDestinationFinalize(dest) { try? FileManager.default.removeItem(at: url) }
+        }
+    }
 
     private static func write(to url: URL, height: Int) {
         guard let image = capture(width: 640, height: height), let data = UIImage(cgImage: image).jpegData(compressionQuality: 0.8) else { return }

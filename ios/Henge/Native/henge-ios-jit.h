@@ -87,6 +87,15 @@ HENGE_EXPORT bool henge_ios_jit_prewarm(size_t bytes);
 HENGE_EXPORT bool henge_ios_jit_prewarm_self(size_t bytes);
 
 /*
+ * A debugger Henge asked for has just attached: let the next prewarm try again if the last one failed only because no
+ * debugger answered its probe. Any other failure stays final for this launch.
+ */
+HENGE_EXPORT void henge_ios_jit_prewarm_rearm(void);
+
+/* The held region, or NULL when there is none. */
+HENGE_EXPORT HengeDualMapping *henge_ios_jit_get_mapping(void);
+
+/*
  * The native runtime shares the prewarmed region with QEMU: it takes bytes from the bottom, QEMU the top. Call before
  * writing anything below `end` (an offset from the region's start); false means QEMU holds that part.
  */
@@ -101,7 +110,7 @@ void henge_ios_jit_release(HengeDualMapping *m);
  */
 HENGE_EXPORT void henge_ios_jit_detach(void);
 
-/* True once a successful allocation has happened -- i.e. JIT is genuinely live. */
+/* True once a region has passed its execute self-test -- i.e. JIT is genuinely live. */
 HENGE_EXPORT bool henge_ios_jit_is_available(void);
 
 /*

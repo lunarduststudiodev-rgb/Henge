@@ -34,10 +34,19 @@ static int seg_io(HvVirtioBlk *b, const HvVirtqElem *e, int writable, uint32_t o
         }
         uint32_t n = g->len - off;
         if (n > len) n = len;
-        void *p = hv_phys_ptr(b->vio.m, g->addr + off, n);
-        if (!p) return -1;
-        int r = writable ? hv_disk_read(b->disk, disk_off, p, n) : hv_disk_write(b->disk, disk_off, p, n);
-        if (writable && r == 0) hv_dma_written(b->vio.m, g->addr + off, n);
+        /* A read into guest memory claims its pages first (an auto-save's guard): the stop waits for no request
+           to be under way, so a pointer taken here is never one taken before the stop and written after. */
+        int r;
+        if (writable) {
+            void *p = hv_phys_ptr_w(b->vio.m, g->addr + off, n);
+            if (!p) return -1;
+            r = hv_disk_read(b->disk, disk_off, p, n);
+            hv_dma_written(b->vio.m, g->addr + off, n); /* failed too: the lend ends, and part may be written */
+        } else {
+            const void *p = hv_phys_ptr_r(b->vio.m, g->addr + off, n); /* a disk write only reads guest memory */
+            if (!p) return -1;
+            r = hv_disk_write(b->disk, disk_off, p, n);
+        }
         if (r != 0) return -1;
         disk_off += n;
         len -= n;

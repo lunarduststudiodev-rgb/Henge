@@ -47,9 +47,16 @@ enum Device {
     /// What a choice risks on this device, if anything. An install always gets at least 2 GB (Installer.install).
     static func memoryNote(_ gb: Int) -> String? {
         if gb < 4 { return "macOS has little room under 4 GB, so it can be very slow." }
-        if gb > suggestedRAMGB { return "More than \(suggestedRAMGB) GB is a lot for this \(name): iOS may close Henge when macOS gets busy." }
+        if memoryTooHigh(gb) {
+            return "Too much for this \(name). Henge needs memory of its own beside the Mac's, and when the \(name) runs short, "
+                + "iPadOS closes Henge without asking: anything not saved on the Mac is lost. \(suggestedRAMGB) GB or less is safer."
+        }
         return nil
     }
+
+    /// More than this device can give a Mac without iPadOS closing Henge when memory runs short (8 Nov 2026:
+    /// an 8 GB Mac on an iPad with 12 GB was closed four times in a day).
+    static func memoryTooHigh(_ gb: Int) -> Bool { gb > suggestedRAMGB }
 
     /// The virtual CPU offers Armv8.5 instructions (core/sysreg.c), and macOS uses them. They run as
     /// they are, so the chip needs them too: A14, M1 and later, which is iPhone13,x and iPad13,x up.
@@ -96,6 +103,7 @@ enum HardwareKeys {
             let usage = UInt8(raw)
             henge_vm_key_hid(usage, down ? 1 : 0)
             if usage < 0xe0 { lastKey = CACurrentMediaTime() }
+            if down, usage == 0x28 || usage == 0x58 { Keys.lastEnter = Date() } // Return, or Enter on a keypad
             if down {
                 held.insert(usage)
             } else {
@@ -117,7 +125,17 @@ enum HardwareKeys {
 /// Asks iPadOS to hand the pointer over, so a trackpad or mouse drives only the Mac's pointer. It does
 /// that only for an app filling the screen. SwiftUI has no way to ask, so the answer is added to the
 /// class of the window's root view controller, which is who iPadOS asks.
+/// A locked pointer can't leave the app, so Universal Control can't take it back to the Mac it came from:
+/// the session asks only where the iPad's pointer can't stand for the Mac's (zoomed in, another display).
 enum PointerLock {
+    /// iPadOS has granted it. It may not have yet (another app was in front when asked, or no pointer).
+    static var isLocked: Bool {
+        UIApplication.shared.connectedScenes.contains { $0.pointerLockState?.isLocked ?? false }
+    }
+
+    /// Asks again, as when a mouse arrives after the session started.
+    static func refresh() { set(wanted) }
+
     private static var wanted = false
     private static var patched: Set<ObjectIdentifier> = []
 
@@ -145,48 +163,51 @@ enum PointerLock {
     }
 }
 
-/// A Magic Keyboard's trackpad or a mouse, while a Mac is running. GameController gives the raw motion,
-/// which macOS then accelerates as it would for its own mouse.
+/// A Magic Keyboard's trackpad or a mouse, while a Mac is running and iPadOS has the pointer locked to Henge.
+/// GameController gives the raw motion, which macOS then accelerates as it does for its own mouse. Henge doesn't
+/// scale it first: macOS's acceleration isn't linear, and a speed applied before it made the pointer jump (#20).
+/// macOS's own Tracking speed (System Settings › Mouse) sets how fast it goes, as on a real Mac.
 final class HardwareMouse {
     static let shared = HardwareMouse()
-    static let speedKey = "henge.mouse.speed"
     static let reverseKey = "henge.mouse.reverse"
-    static let scrollSpeedKey = "henge.mouse.scrollSpeed"
 
     private var observers: [NSObjectProtocol] = []
     private var mice: [GCMouse] = []
     private var buttonsDown: Set<Int32> = []
     private var restX: Float = 0, restY: Float = 0
-    private var speed: Float = 1
-    private var reverse = false
+    private var movedPressed: Float = 0 // how far the left button has been dragged since it went down
     private var scrollsLogged = 0 // the first few, to see what a device's raw values look like
     private var lastScrollFirst: Float = 0, lastScrollSecond: Float = 0
+    private let scroller = MacScroller()
+    private var scrollEnd: DispatchWorkItem?
 
     func start() {
-        let defaults = UserDefaults.standard
-        speed = defaults.object(forKey: Self.speedKey) == nil ? 1 : Float(defaults.double(forKey: Self.speedKey))
-        reverse = defaults.bool(forKey: Self.reverseKey)
         lastScrollFirst = 0
         lastScrollSecond = 0
         GCMouse.mice().forEach(attach)
         observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { [weak self] note in
             if let mouse = note.object as? GCMouse { self?.attach(mouse) }
+            PointerLock.refresh()
         })
         observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidDisconnect, object: nil, queue: .main) { [weak self] note in
             guard let self, let mouse = note.object as? GCMouse else { return }
             self.releaseButtons()
             self.mice.removeAll { $0 === mouse }
         })
-        observers.append(NotificationCenter.default.addObserver(forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main) { note in
-            let locked = (note.object as? UIScene)?.pointerLockState?.isLocked ?? false
+        observers.append(NotificationCenter.default.addObserver(forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main) { [weak self] note in
+            // The scene that changed comes in the user info: the notification's object isn't it (PR #35).
+            let scene = note.userInfo?[UIPointerLockState.sceneUserInfoKey] as? UIScene
+            let locked = scene?.pointerLockState?.isLocked ?? PointerLock.isLocked
             HengeLog.log("input", "pointer lock: \(locked ? "on" : "off")")
+            self?.releaseButtons() // whatever was pressed went to the other path
+            self?.stopScrolling()
         })
-        PointerLock.set(true)
     }
 
     func stop() {
         PointerLock.set(false)
         releaseButtons()
+        stopScrolling()
         observers.forEach(NotificationCenter.default.removeObserver)
         observers.removeAll()
         for mouse in mice {
@@ -217,9 +238,12 @@ final class HardwareMouse {
     }
 
     /// GameController's Y runs upward. What doesn't make a whole step yet waits for the next move.
+    /// Only while the pointer is locked: otherwise the iPad's own pointer is the Mac's (PointerInput).
     private func moved(_ dx: Float, _ dy: Float) {
-        restX += dx * speed
-        restY -= dy * speed
+        guard PointerLock.isLocked else { return }
+        if buttonsDown.contains(0) { movedPressed += abs(dx) + abs(dy) }
+        restX += dx
+        restY -= dy
         let x = restX.rounded(), y = restY.rounded()
         guard x != 0 || y != 0 else { return }
         restX -= x
@@ -228,19 +252,45 @@ final class HardwareMouse {
     }
 
     private func button(_ button: Int32, _ pressed: Bool) {
+        guard PointerLock.isLocked || !pressed else { return }
+        guard pressed || buttonsDown.contains(button) else { return }
+        if pressed {
+            stopScrolling() // a scroll still waiting to end doesn't fling after the click
+            MacScroller.stopGlide() // the click waits for it (the input fence), so it lands where the page stopped
+        }
         henge_vm_mouse_button(button, pressed ? 1 : 0)
         if pressed {
             buttonsDown.insert(button)
+            if button == 0 { movedPressed = 0 }
         } else {
             buttonsDown.remove(button)
             StickyKeys.shared.releaseAll()
+            // A click, not a drag: in a field, it brings the keyboard back.
+            if button == 0, movedPressed < 8 { KeyboardOwner.shared.clicked() }
         }
     }
 
-    /// GameController puts vertical motion on the first axis and horizontal on the second.
-    /// macOS accelerates wheel units roughly quadratically, so use a tunable square root
-    /// and cap each event to keep a small pad gesture from jumping across a page.
+    // MARK: Scrolling
+
+    /// A scroll ends when no more comes for this long: a trackpad's two fingers send 60 to 120 a second.
+    private static let scrollPause: TimeInterval = 0.06
+
+    /// The Mac's points a page moves for each of GameController's scroll units, at Scroll speed 1: a unit is about
+    /// one of the iPad's points of finger travel, and the Mac's screen fills the iPad, so the page follows the
+    /// fingers as an iPad page does. A small move moves a little, a fast one far, and lifting the fingers while
+    /// they move flings the page on (#38: a square root of each event's size, as wheel units, made every small
+    /// move a jump, and macOS then sped those units up again).
+    private var pointsPerUnit: CGFloat {
+        let ipad = UIScreen.main.bounds.size
+        let mac = MacScreen.points
+        return mac.width / max(max(ipad.width, ipad.height), 1)
+    }
+
+    /// GameController puts vertical motion on the first axis and horizontal on the second, as the fingers move
+    /// (natural scrolling: the page follows them). A gesture is a stream of these with no end marked, so it ends
+    /// once they pause.
     private func scrolled(_ first: Float, _ second: Float) {
+        guard PointerLock.isLocked else { return }
         // GameController reports both axis states when either one changes. On a
         // Magic Keyboard it calls us twice per movement, with one stale axis in
         // each call; sending both values doubles the scroll and adds sideways drift.
@@ -250,25 +300,48 @@ final class HardwareMouse {
         lastScrollSecond = second
         let mostlyVertical = abs(first) > 2 * abs(second)
         let mostlyHorizontal = abs(second) > 2 * abs(first)
-        let verticalRaw = verticalChanged && !mostlyHorizontal ? -first : 0
-        let horizontalRaw = horizontalChanged && !mostlyVertical ? second : 0
-        let defaults = UserDefaults.standard
-        let configured = defaults.object(forKey: Self.scrollSpeedKey) == nil
-            ? 0.3 : defaults.double(forKey: Self.scrollSpeedKey)
-        let scale = Float(configured.isFinite ? min(max(configured, 0.1), 1.5) : 0.3)
-        let way: Int32 = reverse ? -1 : 1
-        let horizontal = way * Self.wheelUnits(horizontalRaw, scale: scale)
-        let vertical = way * Self.wheelUnits(verticalRaw, scale: scale)
+        let vertical = verticalChanged && !mostlyHorizontal && first.isFinite ? CGFloat(-first) : 0
+        let horizontal = horizontalChanged && !mostlyVertical && second.isFinite ? CGFloat(-second) : 0
+        let way: CGFloat = UserDefaults.standard.bool(forKey: Self.reverseKey) ? -1 : 1
+        let scale = pointsPerUnit * ScrollSpeed.factor * way
+        let d = CGPoint(x: horizontal * scale, y: vertical * scale)
         if scrollsLogged < 24 {
             scrollsLogged += 1
-            HengeLog.log("input", "scroll raw: \(first), \(second); units: \(horizontal), \(vertical)")
+            HengeLog.log("input", "scroll raw: \(first), \(second); Mac points: \(Int(d.x.rounded())), \(Int(d.y.rounded()))")
         }
-        if horizontal != 0 || vertical != 0 { henge_vm_mouse_scroll(horizontal, vertical) }
+        guard d != .zero else { return }
+        let now = CACurrentMediaTime()
+        scroller.scroll(by: d, at: now) // a page still gliding stops as it begins, as under a trackpad
+        scrollEnd?.cancel()
+        let end = DispatchWorkItem { [weak self] in
+            // A trackpad's stream of moves flings the page on; a wheel's notch never does.
+            self?.scroller.end(gliding: true, at: now, fling: 3)
+        }
+        scrollEnd = end
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.scrollPause, execute: end)
     }
 
-    private static func wheelUnits(_ value: Float, scale: Float) -> Int32 {
-        guard value.isFinite else { return 0 }
-        let units = Int32(min(32, (22 * scale * abs(value).squareRoot()).rounded()))
-        return value < 0 ? -units : units
+    private func stopScrolling() {
+        scrollEnd?.cancel()
+        scrollEnd = nil
+        scroller.end(gliding: false, at: CACurrentMediaTime())
+    }
+}
+
+/// Under a Mac's memory choice: what it risks, a warning in its colour when it is too much for this device.
+struct MemoryNote: View {
+    let gb: Int
+
+    var body: some View {
+        if let note = Device.memoryNote(gb) {
+            let high = Device.memoryTooHigh(gb)
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                if high { Image(systemName: "exclamationmark.triangle.fill") }
+                Text(note).fixedSize(horizontal: false, vertical: true)
+            }
+            .font(.system(size: 13, weight: high ? .medium : .regular))
+            .foregroundStyle(high ? Desk.warn : Desk.dim)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }

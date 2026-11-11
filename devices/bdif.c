@@ -22,7 +22,6 @@
 
 #define DATA_FLAGS_READ 0x00030001u  /* the data buffer is written by the device: a read from the disk */
 #define DATA_FLAGS_WRITE 0x00010001u /* read by the device: a write to the disk (macOS 27's iBSS writes aux sector 32768) */
-#define MAX_LEN (128u << 20)
 
 /* A request, in guest memory: three (addr, len, flags) commands. */
 typedef struct {
@@ -62,10 +61,15 @@ static uint32_t usb_xfer(HvBdif *b, uint64_t chain, int write, uint8_t *buf, uin
             total += dsc[i].len;
             uint32_t n = dsc[i].len < len - done ? dsc[i].len : len - done;
             if (n) {
-                void *p = hv_phys_ptr(b->m, dsc[i].addr, n);
-                if (!p) break;
-                if (write) memcpy(p, buf + done, n), hv_dma_written(b->m, dsc[i].addr, n);
-                else memcpy(buf + done, p, n);
+                if (write) {
+                    void *p = hv_phys_ptr_w(b->m, dsc[i].addr, n);
+                    if (!p) break;
+                    memcpy(p, buf + done, n), hv_dma_written(b->m, dsc[i].addr, n);
+                } else {
+                    const void *p = hv_phys_ptr_r(b->m, dsc[i].addr, n);
+                    if (!p) break;
+                    memcpy(buf + done, p, n);
+                }
                 done += n;
             }
         }
@@ -150,8 +154,11 @@ static uint64_t bdif_read(void *opaque, uint64_t off, unsigned size) {
     case REG_UNK2: return 1;
     case REG_UNK3: return 0;
     case REG_NEXT_DEVICE:
-        if (devid == DEVID_ROOT) return 0x8000000;
-        if (devid == DEVID_AUX) return 0x10000;
+        /* For a disk this is its size in 512-byte sectors, which iBoot checks GPT addresses against: a disk grown
+           past 64 GiB has to say so, or the 27.2 -> 27.3 upgrade's boot cannot see its partitions. With no disk
+           file, the sizes it always gave (64 GiB, and the aux disk's 32 MiB). */
+        if (devid == DEVID_ROOT) return b->root ? b->root->size / 512 : 0x8000000;
+        if (devid == DEVID_AUX) return b->aux ? b->aux->size / 512 : 0x10000;
         return ~0ull;
     default: return ~0ull;
     }
@@ -163,13 +170,19 @@ static void command(HvBdif *b, HvDisk *disk, uint64_t req_pa) {
     if (hv_phys_read(b->m, req_pa, req, sizeof req) != 0) return;
     if (disk && req[0].len == 16) {
         uint32_t sector[4];
-        if (hv_phys_read(b->m, req[0].addr, sector, sizeof sector) == 0 && req[1].len <= MAX_LEN) {
-            void *buf = hv_phys_ptr(b->m, req[1].addr, req[1].len);
+        if (hv_phys_read(b->m, req[0].addr, sector, sizeof sector) == 0) {
+            /* Straight into or out of guest RAM, whatever the length (hv_phys_ptr checks the whole range is RAM):
+               the 27.3 upgrade's iBoot reads a 272 MiB boot asset in one request, past the 128 MiB this once allowed. */
             uint64_t at = (uint64_t)sector[2] * 512;
-            if (buf && req[1].flags == DATA_FLAGS_READ) {
-                if (hv_disk_read(disk, at, buf, req[1].len) == 0) ret = 0, hv_dma_written(b->m, req[1].addr, req[1].len);
-            } else if (buf && req[1].flags == DATA_FLAGS_WRITE) {
-                if (hv_disk_write(disk, at, buf, req[1].len) == 0) ret = 0;
+            if (req[1].flags == DATA_FLAGS_READ) {
+                void *buf = hv_phys_ptr_w(b->m, req[1].addr, req[1].len);
+                if (buf) { /* marked failed too: the lend ends, and part may be written */
+                    if (hv_disk_read(disk, at, buf, req[1].len) == 0) ret = 0;
+                    hv_dma_written(b->m, req[1].addr, req[1].len);
+                }
+            } else if (req[1].flags == DATA_FLAGS_WRITE) {
+                const void *buf = hv_phys_ptr_r(b->m, req[1].addr, req[1].len); /* a disk write only reads guest memory */
+                if (buf && hv_disk_write(disk, at, buf, req[1].len) == 0) ret = 0;
             }
         }
     }

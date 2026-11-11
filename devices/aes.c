@@ -85,8 +85,10 @@ static int cmd_data(HvAes *a) {
         if (a->m->log) fprintf(stderr, "hengevm: aes: data command %08x with a %u-byte key (not modelled)\n", cmd, k->len);
         return 1;
     }
-    uint8_t *in = hv_phys_ptr(a->m, src, len), *out = hv_phys_ptr(a->m, dst, len);
+    const uint8_t *in = hv_phys_ptr_r(a->m, src, len);
+    uint8_t *out = hv_phys_ptr_w(a->m, dst, len);
     if (!in || !out) {
+        if (out) hv_dma_written(a->m, dst, len); /* its lend ends */
         if (a->m->log) fprintf(stderr, "hengevm: aes: DMA outside RAM (%llx -> %llx, %u bytes)\n",
                                (unsigned long long)src, (unsigned long long)dst, len);
         return 1;
@@ -96,8 +98,9 @@ static int cmd_data(HvAes *a) {
     CCCryptorStatus st = CCCrypt(a->encrypt ? kCCEncrypt : kCCDecrypt, kCCAlgorithmAES, a->cbc ? 0 : kCCOptionECBMode,
                                  k->key, k->len, a->cbc ? (const void *)a->iv[iv_ctx] : NULL, in, len, tmp, len,
                                  &moved);
-    if (st == kCCSuccess) memcpy(out, tmp, len), hv_dma_written(a->m, dst, len);
-    else if (a->m->log) fprintf(stderr, "hengevm: aes: cipher failed (%d), length %u\n", (int)st, len);
+    if (st == kCCSuccess) memcpy(out, tmp, len);
+    hv_dma_written(a->m, dst, len); /* failed too: its lend ends */
+    if (st != kCCSuccess && a->m->log) fprintf(stderr, "hengevm: aes: cipher failed (%d), length %u\n", (int)st, len);
     free(tmp);
     return 1;
 }

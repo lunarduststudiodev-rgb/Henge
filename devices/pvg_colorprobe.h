@@ -22,8 +22,9 @@
      layer         the CAMetalLayer's colour-relevant properties
      swap          a frame handed to the display, logged for the first 3 swaps, whenever what describes the display changes (surface
                    size/format, gamma descriptor) and every 3000th swap. The two alternating display buffers are not news.
-     display_page  words of the shared display page the guest reads (colour matrix, primaries, mode, state) when they change;
-                   the swap counter, mapping and pointer words are ignored
+     display_page  words of the shared display page the guest reads (colour matrix, primaries, mode, state) when they change,
+                   looked at every swap (a matrix can change with the gamma table unchanged: Night Shift, say); the swap counter,
+                   mapping and pointer words are ignored
      gamma_check / gamma_raw / gamma_f32 / gamma_u32n / gamma_f16 / gamma_u16n
                    the guest's gamma table, read where the descriptor says, judged by the guest's checksum, and read as four element types
                    against four curves (identity, sRGB encode, gamma-2.2 encode, gamma-2.2 decode)
@@ -40,6 +41,8 @@
      frame-NNN-src.raw   displayed surface, tightly packed, BGRA8 (or RGBA half floats, see the json)
      frame-NNN-post.raw  drawable after the screen shader, tightly packed BGRA8
      gamma-NNN.bin       the gamma table bytes, if found in the surface
+     gamma-sum-SSSSSSSS.bin   each different gamma table the guest gives (SSSSSSSS its checksum), wherever it was found:
+                         the whole table, to see one table or three and the order of its curve and any scaling
      frame-NNN.json      geometry, format, colour mode and gamma descriptor for the files above
    Controls, by creating an empty file in the probe folder (checked once a second, then deleted):
      trigger        take a capture (or set HV_COLOR_PROBE_SECS=N for one every N seconds)
@@ -71,6 +74,8 @@ static struct {
     uint64_t g_off, g_len;
     uint32_t page_prev[128];
     int page_have;
+    uint32_t kept_sums[16]; /* the tables already written to gamma-sum-*.bin */
+    unsigned kept;
     dispatch_source_t timer;
     /* the capture waiting for its post-shader frame */
     uint8_t *pend_src;
@@ -153,8 +158,21 @@ static const char *cp_sum_match(uint32_t s32, uint32_t s8, uint32_t sf) {
     return s32 == cp.g_sum ? "u32" : s8 == cp.g_sum ? "u8" : sf == cp.g_sum ? "f32" : "none";
 }
 
-/* Read the table at t four ways and compare it with the usual curves. */
+/* A table the guest's checksum matched, written whole once per checksum (at most 16 of them). */
+static void cp_gamma_keep(const uint8_t *t, const char *where) {
+    for (unsigned i = 0; i < cp.kept && i < 16; i++)
+        if (cp.kept_sums[i] == cp.g_sum) return;
+    if (cp.kept >= 16) return;
+    cp.kept_sums[cp.kept++] = cp.g_sum;
+    char name[64];
+    snprintf(name, sizeof name, "gamma-sum-%08x.bin", cp.g_sum);
+    cp_write(name, t, (size_t)cp.g_len);
+    cp_log("gamma_kept", "file=%s where=%s len=%llu entries_arg=%u", name, where, (unsigned long long)cp.g_len, cp.g_entries);
+}
+
+/* Read the table at t four ways and compare it with the usual curves; it is one the guest's checksum matched. */
 static void cp_gamma_analyze(const uint8_t *t, const char *why, unsigned seq, const char *where) {
+    cp_gamma_keep(t, where);
     char hex[200] = "";
     for (int i = 0; i < 32 && (uint64_t)i < cp.g_len; i++) snprintf(hex + strlen(hex), sizeof hex - strlen(hex), "%02x", t[i]);
     cp_log("gamma_raw", "why=%s seq=%u where=%s first32=%s as_f32=[%.5f %.5f %.5f %.5f %.5f %.5f] as_u16n=[%.5f %.5f %.5f %.5f %.5f %.5f]", why, seq, where, hex,
@@ -432,7 +450,7 @@ static void cp_note_swap(HvReplay *r, uint64_t mapping, const uint32_t *a, uint3
     }
     cp.swaps++;
     HvObject *s = r->surfaces[@(mapping)];
-    const uint8_t *desc = hv_pvg_lite_surface(r->lite, (uint32_t)mapping);
+    const uint8_t *desc = hv_pvg_lite_surface(r->lite, mapping);
     uint64_t alloc = 0, row = 0, sw = 0, sh = 0;
     uint32_t first = 0, fourcc = 0;
     if (desc) memcpy(&fourcc, desc + 4, 4), memcpy(&alloc, desc + 0x18, 8), memcpy(&sw, desc + 0x20, 8), memcpy(&sh, desc + 0x28, 8), memcpy(&row, desc + 0x30, 8), memcpy(&first, desc + 0x60, 4);
@@ -447,10 +465,8 @@ static void cp_note_swap(HvReplay *r, uint64_t mapping, const uint32_t *a, uint3
                (unsigned long long)alloc, (long long)alloc - (long long)(row * sh), fourcc == 'RGhA' ? cp_mode_name(hv_half_mode_get()) : "plain(passthrough)", cp.g_port,
                (unsigned long long)cp.g_off, (unsigned long long)cp.g_len, cp.g_entries, cp.g_sum, n, changed);
     }
-    if (changed || cp.swaps == 1) {
-        cp_display_page(r, cp.swaps == 1);
-        if (cp.g_len || cp.swaps == 1) cp_gamma_event(r, s, "swap", 0);
-    }
+    cp_display_page(r, cp.swaps == 1); /* every swap: it says only what changed */
+    if ((changed || cp.swaps == 1) && (cp.g_len || cp.swaps == 1)) cp_gamma_event(r, s, "swap", 0);
     cp.last_fp = fp;
     cp.last_sum = cp.g_sum;
     cp.last_len = cp.g_len;

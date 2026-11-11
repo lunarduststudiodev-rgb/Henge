@@ -54,4 +54,11 @@ void hv_gicv3_pend(HvGic *g, int intid);
 /* Recompute every CPU's IRQ and FIQ inputs (waking any that just got one). */
 void hv_gicv3_update(HvGic *g);
 
+/* Suspend (core/snapshot.h): the GIC's whole state into a snapshot, and back into a GIC with the
+   same CPUs. Saving: with the machine paused. Loading: before its CPUs run. */
+struct HvSnapWriter;
+struct HvSnapReader;
+int hv_gicv3_snap_save(HvGic *g, struct HvSnapWriter *w);
+int hv_gicv3_snap_load(HvGic *g, struct HvSnapReader *r);
+
 #endif

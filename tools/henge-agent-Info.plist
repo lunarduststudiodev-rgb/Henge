@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key><string>com.henge.agent</string>
+	<key>CFBundleName</key><string>Henge Tools</string>
+	<key>CFBundleDisplayName</key><string>Henge Tools</string>
+	<key>NSAppleEventsUsageDescription</key><string>Henge Tools shuts down and restarts this Mac when you choose Shut Down or Restart in Henge on your iPad, the same way the Apple menu does, so your apps can save your work first.</string>
+</dict>
+</plist>

@@ -93,5 +93,32 @@ END p_uart
 uart_msg:
     .asciz "hello from the guest\n"
 
+// Pause: count and watch the counter until the host sets [x0] (progress at [x0 + 8]). x11 ends as
+// the biggest step the counter took between two reads: a pause the guest saw shows up there.
+PROGRAM p_pause_clock
+    mrs x10, cntvct_el0
+    mov x11, #0
+    mov x12, #0
+1:  mrs x13, cntvct_el0
+    sub x14, x13, x10
+    cmp x14, x11
+    csel x11, x14, x11, hi
+    mov x10, x13
+    add x12, x12, #1
+    str x12, [x0, #8]
+    ldr x15, [x0]
+    cbz x15, 1b
+END p_pause_clock
+
+// Pause while asleep: WFI over and over (the board's tick wakes it every 10 ms at most).
+PROGRAM p_pause_wfi
+    mov x12, #0
+1:  wfi
+    add x12, x12, #1
+    str x12, [x0, #8]
+    ldr x15, [x0]
+    cbz x15, 1b
+END p_pause_wfi
+
     .p2align 14
 _devices_programs_finish:

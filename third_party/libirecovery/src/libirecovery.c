@@ -25,6 +25,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
@@ -3833,6 +3834,55 @@ static irecv_error_t irecv_kis_send_buffer(irecv_client_t client, unsigned char*
 	return IRECV_E_SUCCESS;
 }
 #endif
+
+irecv_error_t irecv_send_recovery_stream(irecv_client_t client, unsigned long length,
+	irecv_stream_read_cb_t read, void* context)
+{
+#ifdef USE_DUMMY
+	return IRECV_E_UNSUPPORTED;
+#else
+	if (!read || !length)
+		return IRECV_E_INVALID_INPUT;
+	if (check_context(client) != IRECV_E_SUCCESS)
+		return IRECV_E_NO_DEVICE;
+	if (client->isKIS || client->mode < IRECV_K_RECOVERY_MODE_1 || client->mode > IRECV_K_RECOVERY_MODE_4 ||
+	    client->device_info.cpid == 0x8900 || client->device_info.cpid == 0x8720)
+		return IRECV_E_UNSUPPORTED;
+
+	irecv_error_t error = irecv_usb_control_transfer(client, 0x41, 0, 0, 0, NULL, 0, USB_TIMEOUT);
+	if (error != IRECV_E_SUCCESS)
+		return error;
+
+	unsigned char packet[0x8000];
+	for (unsigned long sent = 0; sent < length;) {
+		unsigned long remaining = length - sent;
+		int size = remaining < sizeof(packet) ? (int)remaining : (int)sizeof(packet);
+		if (read(context, packet, (size_t)size) < 0)
+			return IRECV_E_USB_UPLOAD;
+		int bytes = 0;
+		error = irecv_usb_bulk_transfer(client, 0x04, packet, size, &bytes, USB_TIMEOUT);
+		if (error != IRECV_E_SUCCESS)
+			return error;
+		if (bytes != size)
+			return IRECV_E_USB_UPLOAD;
+		sent += size;
+		if (client->progress_callback) {
+			irecv_event_t event = {
+				.progress = (double)sent / (double)length * 100.0,
+				.type = IRECV_PROGRESS,
+				.data = "Uploading",
+				.size = sent > INT_MAX ? INT_MAX : (int)sent
+			};
+			client->progress_callback(client, &event);
+		}
+	}
+	if (length % 512 == 0) {
+		int bytes = 0;
+		irecv_usb_bulk_transfer(client, 0x04, packet, 0, &bytes, USB_TIMEOUT);
+	}
+	return IRECV_E_SUCCESS;
+#endif
+}
 
 irecv_error_t irecv_send_buffer(irecv_client_t client, unsigned char* buffer, unsigned long length, unsigned int options)
 {

@@ -1427,12 +1427,17 @@ void ipsw_cancel(void)
 
 ipsw_file_handle_t ipsw_file_open(ipsw_archive_t ipsw, const char* path)
 {
+	if (!ipsw || !path)
+		return NULL;
 	ipsw_file_handle_t handle = (ipsw_file_handle_t)calloc(1, sizeof(struct ipsw_file_handle));
+	if (!handle)
+		return NULL;
 	if (ipsw->zip) {
 		int err = 0;
 		struct zip *zip = zip_open(ipsw->path, 0, &err);
 		if (zip == NULL) {
 			logger(LL_ERROR, "zip_open: %s: %d\n", ipsw->path, err);
+			free(handle);
 			return NULL;
 		}
 
@@ -1454,7 +1459,12 @@ ipsw_file_handle_t ipsw_file_open(ipsw_archive_t ipsw, const char* path)
 			return NULL;
 		}
 		zip_stat_init(&zst);
-		zip_stat(zip, path, 0, &zst);
+		if (zip_stat_index(zip, zindex, 0, &zst) < 0 || !(zst.valid & ZIP_STAT_SIZE)) {
+			zip_fclose(handle->zfile);
+			zip_close(zip);
+			free(handle);
+			return NULL;
+		}
 		handle->size = zst.size;
 		handle->seekable = (zst.comp_method == ZIP_CM_STORE);
 		handle->zip = zip;
@@ -1468,7 +1478,11 @@ ipsw_file_handle_t ipsw_file_open(ipsw_archive_t ipsw, const char* path)
 			free(handle);
 			return NULL;
 		}
-		fstat(fileno(handle->file), &st);
+		if (fstat(fileno(handle->file), &st) != 0 || !S_ISREG(st.st_mode)) {
+			fclose(handle->file);
+			free(handle);
+			return NULL;
+		}
 		handle->size = st.st_size;
 		handle->seekable = 1;
 	}

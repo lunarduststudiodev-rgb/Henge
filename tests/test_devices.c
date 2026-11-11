@@ -7,19 +7,27 @@
 
 #include "sysreg.h"
 #include "vmapple.h"
+#include "timer.h"
+
+#include <pthread.h>
+#include <mach/mach_time.h>
 
 DECLARE_PROGRAM(p_timer_irq);
 DECLARE_PROGRAM(p_uart);
+DECLARE_PROGRAM(p_pause_clock);
+DECLARE_PROGRAM(p_pause_wfi);
 extern const char devices_programs_begin[], devices_programs_finish[];
 
-/* HV_TEST_WORK, or the system temporary directory: two small disk images go there. */
-static const char *work_dir(void) {
+/* Where the scratch disks go: HV_TEST_WORK, or a fresh folder of this run's own in the system temporary
+   directory, so tests running side by side never share disks. Fills buf; returns 1 for a folder made here. */
+static int work_dir(char *buf, size_t len) {
     const char *w = getenv("HV_TEST_WORK");
-    if (w && *w) return w;
-    w = getenv("TMPDIR");
-    return w && *w ? w : "/tmp";
+    if (w && *w) return snprintf(buf, len, "%s", w), 0;
+    const char *t = getenv("TMPDIR");
+    snprintf(buf, len, "%s/henge-test-disks.XXXXXX", t && *t ? t : "/tmp");
+    return mkdtemp(buf) ? 1 : -1;
 }
-#define RAM_SIZE (64ull << 20)
+#define RAM_SIZE (192ull << 20) /* room for a bdif transfer past 128 MiB; the RAM file is sparse */
 
 static HvMachine m;
 static HvCpu cpu;
@@ -126,10 +134,12 @@ static int make_disk(const char *path, uint64_t size, uint8_t salt) {
     static uint8_t buf[4096];
     for (uint64_t off = 0; off < size; off += sizeof buf) {
         for (size_t i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)((off + i) / 512 * 7 + i + salt);
-        if (write(fd, buf, sizeof buf) != (ssize_t)sizeof buf) return -1;
+        if (write(fd, buf, sizeof buf) != (ssize_t)sizeof buf) {
+            close(fd);
+            return -1;
+        }
     }
-    close(fd);
-    return 0;
+    return close(fd);
 }
 
 static void test_simple_devices(void) {
@@ -184,7 +194,12 @@ static void test_bdif(HvDisk *root, HvDisk *aux) {
     a = ret; l = 1; f = 0; memcpy(r + 32, &a, 8); memcpy(r + 40, &l, 4); memcpy(r + 44, &f, 4);
     memcpy(ram(req), r, 48);
     check("bdif status", rd32(VMAPPLE_BDOOR), 1);
-    check("bdif root next-device", rd32(VMAPPLE_BDOOR + 0x420), 0x8000000);
+    check("bdif root capacity", rd32(VMAPPLE_BDOOR + 0x420), root->size / 512);
+    check("bdif aux capacity", rd32(VMAPPLE_BDOOR + 0x10000 + 0x420), aux->size / 512);
+    uint64_t original_size = root->size;
+    root->size = 96ull << 30; /* a disk grown past 64 GiB is reported whole */
+    check("bdif grown root capacity", rd32(VMAPPLE_BDOOR + 0x420), (96ull << 30) / 512);
+    root->size = original_size;
     for (int which = 0; which < 2; which++) {
         HvDisk *d = which ? aux : root;
         ram(ret)[0] = 0xee;
@@ -194,6 +209,39 @@ static void test_bdif(HvDisk *root, HvDisk *aux) {
         check(which ? "bdif aux read ok" : "bdif root read ok", ram(ret)[0], 0);
         check(which ? "bdif aux data" : "bdif root data", memcmp(ram(data), want, 1024), 0);
     }
+
+    /* One request past the old 128 MiB cap, as the 27.3 upgrade's iBoot reads a 272 MiB boot asset: it crosses
+       a 128 MiB piece of hv_disk_read, and the bytes on both sides of that seam come back in place. */
+    const uint32_t big = (128u << 20) + (8u << 20);
+    const uint64_t at = 4ull << 20, big_data = base + (32ull << 20);
+    const uint8_t marks[3] = {0xa7, 0x5c, 0x3e};
+    const uint64_t mark_at[3] = {0, (128u << 20) - 1, big - 1};
+    check("big transfer fixture", ftruncate(root->fd, (off_t)(at + big)), 0);
+    root->size = at + big;
+    for (int i = 0; i < 3; i++) check("big transfer mark", pwrite(root->fd, &marks[i], 1, (off_t)(at + mark_at[i])), 1);
+    pwrite(root->fd, &marks[1], 1, (off_t)(at + (128u << 20))); /* the first byte of the second piece */
+    uint32_t big_sector[4] = {0, 0, (uint32_t)(at / 512), 0};
+    memcpy(ram(sec), big_sector, sizeof big_sector);
+    memcpy(r + 16, &big_data, 8);
+    memcpy(r + 24, &big, 4);
+    memcpy(ram(req), r, 48);
+    ram(ret)[0] = 0xee;
+    wr64(VMAPPLE_BDOOR + 0x408, req);
+    check("bdif read past 128 MiB ok", ram(ret)[0], 0);
+    for (int i = 0; i < 3; i++) check("bdif read past 128 MiB data", ram(big_data + mark_at[i])[0], marks[i]);
+    check("bdif read past 128 MiB seam", ram(big_data + (128u << 20))[0], marks[1]);
+    uint64_t outside = base + RAM_SIZE - 1024; /* runs off the end of guest RAM */
+    memcpy(r + 16, &outside, 8);
+    memcpy(ram(req), r, 48);
+    wr64(VMAPPLE_BDOOR + 0x408, req);
+    check("bdif refuses a transfer past guest RAM", ram(ret)[0], 1);
+    check("big transfer fixture undone", ftruncate(root->fd, (off_t)original_size), 0);
+    root->size = original_size;
+    /* the request block as the tests after this one expect it */
+    memcpy(ram(sec), sector, 16);
+    a = data; l = 1024; memcpy(r + 16, &a, 8); memcpy(r + 24, &l, 4);
+    memcpy(ram(req), r, 48);
+    memset(ram(big_data), 0, big);
 }
 
 /* A small virtio driver, as a guest would do it. */
@@ -376,6 +424,57 @@ static void test_virtio_net(void) {
     check("RX used length", used_len, 76);
 }
 
+/* The touch tablet, read the way macOS 15's AppleVirtIOInput reads it: a device with
+   absolute X and Y and no relative ones is its trackpad, an absolute pointer whose HID
+   range comes from ABS_INFO (exactly 20 bytes), with a wheel only if EV_REL has one. */
+static uint32_t input_query(uint64_t bar, uint8_t select, uint8_t subsel, uint8_t *data) {
+    wr8(bar + 0x2000, select);
+    wr8(bar + 0x2001, subsel);
+    uint32_t size = rd8(bar + 0x2002);
+    for (uint32_t i = 0; i < size && i < 128; i++) data[i] = rd8(bar + 0x2008 + i);
+    return size;
+}
+
+static void test_virtio_input(void) {
+    /* keyboard, mouse, then the tablet: the last virtio-input device */
+    int slot = (int)find_slot(0x1af4, 0x1052, 2);
+    check("touch tablet enumerated after the keyboard and mouse", slot >= 0 && slot < 32, 1);
+    if (slot < 0 || slot >= 32) return;
+    uint64_t bar = VMAPPLE_PCIE_MMIO + 0x400000;
+    uint64_t ring = setup_virtio(slot, bar, VMAPPLE_MEM + 0x500000);
+    uint8_t d[128];
+    check("tablet name", input_query(bar, 0x01, 0, d) == 13 && !memcmp(d, "HengeVM Touch", 13), 1);
+    check("tablet has no relative axes (not a mouse, no wheel)", input_query(bar, 0x11, HV_EV_REL, d), 0);
+    check("tablet absolute axes", input_query(bar, 0x11, HV_EV_ABS, d) == 1 && d[0] == 3, 1);
+    check("tablet buttons", input_query(bar, 0x11, HV_EV_KEY, d) >= 0x112 / 8 + 1 && (d[0x110 / 8] & 7) == 7, 1);
+    check("tablet not ready before its driver reads ABS_INFO", board.tablet->asked_range, 0);
+    for (uint8_t axis = 0; axis < 2; axis++) {
+        uint32_t info[5];
+        check("ABS_INFO is 20 bytes", input_query(bar, 0x12, axis, d), 20);
+        memcpy(info, d, sizeof info);
+        check("ABS_INFO min", info[0], 0);
+        check("ABS_INFO max", info[1], HV_TABLET_MAX);
+    }
+    check("no ABS_INFO for other axes", input_query(bar, 0x12, 2, d), 0);
+    check("tablet ready once its driver read the range", hv_virtio_input_ready(board.tablet) && board.tablet->asked_range, 1);
+    /* event buffers, then one touch: X, Y, the right button (HID button 2), SYN */
+    uint64_t evq = ring, buf = VMAPPLE_MEM + 0x600000;
+    for (int i = 0; i < 4; i++) put_desc(evq, i, buf + 8u * i, 8, 2, 0), offer(evq, (uint16_t)i);
+    wr16(bar + 0x3000, 0);
+    hv_virtio_input_send(board.tablet, HV_EV_ABS, HV_ABS_X, 16384);
+    hv_virtio_input_send(board.tablet, HV_EV_ABS, HV_ABS_Y, HV_TABLET_MAX);
+    hv_virtio_input_send(board.tablet, HV_EV_KEY, HV_BTN_SECONDARY, 1);
+    hv_virtio_input_send(board.tablet, HV_EV_SYN, 0, 0);
+    hv_virtio_input_poll(board.tablet);
+    check("four events delivered", used_idx(evq), 4);
+    uint16_t ev[4][4];
+    memcpy(ev, ram(buf), sizeof ev);
+    check("X event", ev[0][0] == HV_EV_ABS && ev[0][1] == HV_ABS_X && ev[0][2] == 16384, 1);
+    check("Y event", ev[1][0] == HV_EV_ABS && ev[1][1] == HV_ABS_Y && ev[1][2] == HV_TABLET_MAX, 1);
+    check("right click is BTN_MIDDLE (HID button 2)", ev[2][0] == HV_EV_KEY && ev[2][1] == 0x112 && ev[2][2] == 1, 1);
+    check("SYN", ev[3][0] == HV_EV_SYN && ev[3][1] == 0, 1);
+}
+
 /* The memory balloon: a new target reaches the driver (config change interrupt), inflated 16 KB pages go back
    to the OS (with the RAM file under the board, as holes: they read as zero at once), a page with only some
    of its 4 KB quarters stays, a driver listing one page number per 16 KB page works too, and deflate counts. */
@@ -444,7 +543,126 @@ static void test_virtio_balloon(void) {
     check("anonymous: madvise did not fail", a->failed, 0);
 }
 
-/* FIPS-197 appendix C.1: AES-128, key 000102..0f, plaintext 00112233..ff. */
+/* Shared folders: macOS's AppleVirtIOFS, as a driver would talk to it. One request may span several
+   buffers either way, and it uses queue 0 for everything (the spec's high-priority queue). */
+static void fs_request(uint64_t ring, int q, uint64_t bar, uint16_t head, const uint64_t *in, const uint32_t *in_len, int nin,
+                       const uint64_t *outb, const uint32_t *out_len, int nout) {
+    uint64_t table = ring + (uint64_t)q * 0x4000;
+    int d = head;
+    for (int i = 0; i < nin; i++, d++) put_desc(table, d, in[i], in_len[i], 1, (uint16_t)(d + 1));
+    for (int i = 0; i < nout; i++, d++) put_desc(table, d, outb[i], out_len[i], (uint16_t)(2 | (i + 1 < nout ? 1 : 0)), (uint16_t)(d + 1));
+    offer(table, head);
+    wr16(bar + 0x3000 + 4u * (unsigned)q, (uint16_t)q);
+    hv_virtio_fs_drain(board.fs);
+}
+static uint32_t used_len(uint64_t table, int nth) {
+    uint32_t v;
+    memcpy(&v, ram(table + 0x2000 + 4 + 8u * (unsigned)nth + 4), 4);
+    return v;
+}
+
+static void test_virtio_fs(const char *dir) {
+    int slot = (int)find_slot(0x1af4, 0x1040 + 26, 0);
+    check("virtio-fs enumerated", slot >= 0 && slot < 32, 1);
+    if (slot < 0 || slot >= 32) return;
+    check("virtio-fs is the last device", find_slot(0x1af4, 0x1040 + 18, 0) < (uint64_t)slot, 1);
+    uint64_t bar = VMAPPLE_PCIE_MMIO + 0x600000;
+    uint64_t ring = setup_virtio(slot, bar, VMAPPLE_MEM + 0x700000);
+    char tag[37] = {0};
+    for (int i = 0; i < 36; i++) tag[i] = (char)rd8(bar + 0x2000 + (uint64_t)i);
+    check("tag says automount", strcmp(tag, HV_VFS_TAG_AUTOMOUNT), 0);
+    check("one request queue", rd32(bar + 0x2000 + 36), 1);
+
+    uint64_t buf = VMAPPLE_MEM + 0x800000; /* requests here, answers at +0x100000 */
+    uint64_t ans = buf + 0x100000;
+    /* INIT, its header and body in separate buffers, the answer split in two. */
+    uint32_t h[10] = {40 + 64, 26, 1, 0, 0, 0, 0, 501, 20, 1};
+    uint32_t init[16] = {7, 31, 0x20000, 0x40000029};
+    memcpy(ram(buf), h, 40);
+    memcpy(ram(buf + 0x1000), init, 64);
+    memset(ram(ans), 0xee, 0x2000);
+    fs_request(ring, 0, bar, 0, (uint64_t[]){buf, buf + 0x1000}, (uint32_t[]){40, 64}, 2, (uint64_t[]){ans, ans + 0x1000},
+               (uint32_t[]){20, 4096}, 2);
+    check("INIT used", used_idx(ring), 1);
+    check("INIT answer is 80 bytes", used_len(ring, 0), 80);
+    uint32_t major, minor, len;
+    int32_t err;
+    memcpy(&len, ram(ans), 4), memcpy(&err, ram(ans + 4), 4), memcpy(&major, ram(ans + 16), 4);
+    memcpy(&minor, ram(ans + 0x1000), 4); /* the answer went on into the second buffer */
+    check("INIT ok", err, 0);
+    check("INIT length", len, 80);
+    check("FUSE 7", major, 7);
+    check("FUSE .31, across buffers", minor, 31);
+    check("interrupt raised", board.gic->level[32 + VMAPPLE_IRQ_PCIE + slot], 1);
+    rd8(bar + 0x1000);
+
+    /* WRITE 128 KB from four buffers: create the file on the host first, then open it. */
+    char path[1100];
+    snprintf(path, sizeof path, "%s/big.bin", dir);
+    close(open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644));
+    /* LOOKUP "iPad" (node 2) then "big.bin" */
+    uint32_t lk[10] = {40 + 5, 1, 2, 0, 1, 0, 501, 20, 1, 0};
+    memcpy(ram(buf), lk, 40);
+    memcpy(ram(buf + 40), "iPad", 5);
+    fs_request(ring, 0, bar, 4, (uint64_t[]){buf}, (uint32_t[]){45}, 1, (uint64_t[]){ans}, (uint32_t[]){4096}, 1);
+    uint64_t node;
+    memcpy(&err, ram(ans + 4), 4), memcpy(&node, ram(ans + 16), 8);
+    check("LOOKUP iPad", err, 0);
+    lk[0] = 40 + 8, lk[2] = 3, lk[4] = (uint32_t)node;
+    memcpy(ram(buf), lk, 40);
+    memcpy(ram(buf + 40), "big.bin", 8);
+    fs_request(ring, 0, bar, 8, (uint64_t[]){buf}, (uint32_t[]){48}, 1, (uint64_t[]){ans}, (uint32_t[]){4096}, 1);
+    memcpy(&err, ram(ans + 4), 4), memcpy(&node, ram(ans + 16), 8);
+    check("LOOKUP big.bin", err, 0);
+    uint32_t op[12] = {40 + 8, 14, 4, 0, (uint32_t)node, 0, 501, 20, 1, 0, 2 /* O_RDWR */, 0};
+    memcpy(ram(buf), op, 48);
+    fs_request(ring, 0, bar, 12, (uint64_t[]){buf}, (uint32_t[]){48}, 1, (uint64_t[]){ans}, (uint32_t[]){32}, 1);
+    uint64_t fh;
+    memcpy(&err, ram(ans + 4), 4), memcpy(&fh, ram(ans + 16), 8);
+    check("OPEN", err, 0);
+    uint64_t wr = buf + 0x10000;
+    uint32_t wh[10] = {40 + 40 + 131072, 16, 5, 0, (uint32_t)node, 0, 501, 20, 1, 0};
+    uint8_t win[40] = {0};
+    uint64_t off0 = 0;
+    uint32_t size = 131072;
+    memcpy(win, &fh, 8), memcpy(win + 8, &off0, 8), memcpy(win + 16, &size, 4);
+    memcpy(ram(wr), wh, 40);
+    memcpy(ram(wr + 40), win, 40);
+    for (uint32_t i = 0; i < 131072; i++) ram(wr + 0x1000)[i] = (uint8_t)(i * 7 + (i >> 9));
+    /* header+write_in in one buffer, the data in three uneven ones, on queue 1 this time */
+    fs_request(ring, 1, bar, 0, (uint64_t[]){wr, wr + 0x1000, wr + 0x1000 + 1000, wr + 0x1000 + 70000},
+               (uint32_t[]){80, 1000, 69000, 131072 - 70000}, 4, (uint64_t[]){ans}, (uint32_t[]){24}, 1);
+    uint32_t wrote;
+    memcpy(&err, ram(ans + 4), 4), memcpy(&wrote, ram(ans + 16), 4);
+    check("WRITE 128 KB on queue 1", err, 0);
+    check("WRITE wrote it all", wrote, 131072);
+    check("queue 1 used", used_idx(ring + 0x4000), 1);
+    uint8_t *host = malloc(131072);
+    int fd = open(path, O_RDONLY);
+    check("file is 128 KB on the host", read(fd, host, 131072), 131072);
+    close(fd);
+    check("host data", memcmp(host, ram(wr + 0x1000), 131072), 0);
+    /* READ it back into two buffers */
+    uint32_t rh[10] = {40 + 40, 15, 6, 0, (uint32_t)node, 0, 501, 20, 1, 0};
+    memcpy(ram(buf), rh, 40);
+    memcpy(ram(buf + 40), win, 40);
+    uint64_t rb = buf + 0x40000;
+    memset(ram(rb), 0, 0x30000);
+    fs_request(ring, 0, bar, 0, (uint64_t[]){buf}, (uint32_t[]){80}, 1, (uint64_t[]){rb, rb + 0x10000},
+               (uint32_t[]){16 + 5000, 0x20000}, 2);
+    check("READ answer length", used_len(ring, 4), 16 + 131072);
+    check("READ data, first buffer", memcmp(ram(rb + 16), host, 5000), 0);
+    check("READ data, second buffer", memcmp(ram(rb + 0x10000), host + 5000, 131072 - 5000), 0);
+    free(host);
+    /* FORGET: no answer, but the buffer still comes back (0 bytes) */
+    uint32_t fg[12] = {48, 2, 7, 0, (uint32_t)node, 0, 501, 20, 1, 0, 1, 0};
+    memcpy(ram(buf), fg, 48);
+    fs_request(ring, 0, bar, 4, (uint64_t[]){buf}, (uint32_t[]){48}, 1, NULL, NULL, 0);
+    check("FORGET returned the buffer", used_idx(ring), 6);
+    check("FORGET wrote nothing", used_len(ring, 5), 0);
+    unlink(path);
+}
+
 static void test_aes(void) {
     const uint64_t fifo = VMAPPLE_AES_1 + 0x200, src = VMAPPLE_MEM + 0x500000, dst = src + 0x100;
     static const uint8_t pt[16] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
@@ -513,29 +731,180 @@ static void test_guest_programs(void) {
     }
 }
 
+/* Pause (hv_machine_pause): the CPU runs on a thread of its own while this one pauses and resumes it. */
+static const TestProgram *pause_prog;
+static HvCpu pause_init;
+static int pause_result;
+static void *pause_cpu_thread(void *unused) {
+    (void)unused;
+    pause_result = run_jit(&m, pause_prog, &pause_init, &cpu, NULL);
+    return NULL;
+}
+
+static uint64_t *pause_flag(void) { return (uint64_t *)ram(VMAPPLE_MEM + 0x30000); }
+static uint64_t pause_progress(void) { return __atomic_load_n(&pause_flag()[1], __ATOMIC_ACQUIRE); }
+static double ms_since(uint64_t t) { return (mach_absolute_time() - t) / 24000.0; }
+
+static int wait_progress(uint64_t past) {
+    uint64_t t = mach_absolute_time();
+    while (pause_progress() <= past)
+        if (ms_since(t) > 2000) return 0;
+        else usleep(200);
+    return 1;
+}
+
+static pthread_t start_pause_cpu(const TestProgram *p) {
+    pause_prog = p;
+    pause_flag()[0] = pause_flag()[1] = 0;
+    memset(&pause_init, 0, sizeof pause_init);
+    seed_cpu(&pause_init, 5, VMAPPLE_MEM + 0x10000);
+    pause_init.x[0] = VMAPPLE_MEM + 0x30000;
+    pthread_t t;
+    pthread_create(&t, NULL, pause_cpu_thread, NULL);
+    return t;
+}
+
+static void test_pause(void) {
+    static const TestProgram clock = TEST_PROGRAM(p_pause_clock), wfi = TEST_PROGRAM(p_pause_wfi);
+
+    /* A busy CPU stops, makes no progress while paused, and its clock skips the pause. */
+    pthread_t t = start_pause_cpu(&clock);
+    check("pause: the guest runs", wait_progress(1000), 1);
+    uint64_t bias0 = hv_time_bias, t0 = mach_absolute_time();
+    hv_machine_pause(&m);
+    check("pause: a busy CPU stops", hv_machine_pause_wait(&m, 1000), 0);
+    check("pause: within 20 ms", ms_since(t0) < 20, 1);
+    check("pause: says it is paused", hv_machine_paused(&m), 1);
+    uint64_t held = pause_progress();
+    usleep(300000);
+    check("pause: no guest progress while paused", pause_progress(), held);
+    hv_machine_resume(&m);
+    check("pause: the guest runs again", wait_progress(held + 1000), 1);
+    check("pause: the clock lost the pause (bias >= 290 ms)", hv_time_bias - bias0 >= 24000ull * 290, 1);
+    check("pause: not paused after resume", hv_machine_paused(&m), 0);
+    pause_flag()[0] = 1;
+    pthread_join(t, NULL);
+    check("pause: the program finished", pause_result, 0);
+    printf("  pause: biggest counter step the guest saw: %.2f ms\n", cpu.x[11] / 24000.0);
+    check("pause: the guest never saw the pause (< 100 ms step)", cpu.x[11] < 24000ull * 100, 1);
+
+    /* Resuming without a pause changes nothing. */
+    uint64_t bias1 = hv_time_bias;
+    hv_machine_resume(&m);
+    check("pause: resume alone leaves the clock", hv_time_bias, bias1);
+
+    /* A stop bounded by deadlines (the copy-on-write auto-save's, tests/test_autosave_ram.c; the save that ships
+       stops the Mac for all of it and resumes as a pause): the guest's clock runs on through it, as the real one
+       did, so macOS needs no wake to reread the time. The bias is left as it was and the guest sees the stop as a
+       step (a long one here, to be told from the gaps of an ordinary run). */
+    t = start_pause_cpu(&clock);
+    check("live: the guest runs", wait_progress(1000), 1);
+    bias1 = hv_time_bias;
+    hv_machine_pause(&m);
+    check("live: the CPU stops", hv_machine_pause_wait(&m, 1000), 0);
+    uint64_t counter;
+    check("live: the counter at the stop is read", hv_machine_paused_counter(&m, &counter), 0);
+    check("live: it is the guest's counter then", counter <= hv_counter() && hv_counter() - counter < 24000ull * 50, 1);
+    held = pause_progress();
+    usleep(300000);
+    check("live: no guest progress while stopped", pause_progress(), held);
+    hv_machine_resume_live(&m);
+    check("live: the guest runs again", wait_progress(held + 1000), 1);
+    check("live: the clock ran on (bias unchanged)", hv_time_bias, bias1);
+    check("live: not paused after resume", hv_machine_paused(&m), 0);
+    pause_flag()[0] = 1;
+    pthread_join(t, NULL);
+    check("live: the program finished", pause_result, 0);
+    check("live: the guest saw the stop as time gone by (>= 290 ms step)", cpu.x[11] >= 24000ull * 290, 1);
+
+    /* A CPU asleep in WFI stops at once (it is woken, not left to its 10 ms timeout). */
+    t = start_pause_cpu(&wfi);
+    check("pause: the WFI guest runs", wait_progress(3), 1);
+    t0 = mach_absolute_time();
+    hv_machine_pause(&m);
+    check("pause: a CPU in WFI stops", hv_machine_pause_wait(&m, 1000), 0);
+    check("pause: a CPU in WFI stops within 20 ms", ms_since(t0) < 20, 1);
+    held = pause_progress();
+    usleep(50000);
+    check("pause: no WFI progress while paused", pause_progress(), held);
+
+    /* A powered-off CPU counts as paused only while its thread waits off; another CPU that is neither
+       makes the pause time out (and a timed-out pause is undone by resume). */
+    static HvCpu other;
+    other.m = &m;
+    other.pc_state = &m.percpu[1];
+    m.cpus[1] = &other;
+    int ncpus = m.ncpus;
+    m.ncpus = 2;
+    m.percpu[1].exited = 0;
+    other.off = 1, other.parked_off = 1;
+    check("pause: a powered-off CPU counts as stopped", hv_machine_pause_wait(&m, 50), 0);
+    other.parked_off = 0; /* turned on, say, and not at the gate yet */
+    t0 = mach_absolute_time();
+    check("pause: a CPU still running makes it time out", hv_machine_pause_wait(&m, 30), -1);
+    check("pause: the timeout is kept", ms_since(t0) >= 29 && ms_since(t0) < 200, 1);
+    m.cpus[1] = NULL;
+    m.ncpus = ncpus;
+    m.percpu[1].exited = 1;
+
+    /* Stopping a paused machine: the CPU leaves the gate and its thread ends. */
+    __atomic_store_n(&cpu.halted, 3, __ATOMIC_SEQ_CST);
+    hv_machine_pause_poke(&m);
+    pthread_join(t, NULL);
+    check("pause: halted while paused, the CPU's run ends", pause_result, 0);
+    hv_machine_resume(&m);
+
+    /* Timer deadlines are host time: the guest's compare value plus what was lost to pauses. */
+    uint64_t saved = hv_time_bias;
+    hv_time_bias = 24000ull * 5000;
+    hv_cpu_reset(&cpu, &m);
+    cpu.cntv_ctl = 1;
+    cpu.cntv_cval = hv_counter() + 24000ull * 1000;
+    check("pause: the timer's host deadline includes the bias", hv_timer_update(board.gic, &cpu), cpu.cntv_cval + hv_time_bias);
+    uint64_t guest_now = hv_counter(), host_now = mach_absolute_time(); /* in this order: host time read later is larger */
+    check("pause: the guest counter is host time less the bias", host_now - guest_now >= hv_time_bias, 1);
+    cpu.cntv_ctl = 0;
+    hv_timer_update(board.gic, &cpu);
+    hv_time_bias = saved;
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (hv_machine_init(&m, 4 << 20) != 0) return 1;
-    char root_path[1024], aux_path[1024];
-    snprintf(root_path, sizeof root_path, "%s/hv-test-root.img", work_dir());
-    snprintf(aux_path, sizeof aux_path, "%s/hv-test-aux.img", work_dir());
+    char work[1024];
+    int made = work_dir(work, sizeof work);
+    if (made < 0) return 1;
+    char root_path[1100], aux_path[1100];
+    snprintf(root_path, sizeof root_path, "%s/test-root.img", work);
+    snprintf(aux_path, sizeof aux_path, "%s/test-aux.img", work);
     if (make_disk(root_path, 1 << 20, 1) || make_disk(aux_path, 256 << 10, 2)) {
-        printf("cannot create test disks in %s\n", work_dir());
+        printf("cannot create test disks in %s\n", work);
         return 1;
     }
     static HvDisk root, aux;
-    hv_disk_open(&root, root_path, 0, 0);
-    hv_disk_open(&aux, aux_path, 16384, 0); /* as with auxiliary.bin: skip the 16 KB header */
+    if (hv_disk_open(&root, root_path, 0, 0) ||
+        hv_disk_open(&aux, aux_path, 16384, 0)) { /* as with auxiliary.bin: skip the 16 KB header */
+        printf("cannot open the test disks in %s\n", work);
+        return 1;
+    }
     HvCfgParams cfg = {.nr_cpus = 1, .ecid = 0x1234, .mac_en0 = {2, 0, 0, 0x12, 0x34, 0x56}};
     /* The balloon, over guest RAM in a file (holes read as zero at once) */
     char ram_path[1024];
-    snprintf(ram_path, sizeof ram_path, "%s/hv-test-ram", work_dir());
+    snprintf(ram_path, sizeof ram_path, "%s/hv-test-ram", work);
     setenv("HV_BALLOON", "0", 1);
     setenv("HV_RAM_FILE", ram_path, 1);
     setenv("HV_RAM_NO_LEDGER", "1", 1);
     setenv("HV_RAM_NO_PREFAULT", "1", 1);
     static const uint8_t mac[6] = {2, 0, 0, 0x12, 0x34, 0x56};
     if (hv_vmapple_create(&board, &m, &cpu, RAM_SIZE, &root, &aux, &cfg, mac) != 0) return 1;
+    char fs_dir[] = "/tmp/henge-test-fs.XXXXXX";
+    if (!mkdtemp(fs_dir)) return 1;
+    {
+        static const char *const names[] = {"iPad", "Henge Tools"};
+        const char *const paths[] = {fs_dir, NULL};
+        static const int ro[] = {0, 1};
+        check("shared folder set up", hv_vmapple_share_folders(&board, names, paths, ro, 2), 1);
+    }
     hv_vmapple_reset_cpu(&board);
     check("reset pc", cpu.pc, VMAPPLE_FIRMWARE);
     check("aux disk skips its 16 KB header", aux.size, (256 << 10) - 16384);
@@ -545,6 +914,9 @@ int main(void) {
     test_bdif(&root, &aux);
     test_virtio_blk(&aux);
     test_virtio_net();
+    test_virtio_input();
+    test_virtio_fs(fs_dir);
+    rmdir(fs_dir);
     test_virtio_balloon();
     test_aes();
     /* MSI frame: valid type register, doorbell pends the INTID */
@@ -561,12 +933,42 @@ int main(void) {
     check("gpio edge raises SPI 5", board.gic->level[32 + VMAPPLE_IRQ_GPIO], 1);
     wr32(VMAPPLE_GPIO + 0x41c, 1u << 3);
     check("gpio interrupt cleared", board.gic->level[32 + VMAPPLE_IRQ_GPIO], 0);
+    /* Apple virtual RTC: the "time changed" line, as macOS programs it at boot */
+    {
+        const int line = 32 + VMAPPLE_IRQ_AVP_RTC;
+        uint64_t v = 0;
+        wr64(VMAPPLE_RTC_SELECT + 0x38, 0x00ffffffffffffffull); /* clear everything */
+        wr64(VMAPPLE_RTC_SELECT + 0x20, 0);
+        hv_vmapple_rtc_event(&board, HV_AVP_RTC_WOKE);
+        check("avp rtc: masked event stays low", board.gic->level[line], 0);
+        hv_phys_read(&m, VMAPPLE_RTC_SELECT + 0x28, &v, 8);
+        check("avp rtc: raw status shows it", v, HV_AVP_RTC_WOKE);
+        wr64(VMAPPLE_RTC_SELECT + 0x20, 6);
+        check("avp rtc: unmasking raises INTID 0x33", board.gic->level[line], 1);
+        hv_phys_read(&m, VMAPPLE_RTC_SELECT + 0x30, &v, 8);
+        check("avp rtc: masked status", v, HV_AVP_RTC_WOKE);
+        wr64(VMAPPLE_RTC_SELECT + 0x38, HV_AVP_RTC_WOKE);
+        check("avp rtc: clear drops the line", board.gic->level[line], 0);
+        hv_phys_read(&m, VMAPPLE_RTC_SELECT + 0x28, &v, 8);
+        check("avp rtc: status cleared", v, 0);
+        hv_vmapple_rtc_event(&board, HV_AVP_RTC_RESTORED);
+        check("avp rtc: restore event raises it", board.gic->level[line], 1);
+        wr64(VMAPPLE_RTC_SELECT + 0x38, 7);
+        check("avp rtc: version", rd32(VMAPPLE_RTC_SELECT + 0x40), 0xf001);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        hv_phys_read(&m, VMAPPLE_RTC_SELECT, &v, 8);
+        check("avp rtc: counter is the real time in us", v / 1000000 >= (uint64_t)ts.tv_sec && v / 1000000 <= (uint64_t)ts.tv_sec + 1, 1);
+    }
     test_guest_programs();
+    test_pause();
 
     hv_disk_close(&root);
     hv_disk_close(&aux);
     unlink(root_path);
     unlink(aux_path);
+    unlink(ram_path);
+    if (made) rmdir(work);
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
 }

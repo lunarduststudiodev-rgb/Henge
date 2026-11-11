@@ -6,9 +6,10 @@
 
 #include "virtio.h"
 
-/* virtio-snd (virtio 1.2, section 5.14) with one output stream: what
-   Virtualization.framework's VZVirtioSoundDeviceConfiguration gives a macOS
-   guest, which AppleVirtIOSound drives.
+/* virtio-snd (virtio 1.2, section 5.14) with an output stream (0) and an input
+   stream (1, the microphone): what Virtualization.framework's
+   VZVirtioSoundDeviceConfiguration gives a macOS guest with an input and an output
+   stream, which AppleVirtIOSound drives. HV_NO_MIC leaves the input out.
 
    The guest's PCM goes into a ring here; a host backend (CoreAudio on the Mac)
    pulls it out on its own thread with hv_virtio_snd_pull. A transmit buffer goes
@@ -30,7 +31,31 @@ typedef struct HvVirtioSndBackend {
     int (*start)(void *opaque, unsigned channels, unsigned format, unsigned rate_hz);
     void (*stop)(void *opaque);
     void *opaque;
+    /* The microphone (the input stream), on the CPU thread, which they must not block: start or stop
+       the host's capture on another thread. Once started, the host hands its PCM, in exactly this
+       format, to hv_virtio_snd_capture. cap_start returns 0 if the host will try (if it then sends
+       nothing, the Mac hears silence). NULL: no microphone, the Mac hears silence. */
+    int (*cap_start)(void *opaque, unsigned channels, unsigned format, unsigned rate_hz);
+    void (*cap_stop)(void *opaque);
 } HvVirtioSndBackend;
+
+/* The input stream. The host's capture goes into a ring; the CPU thread fills the guest's
+   capture buffers from it at the stream's rate by the wall clock (silence when the host has
+   nothing), so the guest's input runs at the right speed with or without a microphone. */
+typedef struct HvVirtioSndIn {
+    unsigned channels, format, rate, frame_bytes, rate_hz;
+    uint32_t buffer_bytes, period_bytes;
+    int prepared, running;
+    int capturing;  /* the backend's capture was started (cap_start said yes) */
+    int primed;     /* the ring had a cushion of audio: take from it (else silence until it has) */
+    int restart;    /* a snapshot was loaded while it ran: start the host's capture again */
+    uint8_t *ring;  /* written by the host's capture thread */
+    _Atomic uint64_t written, read;
+    uint64_t start_ns, delivered; /* the clock: bytes due since start_ns, bytes given to the guest */
+    HvVirtqElem pending[HV_VSND_PENDING]; /* capture buffers held until their audio is due */
+    uint32_t phead, ptail;
+    uint64_t overruns, underruns, xfers;
+} HvVirtioSndIn;
 
 typedef struct HvVirtioSnd {
     HvVirtio vio;
@@ -48,6 +73,7 @@ typedef struct HvVirtioSnd {
     uint64_t pending_end[HV_VSND_PENDING]; /* `written` after this buffer's data */
     uint32_t phead, pcopy, ptail; /* pcopy: next one whose audio is not yet in the ring */
     uint64_t underruns, xfers;
+    HvVirtioSndIn in; /* the microphone */
 } HvVirtioSnd;
 
 HvVirtioSnd *hv_virtio_snd_create(HvMachine *m, HvPcie *bus);
@@ -55,5 +81,12 @@ HvVirtioSnd *hv_virtio_snd_create(HvMachine *m, HvPcie *bus);
 void hv_virtio_snd_poll(HvVirtioSnd *d);
 /* Backend thread: take up to `len` bytes of PCM; the rest of `buf` is silence. Returns bytes taken. */
 uint32_t hv_virtio_snd_pull(HvVirtioSnd *d, void *buf, uint32_t len);
+/* Host capture thread: len bytes of PCM from the microphone, in the format cap_start asked for.
+   What doesn't fit (the guest isn't taking it) is dropped. */
+void hv_virtio_snd_capture(HvVirtioSnd *d, const void *pcm, uint32_t len);
+/* The number of streams the guest was told of: 2 with the microphone, 1 without. */
+int hv_virtio_snd_streams(const HvVirtioSnd *d);
+/* After a snapshot load: if the input stream was running, start the host's capture again, the clock from now. */
+void hv_virtio_snd_capture_restart(HvVirtioSnd *d);
 
 #endif

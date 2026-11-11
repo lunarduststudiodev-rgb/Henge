@@ -2880,7 +2880,9 @@ int personalize_component(struct idevicerestore_client_t* client, const char *co
 
 	if (tss_response && plist_dict_get_item(tss_response, "ApImg4Ticket")) {
 		/* stitch ApImg4Ticket into IMG4 file */
-		img4_stitch_component(component_name, component_data, component_size, client->parameters, tss_response, &stitched_component, &stitched_component_size);
+		if (img4_stitch_component(component_name, component_data, component_size, client->parameters,
+			tss_response, &stitched_component, &stitched_component_size) < 0)
+			return -1;
 	} else {
 		/* try to get blob for current component from tss response */
 		if (tss_response && tss_response_get_blob_by_entry(tss_response, component_name, (unsigned char**)&component_blob) < 0) {

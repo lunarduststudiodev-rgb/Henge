@@ -19,8 +19,9 @@ the App Store.
 | StikJIT (the Bitrise build applies `ci/stikjit-high-address.patch`) | MPL-2.0 | `ios/Henge/Resources/legal/` |
 | idevice | MIT | `ios/Henge/Resources/legal/` |
 | Pairing library's Rust crates | Listed per crate | `ios/Henge/Resources/legal/LICENSES-rppairing-crates.txt` |
-| libslirp, pcre2 | BSD | Prebuilt from Husk |
-| glib, libintl | LGPL-2.1-or-later | Prebuilt from Husk |
+| libslirp, with Henge's patch for TCP window scaling | BSD-3-Clause | `third_party/libslirp` |
+| pcre2 | BSD | Prebuilt from Husk |
+| glib, libintl | LGPL-2.1-or-later | Prebuilt from Husk; glib's headers for iOS in `third_party/glib-ios` |
 
 idevicerestore's `COPYING` file is LGPL-3.0, while its source headers say LGPL-2.1
 or later. If the `COPYING` file governs, the combined binary is GPL-3.0, which

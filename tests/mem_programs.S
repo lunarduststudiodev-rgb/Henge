@@ -317,6 +317,71 @@ PROGRAM pageend
     ldr x13, [x1, #64]
 END pageend
 
+// No helper calls (test_mem checks): plain loads and stores in a page's last bytes, which the fast check refuses
+// though they fit, to every kind of register (done by the light refill path through the HvCpu); then TLB misses
+// on writeback, atomic and vector forms (refilled and run again). Each run starts with an empty TLB.
+PROGRAM pageend_light
+    add x1, x0, #3, lsl #12
+    add x1, x1, #4032           // the first page's last 64 bytes
+    ldr x19, [x1, #56]
+    ldr w20, [x1, #60]
+    ldrb w21, [x1, #63]
+    ldrsb x22, [x1, #62]
+    ldrsh w23, [x1, #60]
+    ldrsw x24, [x1, #60]
+    ldp w25, w26, [x1, #56]
+    ldpsw x27, x29, [x1, #56]
+    ldur w2, [x1, #59]
+    ldurh w3, [x1, #61]
+    mov x4, #60
+    ldr w5, [x1, x4]
+    ldr x6, [x1, #56]
+    ldr w7, [x1, #60]
+    ldrh w15, [x1, #62]
+    ldr x16, [x1, #56]
+    ldrsb w17, [x1, #63]
+    ldr x28, [x1, #56]
+    ldr x30, [x1, #56]
+    ldnp w8, w9, [x1, #56]
+    str x22, [x1, #56]
+    str w23, [x1, #60]
+    strb w24, [x1, #63]
+    strh w25, [x1, #62]
+    ldr x10, [x1, #56]
+    stp w27, w29, [x1, #56]
+    ldr x11, [x1, #56]
+    stur w30, [x1, #59]
+    ldr x12, [x1, #56]
+    str w19, [x1, x4]
+    ldr x13, [x1, #56]
+    strh w6, [x1, #62]
+    str w7, [x1, #56]
+    ldr x14, [x1, #56]
+    str x28, [x1, #56]
+    ldr x8, [x1, #56]
+    str wzr, [x1, #60]
+    strb w15, [x1, #61]
+    stnp w16, w17, [x1, #48]
+    ldp x9, x2, [x1, #48]
+    // TLB misses on forms that write back, read-modify-write, or are vector, and DC ZVA: each on a page of its own.
+    add x3, x0, #16, lsl #12
+    ldr x4, [x3, #8]!
+    str x4, [x3], #16
+    add x5, x0, #20, lsl #12
+    ldadd x22, x23, [x5]
+    add x5, x5, #64
+    cas x24, x25, [x5]
+    add x6, x0, #24, lsl #12
+    add x6, x6, #256
+    ld1 {v0.16b, v1.16b}, [x6], #32
+    st1 {v0.16b}, [x6]
+    stp x10, x11, [x6, #-16]!
+    add x7, x0, #28, lsl #12
+    add x7, x7, #192
+    dc zva, x7
+    ldr x5, [x7, #8]
+END pageend_light
+
 PROGRAM groups
     // Accesses grouped on one base (one TLB check for all): SP with writeback,
     // negative and unscaled offsets, sign-extending, pairs of q registers.

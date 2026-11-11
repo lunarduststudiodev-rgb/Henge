@@ -3,6 +3,7 @@
 #include <stdlib.h>
 
 #include "mmu.h"
+#include "translate.h"
 
 DECLARE_PROGRAM(single);
 DECLARE_PROGRAM(stolen_mem);
@@ -15,6 +16,7 @@ DECLARE_PROGRAM(loops);
 DECLARE_PROGRAM(epilogue);
 DECLARE_PROGRAM(dczva);
 DECLARE_PROGRAM(pageend);
+DECLARE_PROGRAM(pageend_light);
 DECLARE_PROGRAM(groups);
 DECLARE_PROGRAM(mmio);
 extern const char mem_programs_begin[], mem_programs_finish[];
@@ -22,10 +24,10 @@ extern const char mem_programs_begin[], mem_programs_finish[];
 static const TestProgram programs[] = {
     TEST_PROGRAM(single), TEST_PROGRAM(stolen_mem), TEST_PROGRAM(pairs),   TEST_PROGRAM(simd_mem),
     TEST_PROGRAM(exclusive), TEST_PROGRAM(atomics),  TEST_PROGRAM(literal), TEST_PROGRAM(loops), TEST_PROGRAM(epilogue),
-    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups),
+    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(pageend_light), TEST_PROGRAM(groups),
 };
 
-#define DATA_SIZE 65536
+#define DATA_SIZE 131072
 #define STACK_SIZE 65536
 #define PT_SIZE (256 * 1024)
 #define DATA_PA 0x40000000ull /* where the data buffer sits in guest PA when the MMU is on */
@@ -85,6 +87,10 @@ static void mmu_on(HvCpu *cpu) {
     cpu->tcr_el1 = 16 | 2u << 14 | 1u << 23 | 5ull << 32;      /* T0SZ 16, TG0 16K, EPD1, IPS 48 bits */
     cpu->ttbr0_el1 = ttbr0;
     cpu->sctlr_el1 |= 1 | 1u << 2 | 1u << 12;                   /* M, C, I */
+    hv_tlb_flush(cpu);
+}
+
+static void tlb_empty(HvCpu *cpu) {
     hv_tlb_flush(cpu);
 }
 
@@ -173,8 +179,23 @@ int main(void) {
             run_native(p, &init, &native, reset_data);
             memcpy(native_data, data, DATA_SIZE);
             reset_data();
-            m.stat_slow_mem = 0;
-            int bad = run_jit(&m, p, &init, &jit, mode == 2 ? mmu_on : NULL);
+            uint64_t slow0 = HV_STAT_TOTAL(&m, slow_mem);
+            /* pageend_light starts with an empty TLB and takes no helper call (counted with statistics on, never printed) */
+            int light = !strcmp(p->name, "pageend_light");
+            HvStats st0;
+            hv_stats_sum(&m, &st0);
+            m.stats_interval = light ? 1 << 30 : 0;
+            int bad = run_jit(&m, p, &init, &jit, mode == 2 ? mmu_on : light ? tlb_empty : NULL);
+            m.stats_interval = 0;
+            if (!bad && light && mode) {
+                uint64_t calls = HV_STAT_TOTAL(&m, helper[HV_OP_MEM]) - st0.helper[HV_OP_MEM] + HV_STAT_TOTAL(&m, helper[HV_OP_SYS]) - st0.helper[HV_OP_SYS];
+                uint64_t light_done = HV_STAT_TOTAL(&m, page_end_light) - st0.page_end_light;
+                if (calls || !light_done) {
+                    printf("  %s: %llu helper calls (expected none), %llu page-end accesses done light\n",
+                           p->name, (unsigned long long)calls, (unsigned long long)light_done);
+                    bad = 1;
+                }
+            }
             if (!bad) bad = compare_cpus(p->name, &native, &jit);
             for (size_t off = 0; off < DATA_SIZE && !bad; off += 8)
                 if (memcmp(native_data + off, data + off, 8) != 0) {
@@ -186,7 +207,7 @@ int main(void) {
                     bad = 1;
                 }
             printf("%-11s %-18s: %-4s (%llu slow-path accesses)\n", p->name, mode_names[mode], bad ? "FAIL" : "ok",
-                   (unsigned long long)m.stat_slow_mem);
+                   (unsigned long long)(HV_STAT_TOTAL(&m, slow_mem) - slow0));
             failed += bad != 0;
         }
     }
@@ -194,6 +215,6 @@ int main(void) {
     m.slow_mem = 0;
     failed += test_mmio(&m);
     printf("%zu programs x 3 modes + mmio, %d failures, %llu chained exits\n", count, failed,
-           (unsigned long long)m.stats.chained);
+           (unsigned long long)HV_STAT_TOTAL(&m, chained));
     return failed != 0;
 }

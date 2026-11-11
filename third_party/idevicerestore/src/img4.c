@@ -112,27 +112,6 @@ static void asn1_write_element_header(unsigned char type, unsigned int size, uns
 	*data_size += off;
 }
 
-static unsigned char* asn1_create_element_header(unsigned char type, unsigned int size, unsigned char** data, unsigned int *data_size)
-{
-	unsigned char buf[6];
-	unsigned int off = 0;
-
-	if (!type || size == 0 || !data || !data_size) {
-		return NULL;
-	}
-
-	buf[off++] = type;
-
-	unsigned char* p = &buf[off];
-	asn1_write_size(size, &p, &off);
-
-	*data = malloc(off);
-	memcpy(*data, buf, off);
-	*data_size = off;
-
-	return *data;
-}
-
 static void asn1_write_priv_element(unsigned char **p, unsigned int *length, unsigned int value)
 {
 	int i = 0;
@@ -209,63 +188,49 @@ static void asn1_write_element(unsigned char **p, unsigned int *length, unsigned
 	}
 }
 
-static unsigned int asn1_get_element(const unsigned char* data, unsigned char* type, unsigned char* size)
+/* The outer DER sequence may describe an IM4P much larger than the prefix
+ * read from an archive. Only the first two fields must fit in the prefix. */
+static int asn1_read_header(const unsigned char **p, size_t *remaining, unsigned char type, size_t *len)
 {
-	unsigned int off = 0;
-
-	if (!data)
-		return 0;
-
-	if (type)
-		*type = data[off++];
-	if (size)
-		*size = data[off++];
-
-	return off;
+	if (*remaining < 2 || **p != type)
+		return -1;
+	const unsigned char *at = *p + 2;
+	unsigned int count = (*p)[1];
+	*remaining -= 2;
+	if (!(count & 0x80)) {
+		*len = count;
+	} else {
+		count &= 0x7f;
+		if (!count || count > 4 || count > *remaining)
+			return -1;
+		*len = 0;
+		for (unsigned int i = 0; i < count; i++)
+			*len = (*len << 8) | at[i];
+		at += count;
+		*remaining -= count;
+	}
+	*p = at;
+	return 0;
 }
 
-static const unsigned char *asn1_find_element(unsigned int index, unsigned char type, const unsigned char* data)
+static unsigned char *img4_component_tag(void *prefix, size_t size, size_t component_size)
 {
-	unsigned char el_type = 0;
-	unsigned char el_size = 0;
-	unsigned int off = 0;
-	int i;
-
-	// verify data integrity
-	if (data[off++] != (ASN1_CONSTRUCTED | ASN1_SEQUENCE))
+	const unsigned char *at = prefix;
+	size_t len;
+	if (asn1_read_header(&at, &size, ASN1_CONSTRUCTED | ASN1_SEQUENCE, &len) < 0 ||
+	    (size_t)(at - (const unsigned char *)prefix) > component_size ||
+	    len > component_size - (size_t)(at - (const unsigned char *)prefix))
 		return NULL;
-
-	// check data size
-	switch (data[off++]) {
-	case 0x84:
-		off += 4;
-		break;
-	case 0x83:
-		off += 3;
-		break;
-	case 0x82:
-		off += 2;
-		break;
-	case 0x81:
-		off += 1;
-		break;
-	default:
-		break;
-	}
-
-	// find the element we are searching
-	for (i = 0; i <= index; i++) {
-		off += asn1_get_element(&data[off], &el_type, &el_size);
-		if (i == index)
-			break;
-		off += el_size;
-	}
-
-	// check element type
-	if (el_type != type)
+	if (len < size)
+		size = len;
+	if (asn1_read_header(&at, &size, ASN1_IA5_STRING, &len) < 0 ||
+	    len != 4 || len > size || memcmp(at, "IM4P", 4))
 		return NULL;
-
-	return &data[off];
+	at += len;
+	size -= len;
+	if (asn1_read_header(&at, &size, ASN1_IA5_STRING, &len) < 0 || len != 4 || len > size)
+		return NULL;
+	return (unsigned char *)at;
 }
 
 static const char *_img4_get_component_tag(const char *compname)
@@ -402,32 +367,18 @@ static const char *_img4_get_component_tag(const char *compname)
 	return NULL;
 }
 
-int img4_stitch_component(const char* component_name, const void* component_data, size_t component_size, plist_t parameters, plist_t tss_response, void** img4_data, size_t *img4_size)
+int img4_build_envelope(const char* component_name, void* component_prefix, size_t prefix_size,
+	size_t component_size, plist_t parameters, plist_t tss_response, struct img4_envelope* envelope)
 {
-	unsigned char* magic_header = NULL;
-	unsigned int magic_header_size = 0;
-	unsigned char* blob_header = NULL;
-	unsigned int blob_header_size = 0;
-	unsigned char* img4header = NULL;
-	unsigned int img4header_size = 0;
-	unsigned int content_size;
-	unsigned char* outbuf;
+	if (!component_name || !component_prefix || !prefix_size || prefix_size > component_size ||
+	    !tss_response || !envelope)
+		return -1;
+	memset(envelope, 0, sizeof(*envelope));
 	unsigned char* p;
-	unsigned char* blob = NULL;
-	unsigned int blob_size = 0;
-
-	if (!component_name || !component_data || component_size == 0 || !tss_response || !img4_data || !img4_size) {
-		return -1;
-	}
-
-	if (tss_response_get_ap_img4_ticket(tss_response, &blob, &blob_size) != 0) {
-		logger(LL_ERROR, "%s: Failed to get ApImg4Ticket from TSS response\n", __func__);
-		return -1;
-	}
 
 	logger(LL_INFO, "Personalizing IMG4 component %s...\n", component_name);
 	/* first we need check if we have to change the tag for the given component */
-	const void *tag = asn1_find_element(1, ASN1_IA5_STRING, component_data);
+	unsigned char *tag = img4_component_tag(component_prefix, prefix_size, component_size);
 	if (tag) {
 		logger(LL_DEBUG, "Tag found\n");
 		const char* matches[] = {
@@ -452,7 +403,7 @@ int img4_stitch_component(const char* component_name, const void* component_data
 			if (!strcmp(matches[i], component_name)) {
 				const char* comptag = _img4_get_component_tag(component_name);
 				if (comptag) {
-					memcpy((void*)tag, comptag, 4);
+					memcpy(tag, comptag, 4);
 				} else {
 					logger(LL_WARNING, "Cannot find tag for component '%s'\n", component_name);
 				}
@@ -469,6 +420,8 @@ int img4_stitch_component(const char* component_name, const void* component_data
 	unsigned char *additional_data = NULL;
 	unsigned int additional_size = 0;
 	char *tbm_key = malloc(strlen(component_name) + 5);
+	if (!tbm_key)
+		return -1;
 	snprintf(tbm_key, strlen(component_name)+5, "%s-TBM", component_name);
 	plist_t tbm_dict = plist_dict_get_item(tss_response, tbm_key);
 	free(tbm_key);
@@ -502,6 +455,8 @@ int img4_stitch_component(const char* component_name, const void* component_data
 	int nonce_slot_required = plist_dict_get_bool(parameters, "RequiresNonceSlot") && (!strcmp(component_name, "SEP") || !strcmp(component_name, "SepStage1") || !strcmp(component_name, "LLB"));
 
 	if (ucon_data || ucer_data || nonce_slot_required) {
+		if (ucon_size > UINT32_MAX / 4 || ucer_size > UINT32_MAX / 4)
+			return -1;
 		size_t im4r_size = 16;
 		if (ucon_data) {
 			im4r_size += 8 + 8 + ucon_size + 16;
@@ -513,6 +468,8 @@ int img4_stitch_component(const char* component_name, const void* component_data
 			im4r_size += 16;
 		}
 		unsigned char *im4rset = (unsigned char*)malloc(im4r_size);
+		if (!im4rset)
+			return -1;
 		unsigned char *p_im4rset = im4rset;
 		unsigned int im4rlen = 0;
 
@@ -656,6 +613,10 @@ int img4_stitch_component(const char* component_name, const void* component_data
 
 		// now put everything together
 		additional_data = malloc(im4rlen + inner_set_len + hdrdata_len + seq_len + cont_len);
+		if (!additional_data) {
+			free(im4rset);
+			return -1;
+		}
 		p = additional_data;
 		memcpy(p, cont_, cont_len);
 		p += cont_len;
@@ -672,66 +633,74 @@ int img4_stitch_component(const char* component_name, const void* component_data
 		free(im4rset);
 	}
 
-	// create element header for the "IMG4" magic
-	asn1_create_element_header(ASN1_IA5_STRING, IMG4_MAGIC_SIZE, &magic_header, &magic_header_size);
-	// create element header for the blob (ApImg4Ticket)
-	asn1_create_element_header(ASN1_CONTEXT_SPECIFIC|ASN1_CONSTRUCTED, blob_size, &blob_header, &blob_header_size);
-
-	// calculate the size for the final IMG4 file (asn1 sequence)
-	content_size = magic_header_size + IMG4_MAGIC_SIZE + component_size + blob_header_size + blob_size + additional_size;
-
-	// create element header for the final IMG4 asn1 blob
-	asn1_create_element_header(ASN1_SEQUENCE|ASN1_CONSTRUCTED, content_size, &img4header, &img4header_size);
-
-	outbuf = (unsigned char*)malloc(img4header_size + content_size);
-	if (!outbuf) {
-		if (magic_header) {
-			free(magic_header);
-		}
-		if (blob_header) {
-			free(blob_header);
-		}
-		if (img4header) {
-			free(img4header);
-		}
+	unsigned char* blob = NULL;
+	unsigned int blob_size = 0;
+	if (tss_response_get_ap_img4_ticket(tss_response, &blob, &blob_size) != 0 || !blob_size) {
+		logger(LL_ERROR, "%s: Failed to get ApImg4Ticket from TSS response\n", __func__);
+		free(blob);
 		free(additional_data);
+		return -1;
+	}
+
+	unsigned char blob_header[8];
+	p = blob_header;
+	unsigned int blob_header_size = 0;
+	asn1_write_element_header(ASN1_CONTEXT_SPECIFIC | ASN1_CONSTRUCTED, blob_size, &p, &blob_header_size);
+	size_t suffix_size = (size_t)blob_header_size + blob_size + additional_size;
+	const unsigned int magic_size = 2 + IMG4_MAGIC_SIZE;
+	if (suffix_size > UINT32_MAX - magic_size || component_size > UINT32_MAX - magic_size - suffix_size) {
+		free(blob);
+		free(additional_data);
+		return -1;
+	}
+	p = envelope->prefix;
+	asn1_write_element_header(ASN1_SEQUENCE | ASN1_CONSTRUCTED,
+		magic_size + component_size + suffix_size, &p, &envelope->prefix_size);
+	asn1_write_element_header(ASN1_IA5_STRING, IMG4_MAGIC_SIZE, &p, &envelope->prefix_size);
+	memcpy(p, IMG4_MAGIC, IMG4_MAGIC_SIZE);
+	envelope->prefix_size += IMG4_MAGIC_SIZE;
+
+	envelope->suffix = malloc(suffix_size);
+	if (envelope->suffix) {
+		memcpy(envelope->suffix, blob_header, blob_header_size);
+		memcpy(envelope->suffix + blob_header_size, blob, blob_size);
+		if (additional_size)
+			memcpy(envelope->suffix + blob_header_size + blob_size, additional_data, additional_size);
+		envelope->suffix_size = suffix_size;
+	}
+	free(blob);
+	free(additional_data);
+	return envelope->suffix ? 0 : -1;
+}
+
+int img4_stitch_component(const char* component_name, const void* component_data, size_t component_size,
+	plist_t parameters, plist_t tss_response, void** img4_data, size_t *img4_size)
+{
+	if (!img4_data || !img4_size)
+		return -1;
+	struct img4_envelope envelope;
+	if (img4_build_envelope(component_name, (void*)component_data, component_size, component_size,
+		parameters, tss_response, &envelope) < 0)
+		return -1;
+
+	if (component_size > SIZE_MAX - envelope.prefix_size ||
+	    envelope.suffix_size > SIZE_MAX - envelope.prefix_size - component_size) {
+		free(envelope.suffix);
+		return -1;
+	}
+	size_t size = envelope.prefix_size + component_size + envelope.suffix_size;
+	unsigned char* out = malloc(size);
+	if (!out) {
+		free(envelope.suffix);
 		logger(LL_ERROR, "out of memory when personalizing IMG4 component %s\n", component_name);
 		return -1;
 	}
-	p = outbuf;
-
-	// now put everything together
-	memcpy(p, img4header, img4header_size);
-	p += img4header_size;
-	memcpy(p, magic_header, magic_header_size);
-	p += magic_header_size;
-	memcpy(p, IMG4_MAGIC, IMG4_MAGIC_SIZE);
-	p += IMG4_MAGIC_SIZE;
-	memcpy(p, component_data, component_size);
-	p += component_size;
-	memcpy(p, blob_header, blob_header_size);
-	p += blob_header_size;
-	memcpy(p, blob, blob_size);
-	p += blob_size;
-	if (additional_size) {
-		memcpy(p, additional_data, additional_size);
-		p += additional_size;
-	}
-
-	*img4_data = outbuf;
-	*img4_size = (p - outbuf);
-
-	if (magic_header) {
-		free(magic_header);
-	}
-	if (blob_header) {
-		free(blob_header);
-	}
-	if (img4header) {
-		free(img4header);
-	}
-	free(additional_data);
-
+	memcpy(out, envelope.prefix, envelope.prefix_size);
+	memcpy(out + envelope.prefix_size, component_data, component_size);
+	memcpy(out + envelope.prefix_size + component_size, envelope.suffix, envelope.suffix_size);
+	free(envelope.suffix);
+	*img4_data = out;
+	*img4_size = size;
 	return 0;
 }
 

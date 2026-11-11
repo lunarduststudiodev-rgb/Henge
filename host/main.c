@@ -15,6 +15,7 @@
 #include <stdatomic.h>
 #include <dlfcn.h>
 #include <CommonCrypto/CommonDigest.h>
+#include <Network/Network.h>
 
 #include "dispatch.h"
 #include "exception.h"
@@ -105,14 +106,8 @@ static void prof_sample(thread_act_t th) {
     HvMachine *hm = hv_vm_machine();
     pthread_mutex_lock(&prof_mu);
     prof_total++;
-    if (pc >= hm->jit.base && pc < hm->jit.base + hm->jit.capacity && hm->nblocks) {
-        int lo = 0, hi = hm->nblocks - 1;
-        while (lo < hi) {
-            int mid = (lo + hi + 1) / 2;
-            if (hm->blocks[mid].code && hm->blocks[mid].code <= pc) lo = mid;
-            else hi = mid - 1;
-        }
-        HvBlock *b = &hm->blocks[lo];
+    HvBlock *b = pc >= hm->jit.base && pc < hm->jit.base + hm->jit.capacity ? hv_block_at(hm, pc) : NULL;
+    if (b) {
         int el = (b->flags & HV_BLOCK_EL1) ? 1 : 0;
         {
             ptrdiff_t off = b->code && pc >= b->code ? pc - b->code : -1;
@@ -305,7 +300,8 @@ static void *click_thread(void *unused) {
     return NULL;
 }
 
-uint64_t hook_pages;
+/* 16 KB pages the sha hook saw hashed: counted on the vCPUs' threads, read by the watch thread */
+static _Atomic uint64_t hook_pages;
 /* The guest kernel's call chain, by frame pointers. */
 static void guest_frames(HvCpu *c) {
     HvMachine *hm = hv_vm_machine();
@@ -362,10 +358,7 @@ static __thread uint32_t watch_want[8];
 /* Debugging: "hooksha file": the guest kernel's SHA-256 routine, watched for hashing this 16 KB page. */
 static uint8_t hook_page[0x4000];
 static void sha_hook(HvCpu *c) {
-    static uint64_t calls;
-    extern uint64_t hook_pages;
-    uint64_t pages = hook_pages;
-    calls++;
+    uint64_t pages = atomic_load_explicit(&hook_pages, memory_order_relaxed);
     if (watch_state) { /* the call after the page's: its state now is what the page's hash came to */
         uint32_t st[8];
         HvWalk wn;
@@ -377,7 +370,7 @@ static void sha_hook(HvCpu *c) {
         watch_state = 0;
     }
     uint64_t blocks = c->x[1], va = c->x[2];
-    if (blocks >= 64) pages = ++hook_pages;
+    if (blocks >= 64) pages = atomic_fetch_add_explicit(&hook_pages, 1, memory_order_relaxed) + 1;
     if (!blocks || blocks > 256) return;
     uint64_t bytes = blocks * 64, in = va & 0x3fff;
     if (in + bytes > 0x4000) return;
@@ -412,12 +405,11 @@ static void sha_hook(HvCpu *c) {
                     memcpy(watch_want, st0, 32);
                     sha_blocks(watch_want, now, 256);
                     watch_state = c->x[0];
-                    static int switched;
-                    if (getenv("HV_HOOK_SWITCH") && !switched++) { /* the page is about to be compared: from now on watch memcmp instead */
+                    static _Atomic int switched; /* once, whichever CPU gets here first */
+                    if (getenv("HV_HOOK_SWITCH") && !atomic_exchange_explicit(&switched, 1, memory_order_relaxed)) { /* the page is about to be compared: from now on watch memcmp instead */
                         HvMachine *mm = hv_vm_machine();
-                        mm->stop_hook = memcmp_hook;
-                        mm->stop_pc = c->pc - 0x2274914ull; /* bcmp */
-                        mm->flush_pending = 1;
+                        hv_machine_set_stop(mm, c->pc - 0x2274914ull /* bcmp */, ~0ull, memcmp_hook, 0);
+                        hv_request_full_flush(mm);
                     }
                 }
             }
@@ -509,8 +501,61 @@ static void both_hook(HvCpu *c) {
     guest_frames(c);
 }
 
+/* The Mac's Ethernet follows this Mac's own network, as a cable plugged into it would (vm.h's hv_vm_host_network).
+   The input file's "hostnet 0" and "hostnet 1" pretend this Mac lost it or got it back; "hostnet auto" follows it again. */
+static _Atomic int hostnet_seen = -1, hostnet_forced = -1;
+
+static void hostnet_apply(void) {
+    int forced = atomic_load(&hostnet_forced), seen = atomic_load(&hostnet_seen);
+    int up = forced >= 0 ? forced : seen;
+    if (up >= 0) hv_vm_host_network(up);
+}
+
+static void follow_host_network(void) {
+    nw_path_monitor_t mon = nw_path_monitor_create();
+    nw_path_monitor_set_queue(mon, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    nw_path_monitor_set_update_handler(mon, ^(nw_path_t path) {
+        int up = nw_path_get_status(path) == nw_path_status_satisfied;
+        if (atomic_exchange(&hostnet_seen, up) != up)
+            fprintf(stderr, "hengevm: this Mac's network is %s\n", up ? "up" : "down");
+        hostnet_apply();
+    });
+    nw_path_monitor_start(mon); /* kept for the life of the process */
+}
+
 /* Debugging: HV_INPUT_FILE=path follows a file of lines, for driving a running guest:
-   "click x y", "move x y", "key code" (Linux), "hidkey usage", "hiddown usage", "hidup usage", "shiftkey code", "type words", "wait seconds". */
+   "click x y", "move x y", "key code" (Linux), "hidkey usage", "hiddown usage", "hidup usage", "shiftkey code", "type words", "wait seconds",
+   "msleep ms"; the touchscreen (macOS 27, see HV_TOUCHSCREEN): "tdown id fx fy" and "tmove id fx fy" (fx, fy 0..1 across the
+   screen), "tup id", "tcancel id", "tstate". Each touch line sends one frame with every finger down. "hostnet 0|1|auto": above. */
+
+/* The touchscreen fingers the input file has down: what each frame carries. */
+static HvVmContact in_touch[10];
+static int in_touches;
+
+static void touch_line(const char *line) {
+    int id = -1;
+    double fx = 0, fy = 0;
+    char verb[16];
+    if (sscanf(line, "%15s %d %lf %lf", verb, &id, &fx, &fy) < 2 || id < 0 || id > 9) return;
+    int i = 0;
+    while (i < in_touches && in_touch[i].id != id) i++;
+    int lift = !strcmp(verb, "tup") || !strcmp(verb, "tcancel");
+    if (i == in_touches) {
+        if (lift || in_touches == 10) return;
+        if (!in_touches) hv_vm_touchscreen_watch(); /* a gesture starts: the helper checks macOS takes it, as the app has it */
+        in_touches++;
+    }
+    in_touch[i].id = id;
+    if (lift) {
+        in_touch[i].down = 0;
+        in_touch[i].cancel = !strcmp(verb, "tcancel");
+    } else {
+        in_touch[i] = (HvVmContact){.id = id, .down = 1, .x = fx, .y = fy};
+    }
+    int rc = hv_vm_touchscreen_frame(in_touches, in_touch);
+    if (rc) fprintf(stderr, "hengevm: touch frame %d (touchscreen state %d)\n", rc, hv_vm_touchscreen_state());
+    if (lift) in_touch[i] = in_touch[--in_touches]; /* sent lifted once; gone from the next frame */
+}
 static void *input_thread(void *unused) {
     (void)unused;
     FILE *f = fopen(getenv("HV_INPUT_FILE"), "a+");
@@ -533,6 +578,31 @@ static void *input_thread(void *unused) {
             if (y) hv_vm_mouse_wheel(y);
             if (x) hv_vm_mouse_hwheel(x);
         }
+        else if (!strncmp(line, "hostnet ", 8)) {
+            atomic_store(&hostnet_forced, !strcmp(line + 8, "auto") ? -1 : atoi(line + 8) != 0);
+            fprintf(stderr, "hengevm: hostnet %s\n", line + 8);
+            hostnet_apply();
+        }
+        else if (!strcmp(line, "pause")) fprintf(stderr, "hengevm: pause %d\n", hv_vm_pause(2000));
+        else if (!strcmp(line, "resume")) hv_vm_resume();
+        else if (!strncmp(line, "suspend ", 8)) { /* FILE: the Mac saved there, and left paused */
+            char why[256] = "";
+            /* Not while the Mac's graphics framework runs, whose state can't be saved; with the iPad's graphics
+               device (--phone, --no-pvg, or the framework's device not started) it can */
+            int ok = !hv_pvg_running();
+            int rc = ok ? hv_vm_suspend(line + 8, 2000, why, sizeof why) : -2;
+            fprintf(stderr, "hengevm: suspend %d%s%s\n", rc, *why ? ": " : "", ok ? why : "not with the Mac's graphics framework (use --phone)");
+        }
+        else if (!strcmp(line, "quit")) { /* as if the app were ended: nothing is shut down, the disks flushed */
+            hv_vm_flush_disks();
+            fprintf(stderr, "hengevm: quit\n");
+            _exit(0);
+        }
+        else if (!strncmp(line, "plug ", 5)) { /* FILE SERIAL: a USB drive, writable */
+            char path[400], serial[64];
+            if (sscanf(line + 5, "%399s %63s", path, serial) == 2)
+                fprintf(stderr, "hengevm: plug %d\n", hv_vm_plug_disk(path, 0, serial, serial));
+        }
         else if (!strncmp(line, "pointer", 7)) {
             int px = -1, py = -1;
             int rc = hv_vm_pointer(&px, &py);
@@ -542,22 +612,32 @@ static void *input_thread(void *unused) {
             enum { W = 640, H = 360 };
             static uint8_t px[W * H * 4];
             int rc = hv_vm_snapshot(px, W, H);
+            const uint8_t *img = px;
+            uint8_t *drawn = NULL;
+            uint32_t iw_ = W, ih_ = H;
+            if (rc != 0 && board.pvg && hv_pvg_lite_frame(board.pvg, NULL, 0, &iw_, &ih_) == 1) { /* no display: what the CPU drew */
+                size_t bytes = (size_t)iw_ * ih_ * 4;
+                drawn = malloc(bytes);
+                rc = drawn ? hv_pvg_lite_frame(board.pvg, drawn, bytes, &iw_, &ih_) : -1; /* -1 or 1: gone or resized since */
+                if (rc == 0) img = drawn;
+            }
             fprintf(stderr, "hengevm: snapshot %d\n", rc);
             FILE *bf = rc == 0 ? fopen(line + 9, "wb") : NULL;
             if (bf) {
-                uint32_t size = W * H * 4;
+                uint32_t size = iw_ * ih_ * 4;
                 uint8_t h[54] = {'B', 'M'};
                 uint32_t v;
                 v = 54 + size; memcpy(h + 2, &v, 4);
                 v = 54; memcpy(h + 10, &v, 4);
                 v = 40; memcpy(h + 14, &v, 4);
-                int32_t iw = W, ih = -H; memcpy(h + 18, &iw, 4); memcpy(h + 22, &ih, 4);
+                int32_t iw = (int32_t)iw_, ih = -(int32_t)ih_; memcpy(h + 18, &iw, 4); memcpy(h + 22, &ih, 4);
                 h[26] = 1; h[28] = 32;
                 memcpy(h + 34, &size, 4);
                 fwrite(h, 1, 54, bf);
-                fwrite(px, 1, size, bf);
+                fwrite(img, 1, size, bf);
                 fclose(bf);
             }
+            free(drawn);
         }
         else if (!strncmp(line, "press", 5) || !strncmp(line, "release", 7)) {
             hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, line[0] == 'p');
@@ -586,6 +666,19 @@ static void *input_thread(void *unused) {
             key_event(125, 0);
         }
         else if (sscanf(line, "wait %d", &x) == 1) sleep((unsigned)x);
+        else if (sscanf(line, "msleep %d", &x) == 1) usleep((useconds_t)x * 1000);
+        else if (!strncmp(line, "tdown ", 6) || !strncmp(line, "tmove ", 6) || !strncmp(line, "tup ", 4) || !strncmp(line, "tcancel ", 8)) touch_line(line);
+        else if (!strcmp(line, "menuask") || !strcmp(line, "menuclose")) { /* the helper's answer, a second at most */
+            unsigned id = line[4] == 'a' ? hv_share_menu_ask() : hv_share_menu_close();
+            int n = -1;
+            for (int i = 0; i < 50 && id && (n = hv_share_menu_answer(id)) < 0; i++) usleep(20000);
+            fprintf(stderr, "hengevm: %s %u: %d\n", line, id, n);
+        }
+        else if (!strncmp(line, "tenable ", 8)) hv_vm_touchscreen_config(atoi(line + 8), 0, 0); /* the app's switch */
+        else if (!strncmp(line, "tstate", 6))
+            fprintf(stderr, "hengevm: touchscreen state %d, usable %d, status %d, macOS takes touches %d, system part %d, helper %d, session %d\n",
+                    hv_vm_touchscreen_state(), hv_vm_touchscreen_usable(), hv_vm_touchscreen_status(), hv_share_touchscreen_verdict(),
+                    hv_share_touchscreen_ready(), hv_share_touchscreen(), hv_share_session());
         else if (!strncmp(line, "type ", 5)) type_text(line + 5);
         else if (!strncmp(line, "prof ", 5)) prof_dump(line + 5);
         else if (!strncmp(line, "balloon ", 8)) { /* MB the guest should hand back (HV_BALLOON set at boot) */
@@ -611,7 +704,8 @@ static void *input_thread(void *unused) {
             fprintf(stderr, "hengevm: kernel image written\n");
         }
         else if (!strncmp(line, "hooksha ", 8)) {
-            if (hv_vm_machine()->stop_hook) continue;
+            if (__atomic_load_n(&hv_vm_machine()->stop_hook, __ATOMIC_ACQUIRE)) continue;
+            if (run_args.brk != ~0ull) { fprintf(stderr, "hengevm: hooksha: not with --break (one stop at a time)\n"); continue; }
             FILE *pf = fopen(line + 8, "rb");
             size_t got = pf ? fread(hook_page, 1, sizeof hook_page, pf) : 0;
             if (pf) fclose(pf);
@@ -630,14 +724,13 @@ static void *input_thread(void *unused) {
                 HvMachine *hm = hv_vm_machine();
                 if (getenv("HV_HOOK_BOTH")) {
                     both_sha_pc = va;
-                    hm->stop_hook = both_hook;
-                    hm->stop_pc = va;
-                    hm->stop_pc2 = va - 0x2274914ull;
+                    hv_machine_set_stop(hm, va, va - 0x2274914ull, both_hook, 0);
+                } else if (getenv("HV_HOOK_BCMP")) {
+                    hv_machine_set_stop(hm, va - 0x2274914ull, ~0ull, memcmp_hook, 0);
                 } else {
-                hm->stop_hook = getenv("HV_HOOK_BCMP") ? memcmp_hook : sha_hook;
-                hm->stop_pc = getenv("HV_HOOK_BCMP") ? va - 0x2274914ull : va;
+                    hv_machine_set_stop(hm, va, ~0ull, sha_hook, 0);
                 }
-                hm->flush_pending = 1;
+                hv_request_full_flush(hm);
             }
         }
         else if (!strncmp(line, "find ", 5)) { /* bytes in hex: where in guest RAM, and what is around them */
@@ -731,9 +824,9 @@ static void *watch_thread(void *unused) {
         const uint8_t *page = hv_pvg_lite_display_page(board.pvg);
         fprintf(stderr, "hengevm: watch %ld s: swaps %u on %u;", (long)(time(NULL) - start), page ? *(const volatile uint32_t *)(page + 0xf98) : 0, page ? *(const volatile uint32_t *)(page + 0xfb0) : 0);
         for (int i = 0; i < ncpus; i++) fprintf(stderr, " %llx@%u", (unsigned long long)hv_vm_cpu(i)->pc, hv_vm_cpu(i)->el);
-        { HvMachine *wm = hv_vm_machine(); fprintf(stderr, " | jit %llu MB, flushes %llu, ic %llu, code writes %llu", (unsigned long long)wm->jit.used * 4 >> 20, (unsigned long long)wm->stats.block_flushes, (unsigned long long)wm->stats.flush_ic, (unsigned long long)wm->stats.flush_smc);
-          fprintf(stderr, " (cpu %llu dma %llu), %llu translations, blocks now %u; top:", (unsigned long long)hv_smc_cpu, (unsigned long long)hv_smc_dma, (unsigned long long)wm->stats.translations, (unsigned)wm->nblocks);
-          uint32_t seen = 0; uint64_t distinct = 0; (void)seen;
+        { HvMachine *wm = hv_vm_machine(); fprintf(stderr, " | jit %llu MB, flushes %llu, ic %llu, code writes %llu", (unsigned long long)hv_jit_words_used(wm) * 4 >> 20, (unsigned long long)HV_STAT_TOTAL(wm, block_flushes), (unsigned long long)HV_STAT_TOTAL(wm, flush_ic), (unsigned long long)HV_STAT_TOTAL(wm, flush_smc));
+          fprintf(stderr, " (cpu %llu dma %llu), %llu translations, blocks now %u; top:", (unsigned long long)hv_smc_cpu, (unsigned long long)hv_smc_dma, (unsigned long long)HV_STAT_TOTAL(wm, translations), (unsigned)hv_blocks_held(wm));
+          uint64_t distinct = 0;
           uint64_t best[4] = {0}; uint32_t bestn[4] = {0};
           for (uint64_t pg = 0; pg < hv_smc_pages; pg++) {
               uint32_t n = hv_smc_counts[pg];
@@ -742,8 +835,8 @@ static void *watch_thread(void *unused) {
           }
           for (int k = 0; k < 4; k++) fprintf(stderr, " %llx*%u(pc %llx)", (unsigned long long)(0x70000000ull + (best[k] << 14)), bestn[k], (unsigned long long)hv_smc_last[best[k]]);
           fprintf(stderr, " distinct %llu", (unsigned long long)distinct);
-          fprintf(stderr, " sha pages %llu", (unsigned long long)hook_pages);
-          { uint64_t bs[4]; hv_pvg_lite_barrier_stats(board.pvg, bs); fprintf(stderr, " barriers %llu drains %llu retries %llu gaveup %llu", (unsigned long long)bs[0], (unsigned long long)bs[1], (unsigned long long)bs[2], (unsigned long long)bs[3]); }
+          fprintf(stderr, " sha pages %llu", (unsigned long long)atomic_load_explicit(&hook_pages, memory_order_relaxed));
+          { uint64_t bs[4]; hv_pvg_lite_barrier_stats(board.pvg, bs); fprintf(stderr, " barriers %llu drains %llu retries %llu cycles %llu", (unsigned long long)bs[0], (unsigned long long)bs[1], (unsigned long long)bs[2], (unsigned long long)bs[3]); }
         }
         fprintf(stderr, "\n");
     }
@@ -798,19 +891,13 @@ static void *cpu_thread(void *unused) {
     RunArgs *a = &run_args;
     cpu_port = mach_thread_self();
     hv_vm_cpu_qos();
-    /* --break PC: stop the brk_hits-th time execution reaches PC. */
-    m.stop_pc = a->brk;
+    /* --break PC: stop the brk_hits-th time execution reaches PC. The other CPUs run already: it flushes what they made. */
+    hv_machine_set_break(&m, a->brk);
     int r;
     for (;;) {
         r = hv_vm_run_cpu0();
         if (r != HV_EXIT_HALT || cpu.halted || cpu.pc != a->brk || --a->brk_hits == 0) break;
-        m.stop_pc = ~0ull; /* step past it: run one block, then re-arm */
-        uint64_t at = cpu.pc;
-        while (cpu.pc == at && !cpu.halted) {
-            m.stop_pc = ~0ull;
-            hv_run_one(&cpu);
-        }
-        m.stop_pc = a->brk;
+        hv_cpu_pass_stop(&cpu); /* on past it once: the stop stays put for every CPU, so nothing to flush */
     }
     if (cpu.pc == a->brk) {
         fprintf(stderr, "hengevm: breakpoint %llx, x30 %llx:", (unsigned long long)a->brk, (unsigned long long)cpu.x[30]);
@@ -830,7 +917,7 @@ static void *cpu_thread(void *unused) {
         }
     }
     fprintf(stderr, "\nhengevm: stopped (%s) after %llu blocks, %d translated\n", interrupted ? "interrupted" : reason_name(r),
-            (unsigned long long)cpu.icount, m.nblocks);
+            (unsigned long long)cpu.icount, (int)hv_blocks_held(&m));
     fprintf(stderr, "  pc %016llx el%u sp %016llx insn %08x\n", (unsigned long long)cpu.pc, cpu.el,
             (unsigned long long)cpu.sp, cpu.exit_insn);
     fprintf(stderr, "  esr %08llx far %016llx elr %016llx vbar %016llx sctlr %08llx\n", (unsigned long long)cpu.esr_el1,
@@ -876,21 +963,97 @@ static void *cpu_thread(void *unused) {
     }
     if (getenv("HV_BOOT_DISPLAY_DUMP")) { /* debugging: the boot framebuffer, raw BGRA, for the iOS view */
         HvBootDisplay bd;
-        if (hv_vm_boot_display(&bd) == 0) {
+        uint8_t *px = NULL;
+        int rc = hv_vm_boot_display(&bd, NULL, 0);
+        if (rc == 1) px = malloc((size_t)bd.stride * bd.height), rc = px ? hv_vm_boot_display(&bd, px, (size_t)bd.stride * bd.height) : -1;
+        if (rc == 0) {
             FILE *f = fopen(getenv("HV_BOOT_DISPLAY_DUMP"), "wb");
-            if (f) fwrite(bd.pixels, 1, (size_t)bd.stride * bd.height, f), fclose(f);
+            if (f) fwrite(px, 1, (size_t)bd.stride * bd.height, f), fclose(f);
             fprintf(stderr, "hengevm: boot display %ux%u stride %u written\n", bd.width, bd.height, bd.stride);
         } else {
             fprintf(stderr, "hengevm: no boot display found\n");
         }
+        free(px);
     }
-    hv_vm_flush_disks();
+    hv_vm_finish(); /* the other CPUs stopped and joined, the disks' last writes done and flushed */
+    if (hv_vm_halted_by() == HV_HALT_RESET && !interrupted)
+        fprintf(stderr, "hengevm: macOS restarted the Mac: run hengevm again to start it\n");
     exit(0);
     return NULL;
 }
 
+/* ---- The Mac's battery, as the guest's (HV_POWER: battery, wall or none; by default the battery when this
+   Mac has one, else wall power) ---- */
+
+#include <IOKit/ps/IOPowerSources.h>
+#include <IOKit/ps/IOPSKeys.h>
+#include <notify.h>
+
+static int cf_int(CFDictionaryRef d, CFStringRef key, int *out) {
+    CFNumberRef n = CFDictionaryGetValue(d, key);
+    return n && CFGetTypeID(n) == CFNumberGetTypeID() && CFNumberGetValue(n, kCFNumberIntType, out);
+}
+
+static int cf_true(CFDictionaryRef d, CFStringRef key) {
+    CFBooleanRef b = CFDictionaryGetValue(d, key);
+    return b && CFGetTypeID(b) == CFBooleanGetTypeID() && CFBooleanGetValue(b);
+}
+
+/* 1 and the state of the Mac's internal battery, or 0 when it has none. */
+static int mac_battery(double *percent, int *external, int *charging, int *full) {
+    int found = 0;
+    CFTypeRef info = IOPSCopyPowerSourcesInfo();
+    CFArrayRef list = info ? IOPSCopyPowerSourcesList(info) : NULL;
+    for (CFIndex i = 0; list && i < CFArrayGetCount(list) && !found; i++) {
+        CFDictionaryRef d = IOPSGetPowerSourceDescription(info, CFArrayGetValueAtIndex(list, i));
+        CFStringRef type = d ? CFDictionaryGetValue(d, CFSTR(kIOPSTypeKey)) : NULL;
+        int cur = 0, max = 0;
+        if (!type || CFGetTypeID(type) != CFStringGetTypeID() || !CFEqual(type, CFSTR(kIOPSInternalBatteryType))) continue;
+        if (!cf_int(d, CFSTR(kIOPSCurrentCapacityKey), &cur) || !cf_int(d, CFSTR(kIOPSMaxCapacityKey), &max) || max <= 0) continue;
+        CFStringRef state = CFDictionaryGetValue(d, CFSTR(kIOPSPowerSourceStateKey));
+        *percent = 100.0 * cur / max;
+        *external = state && CFGetTypeID(state) == CFStringGetTypeID() && CFEqual(state, CFSTR(kIOPSACPowerValue));
+        *charging = cf_true(d, CFSTR(kIOPSIsChargingKey));
+        *full = *external && (cf_true(d, CFSTR(kIOPSIsChargedKey)) || cur >= max);
+        found = 1;
+    }
+    if (list) CFRelease(list);
+    if (info) CFRelease(info);
+    return found;
+}
+
+static void mac_power_send(void) {
+    double percent;
+    int external, charging, full;
+    if (!mac_battery(&percent, &external, &charging, &full)) return;
+    static int said = -1;
+    int now = (int)(percent + 0.5) * 8 + external * 4 + charging * 2 + full;
+    if (now != said) {
+        said = now;
+        fprintf(stderr, "hengevm: battery %.0f%%%s\n", percent,
+                external ? (full ? ", full on the charger" : charging ? ", charging" : ", on the charger") : "");
+    }
+    hv_vm_set_power(percent, external, charging, full);
+}
+
+/* The kind of power source to give the guest; with a battery, keeps it in step with this Mac's from now on. */
+static int mac_power_start(void) {
+    const char *e = getenv("HV_POWER");
+    double p;
+    int x, c, f;
+    int has = mac_battery(&p, &x, &c, &f);
+    int kind = e ? (!strcmp(e, "battery") ? HV_VM_POWER_BATTERY : !strcmp(e, "wall") ? HV_VM_POWER_WALL : HV_VM_POWER_NONE)
+                 : has ? HV_VM_POWER_BATTERY : HV_VM_POWER_WALL;
+    if (kind != HV_VM_POWER_BATTERY || !has) return kind; /* a battery on a Mac without one: full, on the charger */
+    mac_power_send();
+    int token;
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+    notify_register_dispatch(kIOPSNotifyAnyPowerSource, &token, q, ^(int t) { (void)t; mac_power_send(); }); /* any change */
+    return kind;
+}
+
 static void usage(void) {
-    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS [--profile 1]] [--cpus N] [--window] [--no-pvg] [--no-chain] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES] [--install IPSW]\n");
+    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS [--profile 1]] [--cpus N] [--window] [--no-pvg] [--no-chain] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES] [--install IPSW] [--restore SNAPSHOT] [--plug FILE SERIAL]\n");
     exit(2);
 }
 
@@ -914,6 +1077,9 @@ int main(int argc, char **argv) {
     uint64_t seed = 0, ecid = 0, ram_mb = 4096, aux_offset = 16384;
     const char *install_ipsw = NULL;
     const char *share_folder = NULL;
+    const char *restore_path = NULL;
+    const char *plug_path[4], *plug_serial[4];
+    int nplug = 0;
     int log = 1, trace = 0, use_pvg = 1, no_chain = 0;
     const char *screenshot = NULL;
     uint64_t watch = 0, watch_pa = 0;
@@ -974,6 +1140,11 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--aux-offset")) aux_offset = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--install")) install_ipsw = argv[++i];
+        else if (!strcmp(argv[i], "--restore")) restore_path = argv[++i]; /* FILE: go on from a suspend */
+        else if (!strcmp(argv[i], "--plug") && i + 2 < argc && nplug < 4) { /* FILE SERIAL: a USB drive from the start */
+            plug_path[nplug] = argv[++i];
+            plug_serial[nplug++] = argv[++i];
+        }
         else usage();
     }
     if (!rom || !disk_path || !aux_path) usage();
@@ -982,17 +1153,38 @@ int main(int argc, char **argv) {
     HvVmConfig vc = {.rom = rom, .disk = disk_path, .aux = aux_path, .aux_offset = aux_offset, .ecid = ecid, .seed = seed,
                      .ram_mb = ram_mb, .ncpus = ncpus, .log = log, .no_net = getenv("HV_NO_NET") != NULL,
                      .installer = install_ipsw != NULL};
+    if (!vc.installer) vc.power_source = mac_power_start();
+    if (restore_path && hv_vm_snapshot_has_power(restore_path) == 0) vc.power_source = HV_VM_POWER_NONE; /* saved before the battery */
     if (getenv("HV_JIT_MB")) vc.jit_bytes = (size_t)atoi(getenv("HV_JIT_MB")) << 20; /* debugging: a small region flushes often */
     hv_prof_register = hv_prof_register_thread;
     char err[256];
     if (share_folder) {
         char sock[256];
         snprintf(sock, sizeof sock, "%s.sock", share_folder);
+        char pin[PATH_MAX];
+        snprintf(pin, sizeof pin, "%s.system-key-pin", share_folder); /* this Mac's, next to its folder (share.c) */
+        hv_share_system_pin(pin);
+        if (!restore_path) hv_share_system_cold_boot(); /* afresh, not going on from a suspend */
         if (hv_share_start(share_folder, sock, getenv("HV_AGENT")) == 0) hv_net_set_share_socket(sock);
     }
+    follow_host_network();
     if (hv_vm_create(&vc, err, sizeof err) != 0) {
         fprintf(stderr, "hengevm: %s\n", err);
         return 1;
+    }
+    for (int i = 0; i < nplug; i++)
+        if (hv_vm_plug_disk(plug_path[i], 0, plug_serial[i], plug_serial[i]) < 0)
+            fprintf(stderr, "hengevm: cannot plug in %s\n", plug_path[i]);
+    if (restore_path) {
+        if (use_pvg) {
+            fprintf(stderr, "hengevm: --restore needs --phone (the iPad's graphics device)\n");
+            return 1;
+        }
+        int rc = hv_vm_restore(restore_path, err, sizeof err);
+        if (rc != 0) {
+            fprintf(stderr, "hengevm: restore %d: %s\n", rc, err);
+            return 1;
+        }
     }
     m.trace = trace;
     m.watch_va = watch;
@@ -1018,7 +1210,7 @@ int main(int argc, char **argv) {
     }
     int pvg_on = 0;
     if (use_pvg) {
-        if (hv_pvg_attach(&board, screenshot) != 0) fprintf(stderr, "hengevm: ParavirtualizedGraphics device unavailable; graphics stays inert\n");
+        if (hv_pvg_attach(&board, screenshot) != 0) fprintf(stderr, "hengevm: ParavirtualizedGraphics device unavailable; the iPad's graphics device stays\n");
         else pvg_on = 1;
     }
     if (pvg_on) hv_vm_set_poll(hv_pvg_poll);

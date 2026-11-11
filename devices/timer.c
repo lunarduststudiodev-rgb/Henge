@@ -6,8 +6,9 @@ static uint64_t one(HvGic *g, int c, int ppi, uint64_t ctl, uint64_t cval, uint6
     int enabled = (ctl & 1) && !(ctl & 2);
     int fired = enabled && now - offset >= cval;
     hv_gicv3_set_ppi(g, c, ppi, fired);
-    /* Deadline in host counter units; nothing to wait for if off or already firing. */
-    return enabled && !fired ? cval + offset : 0;
+    /* Deadline in host counter units (the guest's counter stood still while paused); nothing to
+       wait for if off or already firing. */
+    return enabled && !fired ? cval + offset + hv_time_bias : 0;
 }
 
 uint64_t hv_timer_update(HvGic *g, HvCpu *cpu) {
