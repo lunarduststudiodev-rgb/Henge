@@ -159,7 +159,7 @@ final class HardwareMouse {
     /// a finger on the screen, or the Mac itself, may have moved it.
     private static let positionAge: TimeInterval = 0.35
     /// How long after a scroll event pointer motion still counts as part of the scroll gesture.
-    private static let scrollQuiet: TimeInterval = 0.12
+    private static let scrollQuiet: TimeInterval = 0.3
 
     private var observers: [NSObjectProtocol] = []
     private var mice: [GCMouse] = []
@@ -177,6 +177,7 @@ final class HardwareMouse {
     private var havePos = false
     private var lastAbsoluteAt: TimeInterval = 0
     private var absoluteLogged = 0
+    private var movesAfterScroll = 0 // and the first few that get through soon after one
 
     func start() {
         let defaults = UserDefaults.standard
@@ -195,6 +196,7 @@ final class HardwareMouse {
         havePos = false
         lastAbsoluteAt = 0
         absoluteLogged = 0
+        movesAfterScroll = 0
         GCMouse.mice().forEach(attach)
         observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { [weak self] note in
             if let mouse = note.object as? GCMouse { self?.attach(mouse) }
@@ -253,11 +255,19 @@ final class HardwareMouse {
         if holdWhileScrolling, ProcessInfo.processInfo.systemUptime - lastScrollAt < Self.scrollQuiet {
             restX = 0
             restY = 0
-            if movesHeld < 24 {
+            // A pad sends empty moves all through a scroll (0, 0): only real ones are worth a line.
+            if (dx != 0 || dy != 0), movesHeld < 24 {
                 movesHeld += 1
                 HengeLog.log("input", "pointer held while scrolling: \(dx), \(dy)")
             }
             return
+        }
+        if (dx != 0 || dy != 0), movesAfterScroll < 40 {
+            let age = ProcessInfo.processInfo.systemUptime - lastScrollAt
+            if age < 1.5 {
+                movesAfterScroll += 1
+                HengeLog.log("input", "pointer moved \(Int(age * 1000)) ms after a scroll: \(dx), \(dy)")
+            }
         }
         if henge_vm_tablet_on() != 0, movedAbsolute(dx, dy) { return }
         restX += dx * speed
