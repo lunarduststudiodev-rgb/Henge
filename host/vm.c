@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <mach/mach_time.h>
+#include "sysreg.h"
 
 #include "usb_host.h"
 #include "usb_storage.h"
@@ -403,6 +404,12 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     if (!c->rom || !c->disk || !c->aux) return fail(err, errlen, "The ROM, disk and auxiliary storage are all needed.");
     install_fault_notes();
     signal(SIGPIPE, SIG_IGN); /* a guest connection closing at the far end must not end the machine */
+    /* The Mac's counter (its mach_absolute_time, and so its uptime and how long macOS takes the user to have been
+       away) starts near 0, as a Mac's does at power-on, not at the iPad's own uptime: days, with which macOS starts
+       up believing nobody has touched it for that long. All the host's time so far counts as time the Mac did not
+       see, as a pause does (sysreg.h), set before any device or CPU reads the counter. A restored Mac sets its own
+       (hv_machine_restore_paused). HV_HOST_UPTIME=1: as before. */
+    if (!getenv("HV_HOST_UPTIME")) __atomic_store_n(&hv_time_bias, mach_absolute_time(), __ATOMIC_SEQ_CST);
     if (hv_disk_open(&disk, c->disk, 0, 0) != 0) return fail(err, errlen, "Cannot open the disk image.");
     if (hv_disk_open(&aux, c->aux, c->aux_offset ? c->aux_offset : 16384, 0) != 0)
         return fail(err, errlen, "Cannot open the auxiliary storage.");
