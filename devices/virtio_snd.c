@@ -491,3 +491,13 @@ HvVirtioSnd *hv_virtio_snd_create(HvMachine *m, HvPcie *bus) {
     hv_pcie_attach(bus, &v->pci);
     return d;
 }
+
+/* After a pause or a restore: the host's player again for a stream that was playing, and the clock that drains it
+   without one starts from now (host times from before mean nothing). */
+void hv_virtio_snd_resume(HvVirtioSnd *d) {
+    if (!d) return;
+    d->clock_start_ns = now_ns();
+    d->clock_start_consumed = atomic_load(&d->consumed);
+    if (d->running && d->backend.start && d->backend.start(d->backend.opaque, d->channels, d->format, d->rate_hz) != 0)
+        d->backend.start = NULL;
+}

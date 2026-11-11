@@ -16,5 +16,6 @@ typedef struct HvVirtioNet {
 HvVirtioNet *hv_virtio_net_create(HvMachine *m, HvPcie *bus, const uint8_t mac[6]);
 /* Returns 0 if the guest had no receive buffer posted (the caller keeps the frame for later). */
 int hv_virtio_net_receive(HvVirtioNet *n, const uint8_t *frame, uint32_t len);
+void hv_virtio_net_set_link(HvVirtioNet *n, int up);
 
 #endif

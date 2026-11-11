@@ -60,3 +60,11 @@ HvVirtioNet *hv_virtio_net_create(HvMachine *m, HvPcie *bus, const uint8_t mac[6
     hv_pcie_attach(bus, &v->pci);
     return n;
 }
+
+/* The cable out (up = 0) or back in: the guest is told its configuration changed. Device lock held. */
+void hv_virtio_net_set_link(HvVirtioNet *n, int up) {
+    if (!n) return;
+    uint16_t status = up ? 1 : 0;
+    memcpy(n->vio.config + 6, &status, 2);
+    hv_virtio_config_changed(&n->vio);
+}
