@@ -131,6 +131,9 @@ void henge_lab_paused(int background, int write_test, const char *dir);
 void henge_lab_resumed(void);
 /* Testing: sets a translation knob (core/machine.h) in the running machine; nonzero if it exists. */
 int henge_vm_knob(const char *name, int value);
+/* Microseconds an idle CPU watches for work before it sleeps (HV_WFI_SPIN), changed while a Mac runs: read at each
+   sleep, so nothing is translated again for it (as henge_vm_knob would have). */
+void henge_vm_idle_spin(int us);
 /* The memory balloon (only with HV_BALLOON set before boot): asks the guest to hand over target_mb (when >= 0)
    and returns how many MB it has handed over, or -1 without a balloon. */
 long henge_vm_balloon(long target_mb);

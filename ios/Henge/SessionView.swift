@@ -1636,6 +1636,9 @@ struct SessionView: View {
         }
     }
 
+    /// What Quicker wake was last set to for the heat (-1: not yet), for the log.
+    private static var idleSpinSet: Int32 = -1
+
     private static func thermalLabel(_ state: ProcessInfo.ThermalState) -> String {
         switch state {
         case .nominal: return "Normal"
@@ -1824,6 +1827,19 @@ struct SessionView: View {
             if heat.rawValue != thermalState.rawValue {
                 thermalState = heat
                 HengeLog.log("session", "thermal state: \(Self.thermalLabel(heat))")
+            }
+            // Quicker wake keeps idle CPUs watching for work before they sleep, which is heat; and once the device is
+            // hot iPadOS slows everything Henge does (an iPad was "Hot" from its third minute to the end of a session).
+            // So while it is hot they sleep at once, and watch again when it has cooled. Set each second: a store.
+            if UserDefaults.standard.bool(forKey: EngineTuning.wfiSpinKey) {
+                let spin: Int32 = heat.rawValue >= ProcessInfo.ThermalState.serious.rawValue ? 0 : 50
+                henge_vm_idle_spin(spin)
+                if spin != Self.idleSpinSet {
+                    if Self.idleSpinSet >= 0 || spin == 0 {
+                        HengeLog.log("perf", spin == 0 ? "hot: idle CPUs sleep at once (Quicker wake is off until it cools)" : "cooled: Quicker wake is on again")
+                    }
+                    Self.idleSpinSet = spin
+                }
             }
             if state == 2 {
                 MacPause.shared.stopped()
