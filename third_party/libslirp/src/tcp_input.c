@@ -1406,6 +1406,12 @@ dropafterack:
     return;
 
 dropwithreset:
+    /* Henge: a reset is never answered with a reset (RFC 9293 3.10.7.1, and BSD's own tcp_input, which this
+       code left out). Without this, the Mac's reset for a connection the NAT had already let go got a reset
+       back, the Mac reset that, and the two went on: an iPad's log shows 520,000 of them in 17 minutes, each
+       one a packet the emulated Mac had to take an interrupt for and answer. */
+    if (tiflags & TH_RST)
+        goto drop;
     /* reuses m if m!=NULL, m_free() unnecessary */
     if (tiflags & TH_ACK)
         tcp_respond(tp, ti, m, (tcp_seq)0, ti->ti_ack, TH_RST, af);
