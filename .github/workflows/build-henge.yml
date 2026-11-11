@@ -1,0 +1,45 @@
+# Builds this branch (walriyami/Henge's code, kept here as it is) from the fork's Actions tab:
+# Actions > Build Henge IPA > Run workflow > branch walriyami-fork. It has the same file name as the
+# workflow on main so that GitHub lists it; the steps are the "ipa" job of this tree's own
+# .github/workflows/dev-build.yml, without the Mac test jobs.
+
+name: Build Henge IPA
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    name: Henge.ipa
+    runs-on: xcode-27
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: Henge
+
+      - name: Restore Husk and StikJIT
+        uses: actions/cache@v4
+        with:
+          path: |
+            work/Husk/.git
+            work/Husk/src/app/Frameworks
+            work/Husk/build/ios-arm64
+            work/StikJIT/StikJIT.xcframework
+          key: ios-deps-${{ hashFiles('Henge/ci/build-ipa.sh', 'Henge/ci/build-stikjit.sh', 'Henge/ci/stikjit-high-address.patch') }}
+
+      - name: Build Henge.ipa and Henge.tipa
+        run: bash Henge/ci/build-ipa.sh work
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-walriyami-${{ github.sha }}
+          path: |
+            ~/Desktop/Henge.ipa
+            ~/Desktop/Henge.tipa
+          if-no-files-found: error
+          retention-days: 14
