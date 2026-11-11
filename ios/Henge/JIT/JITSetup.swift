@@ -448,6 +448,7 @@ final class JITCoordinator: ObservableObject {
         }
 
         busy = true
+        JITBootstrap.helperMayBeAttached = true
         error = nil
         connectionProblem = nil
         advice = nil

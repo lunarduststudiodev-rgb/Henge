@@ -26,7 +26,7 @@ enum EngineTuning {
         var env = defaults
         unsetenv("HV_STATS") // only while henge-env.txt asks for it: removing the line turns it off at the next start
         let d = UserDefaults.standard
-        if d.integer(forKey: refreshKey) == 120 { env["HV_HZ"] = "120" }
+        if [30, 120].contains(d.integer(forKey: refreshKey)) { env["HV_HZ"] = String(d.integer(forKey: refreshKey)) }
         if d.bool(forKey: superblocksKey) { env["HV_SUPERBLOCKS"] = "1" } else { unsetenv("HV_SUPERBLOCKS") }
         if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
         // The Mac's CPU threads at the user-interactive class instead of user-initiated (host/vm.c hv_vm_cpu_qos).

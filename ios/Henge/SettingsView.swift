@@ -106,6 +106,7 @@ struct SettingsView: View {
             .listRowBackground(Desk.card)
             Section("Performance") {
                 Picker("Mac refresh rate", selection: $refreshRate) {
+                    Text("30 Hz").tag(30)
                     Text("60 Hz").tag(60)
                     Text("120 Hz").tag(120)
                 }

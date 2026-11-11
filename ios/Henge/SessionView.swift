@@ -1656,6 +1656,7 @@ struct SessionView: View {
             HengeLog.log("session", "not starting: \(ram) MB of memory is too little for macOS")
             return
         }
+        JITBootstrap.releaseLingeringDebugger()
         Sharing.prepare(mac)
         MacSpeaker.shared.prepare()
         EngineTuning.apply()
@@ -1831,6 +1832,7 @@ struct SessionView: View {
             }
             tick += 1
             if tick % 10 == 0 {
+                JITBootstrap.releaseLingeringDebugger()
                 let gpuFrames = henge_vm_gpu_frames()
                 let lostText = lost > 0 ? ", dropped \(lost)" : ""
                 HengeLog.log("perf", "\(Self.perfClock.string(from: now)) blocks/s \(String(format: "%.0f", blocksPerSecond)), "

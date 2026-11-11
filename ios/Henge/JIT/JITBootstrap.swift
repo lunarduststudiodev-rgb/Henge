@@ -211,14 +211,40 @@ enum JITBootstrap {
     /// True once this process has told StikDebug to let go.
     nonisolated(unsafe) static private(set) var detached = false
 
+    /// Henge's built-in helper (StikJIT's script, which answers the detach brk) was started this launch.
+    nonisolated(unsafe) static var helperMayBeAttached = false
+    nonisolated(unsafe) static private var lingeringTries = 0
+
+    /// A debugger still on after the one that gave the region was let go: another helper that attached once the first
+    /// detached. With one attached every trap stops Henge until it answers (a phone run went 1.5-2x slower). Told to let
+    /// go too, if it is the built-in helper's (StikJIT's script answers the detach brk; a debugger that does not, Xcode's
+    /// say, would stop at it). Cheap: one sysctl. Called before a Mac starts and every 10 s while one runs; three tries.
+    static func releaseLingeringDebugger() {
+        guard detached, !keepDebuggerAttached, helperMayBeAttached, lingeringTries < 3, isTraced else { return }
+        lingeringTries += 1
+        HengeLog.log("jit", "a debugger is still attached after the JIT region was held (a second helper?); detaching it")
+        henge_ios_jit_detach()
+        HengeLog.log("jit", isTraced ? "still traced after the detach request" : "debugger detached")
+    }
+
+    /// Whether a debugger traces this process right now (P_TRACED; CS_DEBUGGED stays set after a detach).
+    static var isTraced: Bool {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0 else { return false }
+        return (info.kp_proc.p_flag & P_TRACED) != 0
+    }
+
     /// Release the debugger once the JIT region is held. It is no longer
     /// needed for anything, and leaving it attached is what froze the app.
     private static func detachIfDone() {
         guard prewarmed, !detached, !keepDebuggerAttached else { return }
         HengeLog.log("jit", "JIT region held; detaching StikDebug so a suspended "
-                         + "debugger cannot stall the process later")
+                         + "debugger cannot stall the process later (traced: \(isTraced ? "yes" : "no"))")
         henge_ios_jit_detach()
         detached = true
+        HengeLog.log("jit", "after the detach request, traced: \(isTraced ? "yes" : "no")")
     }
 
     /// Whether this device enforces TXM, so that only a trap servicer can grant
