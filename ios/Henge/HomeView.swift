@@ -11,6 +11,8 @@ struct HomeView: View {
     @State private var picking = false
     @State private var jitReady = JITBootstrap.ready
     @State private var chosen: UUID?
+    @State private var showMacApps = false
+    @AppStorage(MacAppsFeature.key) private var macApps = false
 
     /// The Mac on show: the one picked, or the one used last.
     private var mac: VirtualMac? {
@@ -47,6 +49,7 @@ struct HomeView: View {
                     Menu {
                         Button("Install macOS…") { tab = .install }
                         Button("Bring in a Mac from a computer…") { picking = true }
+                        if macApps { Button("Mac Apps…") { showMacApps = true } }
                     } label: {
                         Image(systemName: "plus")
                     }
@@ -56,6 +59,7 @@ struct HomeView: View {
             .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { result in
                 if case let .success(url) = result { machines.importFolder(url) }
             }
+            .sheet(isPresented: $showMacApps) { MacAppsView() }
             .task {
                 while !Task.isCancelled { // the region may be claimed after a hand-off to StikDebug
                     jitReady = JITBootstrap.ready
@@ -187,7 +191,11 @@ private struct MacHero: View {
             .buttonStyle(.plain)
             if jitReady {
                 Button(action: start) {
-                    Label("Start", systemImage: "play.fill")
+                    if InstantResume.enabled && InstantResume.hasSave(for: mac) {
+                        Label("Resume", systemImage: "play.fill")
+                    } else {
+                        Label("Start", systemImage: "play.fill")
+                    }
                 }
                 .buttonStyle(DeskButtonStyle())
                 .padding(.top, 15)

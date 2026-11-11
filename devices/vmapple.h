@@ -90,5 +90,6 @@ int hv_vmapple_load_rom(HvVmapple *b, const char *path);
 void hv_vmapple_reset_cpu(HvVmapple *b);
 /* No CPU or host device callback may be using the board. */
 void hv_vmapple_destroy(HvVmapple *b);
+uint8_t *hv_vmapple_avp_regs(void *avp);
 
 #endif

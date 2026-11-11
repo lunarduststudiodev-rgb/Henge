@@ -38,7 +38,8 @@ enum Device {
     static var suggestedRAMGB: Int {
         let mb = ProcessInfo.processInfo.physicalMemory >> 20
         // m4 fork: an 8 GB iPad (7.4 GB usable) thrashes and kills the Mac at 6 GB: 16 GB devices only.
-        return mb >= 14_000 ? 8 : mb >= 10_000 ? 6 : 4
+        // A 6 GB device (5.7 GB usable) could not build a 4 GB Mac, and installed a 3 GB one (#70); 4 GB devices, 2.
+        return mb >= 14_000 ? 8 : mb >= 10_000 ? 6 : mb >= 7_000 ? 4 : mb >= 5_000 ? 3 : 2
     }
 
     /// The choices for a Mac's memory, in GB.

@@ -73,6 +73,7 @@ typedef struct HvVirtioSnd {
 HvVirtioSnd *hv_virtio_snd_create(HvMachine *m, HvPcie *bus);
 /* CPU thread, each tick: return played buffers to the guest. */
 void hv_virtio_snd_poll(HvVirtioSnd *d);
+void hv_virtio_snd_resume(HvVirtioSnd *d);
 /* Backend thread: take up to `len` bytes of PCM; the rest of `buf` is silence. Returns bytes taken. */
 uint32_t hv_virtio_snd_pull(HvVirtioSnd *d, void *buf, uint32_t len);
 /* Backend thread: `len` bytes of the microphone's PCM, in the input stream's format. Dropped when the guest is behind. */

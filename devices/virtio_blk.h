@@ -52,6 +52,8 @@ void hv_virtio_blk_poll(HvVirtioBlk *b);
 void hv_virtio_blk_drain(HvVirtioBlk *b);
 /* After CPUs stop: finish submitted DMA and join workers before disk flush/free. */
 void hv_virtio_blk_stop(HvVirtioBlk *b);
+int hv_virtio_blk_start(HvVirtioBlk *b);
+int hv_virtio_blk_idle(HvVirtioBlk *b);
 void hv_virtio_blk_destroy(HvVirtioBlk *b);
 
 #endif
