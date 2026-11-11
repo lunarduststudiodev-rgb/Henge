@@ -522,6 +522,7 @@ static void over_surface(HvObject *o) {
     uint64_t bound[3][31]; /* lengths of the buffers bound (vertex or compute, fragment, tile), 0 for none */
     uint32_t pre_raster_samples, pre_imageblock, pre_threadgroup, pre_tile_w, pre_tile_h; /* for the next pass */
     BOOL tracing; /* HV_PVG_TRACE_FILE exists: say what each exec draws */
+    MTLRenderPassDescriptor *pass_desc; /* recycled render pass descriptor */
     /* The newest frame, BGRA, for hv_pvg_metal_frame, and the same without the pointer on it. The worker's;
        frame_lock is held while it changes frame, frame_w, frame_h or frame's pixels, for hv_pvg_metal_frame copies
        them from other threads (the boot screen, a snapshot). */
@@ -561,7 +562,8 @@ static void over_surface(HvObject *o) {
     dispatch_queue_t presenter;
     os_unfair_lock screen_lock; /* what to show, and the pointer as the presenter reads it */
     id<MTLTexture> screen_tex;
-    BOOL screen_half, screen_dirty, presenter_running;
+    BOOL screen_half, screen_dirty, presenter_running, presenter_drawing;
+    NSMutableArray *present_then; /* work waiting for the presenter's frame to finish */
     uint64_t swap_waiting_ns; /* the Mac's newest picture not yet taken to the screen: when it was swapped (0: none) */
     BOOL drawable_retry_pending;
     double drawable_retry_cooldown; /* fresh work coalesces one wake at its expiry */
@@ -584,6 +586,7 @@ static void over_surface(HvObject *o) {
 - (void)present:(uint64_t)mapping;
 - (void)present:(uint64_t)mapping swappedAt:(uint64_t)swap_ns;
 - (void)keepWaitingSwap:(uint64_t)swap_ns;
+- (void)drainPresentThen;
 - (void)screenChanged;
 @end
 
@@ -901,6 +904,8 @@ static BOOL snap_entry_is(HvReplay *r, uint32_t task, uint32_t ref, const uint32
 - (void)dealloc {
     for (uint32_t i = 0; i < exec_found_n; i++) exec_found[i] = nil;
     free((void *)exec_found);
+    pass_desc = nil;
+    present_then = nil;
 }
 
 - (void)complain:(NSString *)what {
@@ -2399,7 +2404,8 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
         else pass_targets.color[i - 2] = a->tex.format;
         if (!p.raster_samples) pass_targets.samples = a->tex.samples ? a->tex.samples : 1;
     }
-    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (!pass_desc) pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
+    MTLRenderPassDescriptor *d = pass_desc;
     set_attachment(d.depthAttachment, &p.depth, tex[0], res[0]);
     d.depthAttachment.clearDepth = p.clear_depth;
     set_attachment(d.stencilAttachment, &p.stencil, tex[1], res[1]);
@@ -2426,14 +2432,14 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
         set_attachment(c, &p.color[i], tex[2 + i], res[2 + i]);
         if (p.color[i].present) c.clearColor = MTLClearColorMake(clear[i][0], clear[i][1], clear[i][2], clear[i][3]);
     }
-    if (visibility) d.visibilityResultBuffer = visibility;
-    if (p.layers) d.renderTargetArrayLength = (NSUInteger)p.layers;
-    if (p.width) d.renderTargetWidth = (NSUInteger)p.width;
-    if (p.height) d.renderTargetHeight = (NSUInteger)p.height;
-    if (p.raster_samples) d.defaultRasterSampleCount = p.raster_samples;
-    if (p.imageblock) d.imageblockSampleLength = p.imageblock;
-    if (p.threadgroup) d.threadgroupMemoryLength = p.threadgroup;
-    if (p.tile_w) d.tileWidth = p.tile_w, d.tileHeight = p.tile_h;
+    d.visibilityResultBuffer = visibility;
+    d.renderTargetArrayLength = (NSUInteger)p.layers;
+    d.renderTargetWidth = (NSUInteger)p.width;
+    d.renderTargetHeight = (NSUInteger)p.height;
+    d.defaultRasterSampleCount = p.raster_samples;
+    d.imageblockSampleLength = p.imageblock;
+    d.threadgroupMemoryLength = p.threadgroup;
+    d.tileWidth = p.tile_w, d.tileHeight = p.tile_h;
     if (tracing) {
         id<MTLTexture> c0 = d.colorAttachments[0].texture;
         MTLClearColor cc = d.colorAttachments[0].clearColor;
@@ -2963,8 +2969,12 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
             if (region.size.height > pass_h - region.origin.y) region.size.height = (NSUInteger)(pass_h - region.origin.y);
         }
         if (![self charge:hv_pvg_sat_mul(pass_w, pass_h)]) break; /* a thread a pixel, at most */
-        SEL sel = sel_registerName("dispatchThreadsPerTile:inRegion:");
-        if (tag == 162 && [(id)e respondsToSelector:sel]) ((void (*)(id, SEL, MTLSize, MTLRegion))objc_msgSend)(e, sel, s, region);
+        static SEL sel_region;
+        static dispatch_once_t once_region;
+        dispatch_once(&once_region, ^{
+            sel_region = sel_registerName("dispatchThreadsPerTile:inRegion:");
+        });
+        if (tag == 162 && [(id)e respondsToSelector:sel_region]) ((void (*)(id, SEL, MTLSize, MTLRegion))objc_msgSend)(e, sel_region, s, region);
         else [e dispatchThreadsPerTile:s];
         break;
     }
@@ -3699,6 +3709,12 @@ static void late_probe(HvReplay *r, const char *what, uint32_t ch, double commit
 - (void)afterGPU:(void (^)(void))then {
     for (id<MTLCommandBuffer> cb = nil;;) {
         os_unfair_lock_lock(&screen_lock); /* the presenter commits under it: none of its work is missed in between */
+        if (presenter_drawing) {
+            if (!present_then) present_then = [NSMutableArray new];
+            [present_then addObject:[then copy]];
+            os_unfair_lock_unlock(&screen_lock);
+            return;
+        }
         if (atomic_load(&inflight) == 0 || encode_only()) {
             os_unfair_lock_unlock(&screen_lock);
             then(); /* cb, if made, is let go uncommitted */
@@ -3784,8 +3800,8 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
    The copy waits for every fence the pass waits for, as the draws would have. */
 - (void)clampPass:(const HvSeg *)segs count:(uint32_t)nseg from:(uint32_t)s at:(const uint8_t *)p task:(uint32_t)task
     commandBuffer:(id<MTLCommandBuffer>)cb {
-    NSMutableArray<HvIndirect *> *found = [NSMutableArray new];
-    NSMutableOrderedSet *waits = [NSMutableOrderedSet new]; /* each once */
+    NSMutableArray<HvIndirect *> *found = nil;
+    NSMutableOrderedSet *waits = nil; /* each once */
     uint32_t weight = 1, frec = 12, fstep = 3, cpsize = 4;
     id<MTLBuffer> factors = nil; /* as exec: will have them at each draw (render 116 and 122) */
     uint64_t foff = 0, fstride = 0;
@@ -3814,7 +3830,10 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
             }
             if (tag == 25) {
                 id f = [self get:U32(0) task:task kind:KIND_FENCE];
-                if (f) [waits addObject:f];
+                if (f) {
+                    if (!waits) waits = [NSMutableOrderedSet new];
+                    [waits addObject:f];
+                }
             }
             if (tag < 16 || tag > 19) continue;
             if (found.count == HV_PVG_PASS_INDIRECT) {
@@ -3862,6 +3881,7 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
                     }
                 }
             }
+            if (!found) found = [NSMutableArray new];
             [found addObject:d];
         }
         if (next_pass || !segs[s].more) break;
@@ -4641,11 +4661,21 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
         tex = screen_tex, half = screen_half, ctex = cursor_tex, shown = cursor_shown, hidden = pointer_hidden;
         cw0 = cursor_w, ch0 = cursor_h, hx = cursor_hot_x, hy = cursor_hot_y;
         uint64_t swap_ns = 0; /* the Mac's picture this present carries, if a new one (frame_pace.h) */
-        PresenterPick pick = presenter_pick(self, generation, target, W, H, drawable_fits, made_half, cb, &swap_ns);
+        PresenterPick pick = presenter_pick(self, generation, target, W, H, drawable_fits, made_half, nil, &swap_ns);
         const uint64_t held_from = stage_now(); /* a DRAW has taken its place in the GPU's order (presenter_take) */
         os_unfair_lock_unlock(&screen_lock);
-        if (pick == PICK_STOP) return; /* cb never enqueued, the drawable never presented: the layer keeps its last frame */
-        if (pick == PICK_AGAIN) continue; /* cb never enqueued: let go */
+        if (pick == PICK_STOP) {
+            os_unfair_lock_lock(&screen_lock);
+            [self drainPresentThen];
+            os_unfair_lock_unlock(&screen_lock);
+            return; /* cb never enqueued, the drawable never presented: the layer keeps its last frame */
+        }
+        if (pick == PICK_AGAIN) {
+            os_unfair_lock_lock(&screen_lock);
+            [self drainPresentThen];
+            os_unfair_lock_unlock(&screen_lock);
+            continue; /* cb never enqueued: let go */
+        }
         float rect[4] = {-1, -1, 2, 2};
         if (fit && !mid) fit = NO; /* made before the pick, for the same format (nothing is made in the hold); none (no memory for it): the screen is drawn straight into the drawable, stretched by its sampler */
         if (fit) {
@@ -4754,6 +4784,16 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
     if (!swap_ns) return;
     if (swap_waiting_ns) hv_frame_replaced();
     else swap_waiting_ns = swap_ns;
+}
+
+- (void)drainPresentThen {
+    if (!present_then.count) return;
+    NSArray *callbacks = [present_then copy];
+    [present_then removeAllObjects];
+    dispatch_queue_t cq = complete_q;
+    dispatch_async(cq, ^{
+        for (void (^blk)(void) in callbacks) blk();
+    });
 }
 
 /* What the display should show: at most a few times a second by CPU, for tests and the boot's first frames. */
@@ -5077,7 +5117,12 @@ static PresenterPick presenter_pick(HvReplay *r, uint64_t generation, CAMetalLay
     r->screen_dirty = NO;
     r->drawable_retry_deadline = 0;
     *swap_ns = r->swap_waiting_ns, r->swap_waiting_ns = 0;
-    presenter_take(r, cb); /* with screen_tex: a swap away from it from now on waits for this frame */
+    if (cb) {
+        r->presenter_drawing = NO;
+        presenter_take(r, cb); /* with screen_tex: a swap away from it from now on waits for this frame */
+    } else {
+        r->presenter_drawing = YES;
+    }
     return PICK_DRAW;
 }
 
@@ -5089,6 +5134,23 @@ static PresenterPick presenter_pick(HvReplay *r, uint64_t generation, CAMetalLay
 static BOOL presenter_commit(HvReplay *r, uint64_t generation, CAMetalLayer *target, id<MTLCommandBuffer> cb,
                              id<CAMetalDrawable> drawable, uint64_t swap_ns, uint64_t held_from) {
     os_unfair_lock_lock(&r->screen_lock);
+    uint64_t take_from = held_from;
+    if (r->presenter_drawing) {
+        r->presenter_drawing = NO;
+        take_from = stage_now();
+        presenter_take(r, cb);
+        if (r->present_then.count) {
+            NSArray *draining = [r->present_then copy];
+            [r->present_then removeAllObjects];
+            dispatch_queue_t cq = r->complete_q;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                (void)done;
+                dispatch_async(cq, ^{
+                    for (void (^blk)(void) in draining) blk();
+                });
+            }];
+        }
+    }
     BOOL same = r->layer_generation == generation && r->layer == target;
     if (same) {
         /* when it was on the glass, for the benchmark (frame_pace.h): 0 if the screen dropped it */
@@ -5104,7 +5166,7 @@ static BOOL presenter_commit(HvReplay *r, uint64_t generation, CAMetalLayer *tar
         [r keepWaitingSwap:swap_ns];
     }
     [cb commit]; /* either way */
-    const uint64_t hold_ns = stage_now() - held_from;
+    const uint64_t hold_ns = stage_now() - take_from;
     os_unfair_lock_unlock(&r->screen_lock);
     [r noteHold:hold_ns];
     return same;

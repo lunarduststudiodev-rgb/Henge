@@ -39,5 +39,24 @@ else
     echo "  System Settings > Accessibility > Display"
 fi
 
+echo "Photos and media background analysis off..."
+launchctl disable "gui/$(id -u)/com.apple.photoanalysisd" 2>/dev/null
+launchctl disable "gui/$(id -u)/com.apple.mediaanalysisd" 2>/dev/null
+killall photoanalysisd mediaanalysisd 2>/dev/null
+
+echo "Intelligence and suggestions background indexing off..."
+launchctl disable "gui/$(id -u)/com.apple.intelligenceplatformd" 2>/dev/null
+launchctl disable "gui/$(id -u)/com.apple.suggestd" 2>/dev/null
+launchctl disable "gui/$(id -u)/com.apple.triald" 2>/dev/null
+launchctl disable "gui/$(id -u)/com.apple.knowledgeconstructiond" 2>/dev/null
+launchctl disable "gui/$(id -u)/com.apple.biometrickitd" 2>/dev/null
+killall intelligenceplatformd suggestd triald 2>/dev/null
+
+echo "Diagnostic and spin hang profiling off..."
+sudo launchctl disable system/com.apple.spindump 2>/dev/null
+sudo launchctl disable system/com.apple.tailspind 2>/dev/null
+sudo launchctl disable system/com.apple.analyticsd 2>/dev/null
+sudo launchctl disable system/com.apple.diagnosticd 2>/dev/null
+
 killall Dock Finder 2>/dev/null
 echo "Done. Log out and in again (or restart the Mac) for all of it to take effect."

@@ -21,6 +21,7 @@ int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
     d->wfd = -1;
     d->guard = NULL;
     d->guard_users = 0;
+    d->dirty_writes = 0;
     d->fd = open(path, readonly ? O_RDONLY : O_RDWR);
     if (d->fd < 0) return -1;
     struct stat st;
@@ -93,6 +94,7 @@ int hv_disk_write(HvDisk *d, uint64_t off, const void *buf, uint64_t len) {
         off += (uint64_t)n;
         len -= (uint64_t)n;
     }
+    __atomic_add_fetch(&d->dirty_writes, 1, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -100,6 +102,9 @@ int hv_disk_write(HvDisk *d, uint64_t off, const void *buf, uint64_t len) {
    host runs; 2 fcntl(F_BARRIERFSYNC). */
 int hv_disk_flush(HvDisk *d) {
     if (d->readonly) return 0;
+    /* Skip expensive barrier / fsync if no writes have arrived since last flush.
+       atomic_exchange ensures any concurrent write sets dirty_writes > 0 again. */
+    if (!__atomic_exchange_n(&d->dirty_writes, 0, __ATOMIC_ACQ_REL)) return 0;
     switch (hv_knob[HV_K_FLUSH]) {
     case 1: return 0;
     case 2: return fcntl(d->fd, F_BARRIERFSYNC) == -1 ? -1 : 0;
@@ -109,6 +114,7 @@ int hv_disk_flush(HvDisk *d) {
 
 int hv_disk_sync(HvDisk *d) {
     if (d->readonly || d->fd < 0) return 0;
+    __atomic_store_n(&d->dirty_writes, 0, __ATOMIC_RELEASE);
     if (fcntl(d->fd, F_FULLFSYNC) == 0) return 0;
     return fsync(d->fd) == 0 ? 0 : -1; /* a file system without F_FULLFSYNC */
 }

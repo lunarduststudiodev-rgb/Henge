@@ -18,5 +18,18 @@ defaults delete com.apple.finder DisableAllAnimations 2>/dev/null
 defaults delete com.apple.universalaccess reduceMotion 2>/dev/null
 defaults delete com.apple.universalaccess reduceTransparency 2>/dev/null
 
+launchctl enable "gui/$(id -u)/com.apple.photoanalysisd" 2>/dev/null
+launchctl enable "gui/$(id -u)/com.apple.mediaanalysisd" 2>/dev/null
+launchctl enable "gui/$(id -u)/com.apple.intelligenceplatformd" 2>/dev/null
+launchctl enable "gui/$(id -u)/com.apple.suggestd" 2>/dev/null
+launchctl enable "gui/$(id -u)/com.apple.triald" 2>/dev/null
+launchctl enable "gui/$(id -u)/com.apple.knowledgeconstructiond" 2>/dev/null
+launchctl enable "gui/$(id -u)/com.apple.biometrickitd" 2>/dev/null
+
+sudo launchctl enable system/com.apple.spindump 2>/dev/null
+sudo launchctl enable system/com.apple.tailspind 2>/dev/null
+sudo launchctl enable system/com.apple.analyticsd 2>/dev/null
+sudo launchctl enable system/com.apple.diagnosticd 2>/dev/null
+
 killall Dock Finder 2>/dev/null
 echo "Done. Log out and in again (or restart the Mac) for all of it to take effect."

@@ -11,6 +11,7 @@ typedef struct HvDisk {
     uint64_t offset;
     uint64_t size;   /* bytes visible to the guest */
     int readonly;
+    uint64_t dirty_writes;     /* writes since last flush (atomic exchange on flush) */
     struct HvDiskGuard *guard; /* an auto-save's, while armed (hv_disk_guard_arm) */
     uint32_t guard_users;      /* writers that may hold `guard` (atomic): its end waits for none */
 } HvDisk;

@@ -800,8 +800,10 @@ static int superblocks(void) {
 }
 
 /* The block may go on past a conditional branch at pc: the next instruction is
-   in the same page and the block is not long already. */
-static int go_on(Emit *e, uint64_t pc) {
+   in the same page and the block is not long already. Backwards branches (loops)
+   must not fall through: their taken edge is hot and must not be pushed out of line. */
+static int go_on(Emit *e, uint64_t pc, uint64_t target) {
+    if (target <= pc) return 0;
     return ((pc + 4) & ~e->page_mask) == e->page && e->cur_i + 1 < 48;
 }
 
@@ -886,7 +888,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
         }
         put(e, 0x54000000u | cond);
         put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .plain = 1});
-        if (superblocks() && go_on(e, pc)) return 0;
+        if (superblocks() && go_on(e, pc, target)) return 0;
         put_branch_exit(e, pc + 4, 1);
         return 1;
     }
@@ -898,7 +900,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
     if (!is_stolen(rt)) {
         put(e, bare);
         put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .plain = 1});
-        if (superblocks() && go_on(e, pc)) return 0;
+        if (superblocks() && go_on(e, pc, target)) return 0;
         put_branch_exit(e, pc + 4, 1);
         return 1;
     }
@@ -908,7 +910,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
     put(e, (bare & ~0x1fu) | s);
     put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .nrestore = 1, .restore = {s}, .plain = 1});
     unspill(e, &s, 1);
-    if (superblocks() && go_on(e, pc)) return 0;
+    if (superblocks() && go_on(e, pc, target)) return 0;
     put_branch_exit(e, pc + 4, 1);
     return 1;
 }

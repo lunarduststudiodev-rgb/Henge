@@ -1287,6 +1287,17 @@ flush:
    the same word (WFE_YIELD_ROUNDS of them, about 200 us) give this core up for a moment, so the host can run the
    owner (lock-holder pre-emption). The priority is lowered only while off the core, for at most 1 ms. */
 enum { WFE_YIELD_ROUNDS = 4 };
+
+static inline uint64_t wfi_timer_now(void) {
+#if defined(__aarch64__)
+    uint64_t val;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
+#else
+    return mach_absolute_time();
+#endif
+}
+
 static uint32_t wfe(HvCpu *cpu) {
     static int spin = -1;
     if (spin < 0) spin = getenv("HV_WFE_SPIN") != NULL;
@@ -1308,11 +1319,11 @@ static uint32_t wfe(HvCpu *cpu) {
     static int sleep_ok = -1;
     if (sleep_ok < 0) {
         __asm__ volatile("sevl; wfe" ::: "memory"); /* clear the event register */
-        uint64_t t0 = mach_absolute_time();
+        uint64_t t0 = wfi_timer_now();
         __asm__ volatile("wfe" ::: "memory");
-        sleep_ok = mach_absolute_time() - t0 < 24 * 20;
+        sleep_ok = wfi_timer_now() - t0 < 24 * 20;
     }
-    uint64_t deadline = mach_absolute_time() + 24 * 50; /* 50 us at 24 MHz */
+    uint64_t deadline = wfi_timer_now() + 24 * 50; /* 50 us at 24 MHz */
     if (cpu->m->stats_interval) HV_CPU_COUNT(cpu, wfe_waits, 1);
     HvPerCpu *pcs = cpu->pc_state;
     int timed_out = 0;
@@ -1330,7 +1341,7 @@ static uint32_t wfe(HvCpu *cpu) {
             break;
         }
         if (__atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED)) break; /* a request: neither progress nor a wasted round */
-        if (mach_absolute_time() >= deadline) {
+        if (wfi_timer_now() >= deadline) {
             __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
             timed_out = 1;
             break;
@@ -1576,19 +1587,27 @@ static int wait_for_interrupt(HvCpu *cpu) {
         static int sleep_ok = -1; /* does the host's WFE come back soon by itself? (see wfe()) */
         if (sleep_ok < 0) {
             __asm__ volatile("sevl; wfe" ::: "memory");
-            uint64_t t = mach_absolute_time();
+            uint64_t t = wfi_timer_now();
             __asm__ volatile("wfe" ::: "memory");
-            sleep_ok = mach_absolute_time() - t < 24 * 20;
+            sleep_ok = wfi_timer_now() - t < 24 * 20;
         }
-        uint64_t until = mach_absolute_time() + (uint64_t)spin_us * 24;
+        uint64_t until = wfi_timer_now() + (uint64_t)spin_us * 24;
         for (;;) {
             uint32_t v;
             __asm__ volatile("ldaxr %w0, [%1]" : "=r"(v) : "r"(&p->wake_pending) : "memory"); /* a store to it wakes the WFE */
-            if (v || mach_absolute_time() >= until) break;
+            if (v || wfi_timer_now() >= until) break;
             if (sleep_ok) __asm__ volatile("wfe" ::: "memory");
             else __asm__ volatile("yield" ::: "memory");
         }
         __asm__ volatile("clrex" ::: "memory");
+    }
+    if (__atomic_exchange_n(&p->wake_pending, 0, __ATOMIC_ACQ_REL)) {
+        hv_big_lock(m); /* still parked: see big_lock */
+        unpark(cpu);
+        HV_CPU_COUNT(cpu, wfi, 1);
+        HV_CPU_COUNT(cpu, wfi_ticks, mach_absolute_time() - t0);
+        m->tick(m, cpu);
+        return 0;
     }
     pthread_mutex_lock(&p->wake_mu);
     if (!p->wake_pending) {
