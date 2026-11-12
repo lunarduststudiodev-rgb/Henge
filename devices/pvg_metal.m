@@ -2193,7 +2193,8 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
     HvKind serialized = KIND_NONE;
     switch (type) {
     case OBJ_BUFFER: [self makeBuffer:o at:at task:task]; break;
-    case OBJ_TEXTURE: [self makeTexture:o at:at size:size task:task]; break;
+    case OBJ_TEXTURE: case 3: /* 3: macOS 13's driver, the same {length, page, layout, mips, record} entry */
+        [self makeTexture:o at:at size:size task:task]; break;
     case OBJ_FUNCTION: o->object = [self makeFunction:at task:task]; break;
     case OBJ_SERIALIZED: o->object = [self makeSerialized:at length:size task:task kind:&serialized into:o]; break;
     case OBJ_LINEAR_TEXTURE: case 9: [self makeLinearTexture:o at:at size:size task:task]; break;
@@ -2218,7 +2219,7 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
     o->kind = !o->object ? KIND_NONE
             : type == OBJ_SERIALIZED ? serialized
             : type == OBJ_BUFFER || type == 19 || type == 14 ? KIND_BUFFER
-            : type == OBJ_TEXTURE || type == OBJ_LINEAR_TEXTURE || type == 9 || type == OBJ_MAPPED_TEXTURE ? KIND_TEXTURE
+            : type == OBJ_TEXTURE || type == 3 || type == OBJ_LINEAR_TEXTURE || type == 9 || type == OBJ_MAPPED_TEXTURE ? KIND_TEXTURE
             : type == OBJ_FUNCTION ? KIND_FUNCTION
             : type == 13 ? KIND_HEAP : KIND_NONE;
     if (o->kind == KIND_NONE) o->object = nil;
@@ -5112,6 +5113,20 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
             @try {
                 if ((op == 0x43 || op == 0x45) && n >= 12) {
                     gpu_completes = [r exec:args length:n channel:ch stamp:cmd[2]];
+                } else if (op == 0x37 && n >= 12) {
+                    /* macOS 13's driver: the same work with 24-byte resource entries ({ref, flags} and four more words)
+                       before the 16-byte buffers. Put it in 0x43's shape: {task, resources, buffers, {ref, flags}..., buffers...}. */
+                    uint32_t nres = args[1], nbuf = args[2];
+                    if (12 + nres * 24ull + nbuf * 16ull <= n && nres < 65536 && nbuf < 65536) {
+                        uint32_t len43 = 12 + nres * 8 + nbuf * 16, *a43 = malloc(len43);
+                        if (a43) {
+                            a43[0] = args[0], a43[1] = nres, a43[2] = nbuf;
+                            for (uint32_t i = 0; i < nres; i++) a43[3 + i * 2] = args[3 + i * 6], a43[4 + i * 2] = args[4 + i * 6];
+                            memcpy(a43 + 3 + nres * 2, args + 3 + nres * 6, nbuf * 16ull);
+                            gpu_completes = [r exec:a43 length:len43 channel:ch stamp:cmd[2]];
+                            free(a43);
+                        }
+                    } else [r complain:[NSString stringWithFormat:@"command 0x37 of %u bytes: %u resources, %u buffers do not fit", n, nres, nbuf]];
                 } else if (forget_deleted(r, op, args, n)) {
                 } else if (op == 0x35 || op == 0x3e) {
                     [r synchronize:args length:n];
