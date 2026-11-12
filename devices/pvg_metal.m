@@ -2215,8 +2215,13 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
                 o->object = [device newTextureWithDescriptor:t iosurface:v->iosurface plane:(NSUInteger)plane];
             }
         }
-    } else if (surface->object && linear_texture_fits(device, t, surface->first, surface->row, [(id<MTLBuffer>)surface->object length]))
-        o->object = [(id<MTLBuffer>)surface->object newTextureWithDescriptor:t offset:surface->first bytesPerRow:surface->row];
+    if (!o->object && surface->object) {
+        NSUInteger req_row = surface->row >= t.width * pixel_bytes(t.pixelFormat) ? surface->row : t.width * pixel_bytes(t.pixelFormat);
+        NSUInteger align = [device minimumLinearTextureAlignmentForPixelFormat:t.pixelFormat];
+        if (align && (req_row % align)) req_row = (req_row + align - 1) & ~(align - 1);
+        if (linear_texture_fits(device, t, surface->first, req_row, [(id<MTLBuffer>)surface->object length]))
+            o->object = [(id<MTLBuffer>)surface->object newTextureWithDescriptor:t offset:surface->first bytesPerRow:req_row];
+    }
     if (!o->object) {
         [self complain:[NSString stringWithFormat:@"surface %llu: format %lu row %llu not possible", h.mapping, (unsigned long)t.pixelFormat, surface->row]];
         t.storageMode = MTLStorageModePrivate;
@@ -5369,7 +5374,11 @@ static BOOL presenter_commit(HvReplay *r, uint64_t generation, CAMetalLayer *tar
                 CFTimeInterval at = d.presentedTime; /* host time, as CLOCK_UPTIME_RAW */
                 hv_frame_presented(at > 0 ? (uint64_t)(at * 1e9) : 0, swap_ns);
             }];
-        [cb presentDrawable:drawable];
+        if ([cb respondsToSelector:@selector(presentDrawable:afterMinimumDuration:)]) {
+            [cb presentDrawable:drawable afterMinimumDuration:1.0 / 60.0];
+        } else {
+            [cb presentDrawable:drawable];
+        }
         r->gpu_frames++;
     } else {
         r->screen_dirty = YES; /* drawn again, for the new target */

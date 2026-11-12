@@ -880,11 +880,13 @@ static int editability(AXUIElementRef e, BOOL *secure, NSString **role, NSString
         return EDIT_UNKNOWN;
     }
     v = NULL;
-    error = AXUIElementCopyAttributeValue(e, kAXSubroleAttribute, &v);
-    if (unsure(error)) {
-        if (v) CFRelease(v);
-        *why = [NSString stringWithFormat:@"%@'s subrole %@", r, axSaid(error)];
-        return EDIT_UNKNOWN;
+    if (![r isEqualToString:@"AXWebArea"]) {
+        error = AXUIElementCopyAttributeValue(e, kAXSubroleAttribute, &v);
+        if (unsure(error)) {
+            if (v) CFRelease(v);
+            *why = [NSString stringWithFormat:@"%@'s subrole %@", r, axSaid(error)];
+            return EDIT_UNKNOWN;
+        }
     }
     NSString *subrole = nil;
     if (v && CFGetTypeID(v) == CFStringGetTypeID()) subrole = CFBridgingRelease(v);

@@ -575,11 +575,22 @@ static int init_rest(HvMachine *m) {
 }
 
 __thread HvCpu *hv_self;
+static void ack_wake(HvPerCpu *p);
 
 void hv_dev_lock(HvMachine *m) {
     if (pthread_mutex_trylock(&m->dev_mu) == 0) return;
+    HvCpu *cpu = hv_self;
+    HvPerCpu *p = cpu ? cpu->pc_state : NULL;
     uint64_t t0 = mach_absolute_time(); /* always: the freeze records show who waits for the device lock */
+    if (p) {
+        __atomic_store_n(&p->tlb_live, 0, __ATOMIC_SEQ_CST); /* others need not wait for this one meanwhile */
+        ack_wake(p);
+    }
     pthread_mutex_lock(&m->dev_mu);
+    if (p) {
+        __atomic_store_n(&p->tlb_live, 1, __ATOMIC_SEQ_CST);
+        hv_cpu_process_requests(cpu); /* anything that came in while we were not live */
+    }
     HV_STAT_ADD(m, dev_waits, 1);
     HV_STAT_ADD(m, dev_wait_ticks, mach_absolute_time() - t0);
 }

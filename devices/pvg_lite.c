@@ -1252,8 +1252,9 @@ static void vblank(HvPvgLite *p) {
     static uint64_t period, next;
     if (!env_checked) {
         env_checked = 1;
+        p->vblank_on = 1;
         const char *e = getenv("HV_PVG_VBLANK");
-        if (e && atoi(e)) p->vblank_on = 1;
+        if (e && !atoi(e)) p->vblank_on = 0;
         const char *hz = getenv("HV_HZ");
         uint64_t r = hz && atoi(hz) > 0 ? (uint64_t)atoi(hz) : 60;
         period = 24000000ull / r; /* host counter ticks (24 MHz) */
