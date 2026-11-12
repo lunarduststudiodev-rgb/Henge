@@ -734,6 +734,7 @@ static int clipboard_put(Conn *c, Request *r) {
 
 static pthread_mutex_t link_mu = PTHREAD_MUTEX_INITIALIZER;
 static int link_fd = -1;
+static int system_fd = -1;
 /* Which link it is: a new number for each (never 0), 0 while there is none. Under link_mu. The benchmark's lines and
    its "failed gone" carry it, so a run hears only the link it was asked on. */
 static unsigned link_id, link_ids;
@@ -1693,7 +1694,6 @@ static int touch_link(Conn *c, Request *r) {
                                    in the shared folder, and note what each kind of HID client sees of the touchscreen's
                                    tag: a test, sent only with HENGE_TOUCH_TRACE=1 (henge-env.txt) (version 29) */
 
-static int system_fd = -1;
 static int system_trusted; /* the linked system part has this Mac's key */
 static int system_session = HV_SESSION_UNKNOWN;
 static int system_touchscreen = -1;
