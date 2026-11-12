@@ -221,6 +221,9 @@ void hv_pvg_metal_test_gpu_failed(HvPvgMetal *m, long code);
 uint64_t hv_pvg_metal_test_indirect(HvPvgMetal *m, void *jobs, uint32_t max, uint32_t *n);
 HvPvgMetal *hv_pvg_lite_metal(HvPvgLite *p);
 void hv_pvg_lite_barrier_stats(HvPvgLite *p, uint64_t out[4]);
+void hv_pvg_lite_set_vblank(HvPvgLite *p, int on);
+#include <stdio.h>
+void hv_pvg_lite_debug(HvPvgLite *p, FILE *f);
 /* The display's shared state page, or NULL before the guest named it. */
 const uint8_t *hv_pvg_lite_display_page(HvPvgLite *p);
 /* A command the Metal side hands back in order (display ones): 0 for a display command not taken (shorter than

@@ -114,6 +114,7 @@ typedef struct HvCpu {
     uint64_t xjump_thunk;    /* 0x4e0: hv_xjump_thunk */
     uint64_t tcr_el1;        /* 0x4e8: here, in reach of one load, for translated MRS (xnu reads it ~17K times a second at login) */
     uint64_t par_el1;        /* 0x4f0: likewise, read after each AT */
+    uint64_t mpidr_el1;      /* 0x4f8: banked MPIDR_EL1 for fast translated MRS read */
     /* 0x500: what tags in the return tables (ret_tab) are xored with, [0] user, [1] kernel.
        Bits 63..48, as ijc_salt; a new value empties that half of the tables. */
     uint64_t ret_salt[2] __attribute__((aligned(128)));
@@ -267,6 +268,7 @@ typedef struct HvCpu {
 #define HV_CPU_XJUMP_THUNK 0x4e0
 #define HV_CPU_TCR_EL1     0x4e8
 #define HV_CPU_PAR_EL1     0x4f0
+#define HV_CPU_MPIDR_EL1   0x4f8
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
    indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
@@ -297,6 +299,7 @@ _Static_assert(offsetof(HvCpu, gaddend) == HV_CPU_GADDEND, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, xjump_thunk) == HV_CPU_XJUMP_THUNK, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, tcr_el1) == HV_CPU_TCR_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, par_el1) == HV_CPU_PAR_EL1, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, mpidr_el1) == HV_CPU_MPIDR_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, tpidr_el0) == HV_CPU_TPIDR_EL0, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, daif) == HV_CPU_DAIF, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, far_el1) == HV_CPU_FAR_EL1, "HvCpu layout");

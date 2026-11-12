@@ -10,6 +10,10 @@ enum EngineTuning {
     static let fastFlushKey = "henge.perf.fastFlush"
     static let highPriorityKey = "henge.perf.highPriority"
     static let balloonKey = "henge.memory.balloon"
+    static let writeCacheKey = "henge.perf.writeCache"
+    static let wfeSpinKey = "henge.perf.wfeSpin"
+    static let tlbtKey = "henge.perf.tlbt"
+    static let lightUIKey = "henge.perf.lightUI"
 
     static let defaults: [String: String] = [
         // 60, not 120: every frame macOS draws is emulated and replayed, so 120 Hz
@@ -17,6 +21,8 @@ enum EngineTuning {
         "HV_HZ": "60",         // the refresh rate macOS is told its display has
         "HV_WFI_SPIN": "50",   // microseconds an idle CPU watches for work before sleeping (1-cycle cntvct_el0)
         "HV_FLUSH": "2",       // disk flush: F_BARRIERFSYNC, ordered but without a full fsync
+        "HV_WRITE_CACHE": "1", // host disk write caching: avoids 2-3x F_NOCACHE penalty
+        "HV_TLBT": "1",        // table-major TLB layout: 9-20% faster in benchmarks
         // No HV_STATS: the engine's detailed statistics (a stats block in the log every N seconds, and the extra
         // probes behind it) are for diagnosis, opted into with HV_STATS=10 in henge-env.txt. The counters the
         // freeze and lag records use are counted per CPU without it.
@@ -36,6 +42,10 @@ enum EngineTuning {
         // The Mac's CPU threads at the user-interactive class instead of user-initiated (host/vm.c hv_vm_cpu_qos).
         if d.bool(forKey: highPriorityKey) { env["HV_QOS"] = "ui" } else { unsetenv("HV_QOS") }
         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }
+        if d.object(forKey: writeCacheKey) as? Bool == false { env["HV_WRITE_CACHE"] = "0" }
+        if d.bool(forKey: wfeSpinKey) { env["HV_WFE_SPIN"] = "1" } else { unsetenv("HV_WFE_SPIN") }
+        if d.object(forKey: tlbtKey) as? Bool == false { env["HV_TLBT"] = "0" }
+        if d.object(forKey: lightUIKey) as? Bool == false { unsetenv("HV_LIGHT_UI") } else { env["HV_LIGHT_UI"] = "1" }
         // The Mac gets a memory balloon, asking for nothing yet: MemoryWatch asks when iPadOS runs short.
         if d.bool(forKey: balloonKey) { env["HV_BALLOON"] = "0" } else { unsetenv("HV_BALLOON") }
         let docs = EnvFile.documents

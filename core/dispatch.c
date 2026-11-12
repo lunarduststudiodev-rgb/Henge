@@ -1461,7 +1461,7 @@ uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info_in) {
     uint32_t r = helper(cpu, info_in);
     /* An exception just taken (an abort, an undefined instruction, a trap): its
        vector's block, as after an SVC. */
-    if (r && cpu->exit_reason == HV_EXIT_EXCEPTION) {
+    if (r && !cpu->off && cpu->exit_reason == HV_EXIT_EXCEPTION) {
         void *code = fast_resume(cpu);
         if (code) {
             cpu->helper_ret = (uint64_t)(uintptr_t)code;
@@ -2456,7 +2456,7 @@ static int run_loop(HvCpu *cpu, int one) {
     hv_self = cpu;
     unpark(cpu);
     for (;;) {
-        if (__atomic_load_n(&m->flush_pending, __ATOMIC_SEQ_CST) || __atomic_load_n(&m->stw_active, __ATOMIC_SEQ_CST)) {
+        if (__builtin_expect(__atomic_load_n(&m->flush_pending, __ATOMIC_ACQUIRE) || __atomic_load_n(&m->stw_active, __ATOMIC_ACQUIRE), 0)) {
             stop_the_world(cpu);
             pending_chain = NULL;
             prev_b = NULL;
@@ -2469,7 +2469,8 @@ static int run_loop(HvCpu *cpu, int one) {
             pending_chain = NULL;
             prev_b = NULL;
         }
-        hv_cpu_process_requests(cpu);
+        if (__builtin_expect(cpu->pc_state && __atomic_load_n(&cpu->pc_state->req_seq, __ATOMIC_ACQUIRE) != __atomic_load_n(&cpu->pc_state->ack_seq, __ATOMIC_RELAXED), 0))
+            hv_cpu_process_requests(cpu);
         if (cpu->halted) return HV_EXIT_HALT;
         if (__atomic_load_n(&m->pause_req, __ATOMIC_ACQUIRE)) {
             pause_gate(cpu); /* comes back resumed, or halted */
@@ -2490,7 +2491,8 @@ static int run_loop(HvCpu *cpu, int one) {
            just now would leave the request waiting for some later kick (a TLBI's sender
            spins on it meanwhile, and a branch-cache reset could be missed): look again
            now that the kick is consumed. It costs one load when nothing is queued. */
-        if (kicked) hv_cpu_process_requests(cpu);
+        if (kicked && cpu->pc_state && __atomic_load_n(&cpu->pc_state->req_seq, __ATOMIC_ACQUIRE) != __atomic_load_n(&cpu->pc_state->ack_seq, __ATOMIC_RELAXED))
+            hv_cpu_process_requests(cpu);
         if (kicked && m->big_lock_on) {
             /* Give another CPU its turn. Whatever it does in between may touch
                what this CPU's exclusive monitor watches, so the monitor clears. */
@@ -2564,7 +2566,8 @@ static int run_loop(HvCpu *cpu, int one) {
         last_fault = ~0ull;
         uint32_t gen0 = __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST);
         int once;
-        HvBlock *b = lookup(cpu, cpu->pc, pa, block_flags(cpu), code, avail, &once);
+        uint32_t flags = (pending_chain && cpu->pc == chain_pc) ? chain_flags : block_flags(cpu);
+        HvBlock *b = lookup(cpu, cpu->pc, pa, flags, code, avail, &once);
         if (__builtin_expect(m->gen_checks, 0)) found_unchained = b; /* park checks the rule at the chain below */
         if (!b) {
             found_unchained = NULL;

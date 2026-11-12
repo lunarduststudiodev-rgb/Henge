@@ -22,8 +22,10 @@ void hv_pace_note(HvPace *p, uint64_t now_ns) {
     if (last && now_ns > last) {
         uint64_t gap = now_ns - last, ms = gap / 1000000;
         atomic_fetch_add_explicit(&p->gaps[ms < HV_PACE_BUCKETS - 1 ? ms : HV_PACE_BUCKETS - 1], 1, memory_order_relaxed);
-        if (gap > atomic_load_explicit(&p->longest_ns, memory_order_relaxed))
-            atomic_store_explicit(&p->longest_ns, gap, memory_order_relaxed);
+        uint64_t longest = atomic_load_explicit(&p->longest_ns, memory_order_relaxed);
+        while (gap > longest &&
+               !atomic_compare_exchange_weak_explicit(&p->longest_ns, &longest, gap, memory_order_relaxed, memory_order_relaxed)) {
+        }
     }
     atomic_fetch_add_explicit(&p->frames, 1, memory_order_release);
 }
@@ -92,8 +94,10 @@ void hv_frame_presented(uint64_t shown_ns, uint64_t swap_ns) {
     if (swap_ns && shown_ns > swap_ns) {
         uint64_t d = shown_ns - swap_ns, ms = d / 1000000;
         atomic_fetch_add_explicit(&hv_frame_flow.delay[ms < HV_PACE_BUCKETS - 1 ? ms : HV_PACE_BUCKETS - 1], 1, memory_order_relaxed);
-        if (d > atomic_load_explicit(&hv_frame_flow.longest_delay_ns, memory_order_relaxed))
-            atomic_store_explicit(&hv_frame_flow.longest_delay_ns, d, memory_order_relaxed);
+        uint64_t longest = atomic_load_explicit(&hv_frame_flow.longest_delay_ns, memory_order_relaxed);
+        while (d > longest &&
+               !atomic_compare_exchange_weak_explicit(&hv_frame_flow.longest_delay_ns, &longest, d, memory_order_relaxed, memory_order_relaxed)) {
+        }
         atomic_fetch_add_explicit(&hv_frame_flow.delays, 1, memory_order_release);
     }
     os_unfair_lock_unlock(&lock);

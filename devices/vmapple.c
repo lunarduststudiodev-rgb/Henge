@@ -426,6 +426,7 @@ void hv_vmapple_reset_cpu(HvVmapple *b) {
         HvCpu *c = &b->cpu[i];
         hv_cpu_reset_index(c, b->m, (uint32_t)i);
         c->mpidr = 0x80000000u | (uint32_t)i; /* Aff0 = the config's cpu_ids[i], bit 31 RES1 */
+        c->mpidr_el1 = c->mpidr;
         c->pc = VMAPPLE_FIRMWARE;
         c->off = i != 0; /* secondaries wait for PSCI CPU_ON */
     }

@@ -22,16 +22,18 @@ static int granule_bits(uint32_t tg, int ttbr1) {
 /* This file is built with -mgeneral-regs-only, and the walk and the TLB fill
    call nothing in libc: hv_tlb_refill runs them from translated code without
    saving the guest's SIMD registers, which libc's memory routines would use. */
-static HvRam *ram_of(HvMachine *m, uint64_t pa) {
+static inline HvRam *ram_of(HvMachine *m, uint64_t pa) {
+    if (__builtin_expect(m->main_ram && pa - m->main_ram->pa < m->main_ram->size, 1))
+        return m->main_ram;
     for (int i = 0; i < m->nram; i++)
         if (pa - m->ram[i].pa < m->ram[i].size) return &m->ram[i];
     return NULL;
 }
 
 /* A descriptor: RAM, 8 bytes, aligned. Device memory as a page table is not supported. */
-static int read_desc(HvMachine *m, uint64_t pa, uint64_t *out) {
+static inline int read_desc(HvMachine *m, uint64_t pa, uint64_t *out) {
     HvRam *r = ram_of(m, pa);
-    if (!r || pa + 8 - r->pa > r->size) return -1;
+    if (__builtin_expect(!r || pa + 8 - r->pa > r->size, 0)) return -1;
     *out = __atomic_load_n((const uint64_t *)(const void *)(r->host + (pa - r->pa)), __ATOMIC_RELAXED);
     return 0;
 }
@@ -939,17 +941,29 @@ static HvRam *ram_of_host(HvMachine *m, const uint8_t *host);
 uint32_t hv_mmu_access(HvCpu *cpu, uint64_t va, HvAccess acc, int el, uint64_t *pa) {
     /* The TLB entry first, as translated code trusts it: slow paths that are slow for another reason (a page's
        last bytes, the access kind) need no walk (macOS 27: 100-250K a second). */
-    if (acc != HV_ACC_EXEC && cpu->m) {
+    if (cpu->m) {
         unsigned bits;
         int table = hv_tlb_where(cpu, va, el, &bits);
         const HvTlbEntry *e = hv_tlb_at(cpu, va, table, bits);
-        uint64_t tag = acc == HV_ACC_WRITE ? e->write_tag : e->read_tag;
-        if (tag != HV_TLB_INVALID && tag + HV_TLB_ADJ == (va & ~((1ull << bits) - 1))) {
-            const uint8_t *host = (const uint8_t *)(uintptr_t)(va + (uint64_t)e->addend);
-            HvRam *ram = ram_of_host(cpu->m, host);
-            if (ram) {
-                *pa = ram->pa + (uint64_t)(host - ram->host);
-                return 0;
+        if (acc == HV_ACC_EXEC) {
+            uint64_t page_va = va & ~((1ull << bits) - 1);
+            if (e->exec_tag != HV_TLB_INVALID && e->exec_tag == hv_exec_key(page_va, e->addend)) {
+                const uint8_t *host = (const uint8_t *)(uintptr_t)(va + (uint64_t)e->addend);
+                HvRam *ram = ram_of_host(cpu->m, host);
+                if (ram) {
+                    *pa = ram->pa + (uint64_t)(host - ram->host);
+                    return 0;
+                }
+            }
+        } else {
+            uint64_t tag = acc == HV_ACC_WRITE ? e->write_tag : e->read_tag;
+            if (tag != HV_TLB_INVALID && tag + HV_TLB_ADJ == (va & ~((1ull << bits) - 1))) {
+                const uint8_t *host = (const uint8_t *)(uintptr_t)(va + (uint64_t)e->addend);
+                HvRam *ram = ram_of_host(cpu->m, host);
+                if (ram) {
+                    *pa = ram->pa + (uint64_t)(host - ram->host);
+                    return 0;
+                }
             }
         }
     }
@@ -1087,6 +1101,13 @@ const uint32_t *hv_mmu_fetch(HvCpu *cpu, uint64_t va, uint64_t *pa, uint32_t *av
     HvTlbEntry *t = hv_tlb_at(cpu, va, table, bits);
     if (t->exec_tag == hv_exec_key(va & ~((1ull << bits) - 1), t->addend)) {
         uint8_t *host = (uint8_t *)(uintptr_t)(va + t->addend);
+        HvRam *main_r = cpu->m->main_ram;
+        if (__builtin_expect(main_r && (uint64_t)(host - main_r->host) < main_r->size, 1)) {
+            *pa = main_r->pa + (uint64_t)(host - main_r->host);
+            uint64_t page = 1ull << hv_code_page_bits(cpu, va);
+            *avail = (uint32_t)((page - (va & (page - 1))) / 4);
+            return (const uint32_t *)host;
+        }
         for (int i = 0; i < cpu->m->nram; i++) {
             HvRam *r = &cpu->m->ram[i];
             if ((uint64_t)(host - r->host) < r->size) {
@@ -1358,9 +1379,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
         if (m->stats_interval) HV_CPU_COUNT(cpu, light_walks, 1);
     }
     const uint8_t *host = (const uint8_t *)(uintptr_t)(va + (uint64_t)e->addend);
-    HvRam *ram = NULL;
-    for (int i = 0; i < m->nram; i++)
-        if ((uint64_t)(host - m->ram[i].host) < m->ram[i].size) ram = &m->ram[i];
+    HvRam *ram = ram_of_host(m, host);
     if (!ram) return 0;
     uint64_t pa = ram->pa + (uint64_t)(host - ram->host);
     uint32_t gen = __atomic_load_n(&ram->page_gen[(pa - ram->pa) >> HV_RAM_PAGE_BITS], __ATOMIC_ACQUIRE);
@@ -1480,7 +1499,9 @@ static int user_entry(const HvTlbEntry *e) {
     return !((tag >> 55) & 1);
 }
 
-static HvRam *ram_of_host(HvMachine *m, const uint8_t *host) {
+static inline HvRam *ram_of_host(HvMachine *m, const uint8_t *host) {
+    if (__builtin_expect(m->main_ram && (uint64_t)(host - m->main_ram->host) < m->main_ram->size, 1))
+        return m->main_ram;
     for (int i = 0; i < m->nram; i++)
         if ((uint64_t)(host - m->ram[i].host) < m->ram[i].size) return &m->ram[i];
     return NULL;

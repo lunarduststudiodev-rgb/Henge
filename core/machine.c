@@ -879,6 +879,8 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
 }
 
 HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
+    if (__builtin_expect(m->main_ram && pa - m->main_ram->pa < m->main_ram->size, 1))
+        return m->main_ram;
     for (int i = 0; i < m->nram; i++) {
         HvRam *r = &m->ram[i];
         if (pa - r->pa < r->size) return r;
@@ -1282,6 +1284,7 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     cpu->spsel = 1;
     cpu->daif = HV_PSTATE_DAIF;
     cpu->excl_addr = ~0ull;
+    cpu->mpidr_el1 = cpu->mpidr ? cpu->mpidr : (0x80000000u | (uint32_t)index);
     /* Architectural reset value has the MMU and caches off; RES1 bits set. */
     cpu->sctlr_el1 = 0x30d00980; /* RES1 bits, and ITD and SED, which read as 1 without AArch32 at EL0 */
     hv_tlb_flush(cpu); /* the TLB as above: this writes none of it */

@@ -20,11 +20,33 @@
 #include <sys/utsname.h>
 #include <sys/sysctl.h>
 
+static inline BOOL cursor_sharp_cached(void) {
+    static int cached = -1;
+    static uint64_t last_check = 0;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (cached < 0 || (now - last_check) > 1000000000ull) { /* refresh at most once a second */
+        last_check = now;
+        NSNumber *s = [[NSUserDefaults standardUserDefaults] objectForKey:@"henge.cursor.sharp"];
+        cached = s ? s.boolValue : 1;
+    }
+    return cached != 0;
+}
+
 /* 1080p shrunk onto a phone would make a normal pointer a few dots across; an iPad's screen needs less. */
 static int cursor_scale(void) {
 #if TARGET_OS_IPHONE
+    static int cached_scale = -1;
+    static uint64_t last_scale_check = 0;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (cached_scale > 0 && (now - last_scale_check) <= 1000000000ull) {
+        return cached_scale;
+    }
+    last_scale_check = now;
     NSInteger saved = [[NSUserDefaults standardUserDefaults] integerForKey:@"henge.cursor.scale"];
-    if (saved >= 1 && saved <= 3) return (int)saved;
+    if (saved >= 1 && saved <= 3) {
+        cached_scale = (int)saved;
+        return cached_scale;
+    }
     static int defaultScale;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -32,7 +54,8 @@ static int cursor_scale(void) {
         uname(&u);
         defaultScale = strncmp(u.machine, "iPad", 4) ? 3 : 1;
     });
-    return defaultScale;
+    cached_scale = defaultScale;
+    return cached_scale;
 #else
     return 1;
 #endif
@@ -553,6 +576,7 @@ static void over_surface(HvObject *o) {
     /* presenter only: fitting a screen of another size to the layer's pixels (resample_h into resample_mid, then resample_v) */
     id<MTLRenderPipelineState> resample_h8, resample_h16, resample_v;
     id<MTLTexture> resample_mid;
+    MTLRenderPassDescriptor *screen_pass, *resample_pass;
     uint32_t resample_logged_w, resample_logged_h;
     uint64_t on_screen; /* the mapping showing */
     _Atomic uint64_t gpu_frames;
@@ -3728,7 +3752,7 @@ static void late_probe(HvReplay *r, const char *what, uint32_t ch, double commit
 - (void)afterGPU:(void (^)(void))then {
     for (id<MTLCommandBuffer> cb = nil;;) {
         os_unfair_lock_lock(&screen_lock); /* the presenter commits under it: none of its work is missed in between */
-        if (presenter_drawing) {
+        if (presenter_drawing || presenter_running || screen_dirty) {
             if (!present_then) present_then = [NSMutableArray new];
             [present_then addObject:[then copy]];
             os_unfair_lock_unlock(&screen_lock);
@@ -3764,17 +3788,21 @@ static Rec rec_at(const uint8_t *p, uint32_t size, uint8_t pad[REC_PAD]) {
     return (Rec){pad, size};
 }
 
-/* Whether the object is the surface on screen, or made from it (a view, a texture over its buffer) */
-- (BOOL)isShown:(HvObject *)o {
-    os_unfair_lock_lock(&screen_lock);
-    id<MTLTexture> shown = screen_tex;
-    os_unfair_lock_unlock(&screen_lock);
+- (BOOL)isObject:(HvObject *)o matchShown:(id<MTLTexture>)shown {
     if (!shown) return NO;
     for (; o; o = o->parent) {
         if (o->object == shown || o->scanout == shown) return YES;
         if (o->surface && (o->surface->scanout == shown || o->surface->object == shown)) return YES;
     }
     return NO;
+}
+
+/* Whether the object is the surface on screen, or made from it (a view, a texture over its buffer) */
+- (BOOL)isShown:(HvObject *)o {
+    os_unfair_lock_lock(&screen_lock);
+    id<MTLTexture> shown = screen_tex;
+    os_unfair_lock_unlock(&screen_lock);
+    return [self isObject:o matchShown:shown];
 }
 
 /* This exec's work (hv_pvg_command_work's units), taken from its budget: NO once it is past HV_PVG_EXEC_WORK, and
@@ -4054,6 +4082,9 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = nil;
     BOOL sync_after = NO, redraw = NO;
+    os_unfair_lock_lock(&screen_lock);
+    id<MTLTexture> current_shown = screen_tex;
+    os_unfair_lock_unlock(&screen_lock);
     NSMutableArray<HvVideo *> *video = nil; /* the video surfaces this exec uses: it is their newest reader */
     NSMutableArray<HvObject *> *video_by = nil; /* a mapping of each that it names */
     NSMutableData *video_flags = nil; /* and all the flags it names it with, through any of them (uint32_t each) */
@@ -4087,7 +4118,7 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
             o->host_valid = YES;
         }
         if (flags & 4) sync_after = YES;
-        if ((flags & 2) && !redraw) redraw = [self isShown:o];
+        if ((flags & 2) && !redraw && current_shown) redraw = [self isObject:o matchShown:current_shown];
     }
     /* Each video surface once, whatever mappings of it the exec names with what: the guest's writing up, and only then
        is the GPU's drawing the newer (a mapping written by the guest after one drawn into would otherwise have the
@@ -4476,6 +4507,16 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         cursor_sampler = [device newSamplerStateWithDescriptor:sd];
         if (!screen_pipe || !linear_pipe || !cursor_pipe || !screen_sampler || !cursor_sampler || !resample_v || !resample_h8 || !resample_h16) { [self complain:[NSString stringWithFormat:@"screen pipelines: %@", err.localizedDescription]]; return NO; }
     }
+    if (!screen_pass) {
+        screen_pass = [MTLRenderPassDescriptor new];
+        screen_pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        screen_pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+    if (!resample_pass) {
+        resample_pass = [MTLRenderPassDescriptor new];
+        resample_pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        resample_pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
     // Pipelines are shared, but a newly connected monitor has a fresh layer.
     if (prepared_layer != target) {
         [CATransaction begin];
@@ -4596,7 +4637,10 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
         if (![self prepareScreenForLayer:target]) {
             os_unfair_lock_lock(&screen_lock);
             BOOL changed = layer_generation != generation;
-            if (!changed) presenter_running = NO;
+            if (!changed) {
+                presenter_running = NO;
+                [self drainPresentThen];
+            }
             os_unfair_lock_unlock(&screen_lock);
             if (changed) continue;
             return;
@@ -4648,6 +4692,7 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
                     // A fresh frame/cursor event received while nextDrawable waited
                     // must not lose its wakeup at the transition into cooldown.
                     if (screen_requests != requests) [self kickPresenter:YES];
+                    else [self drainPresentThen];
                 } else {
                     // A monitor can connect before its first drawable is available.
                     // Retry even if the guest is idle, but never poll a hidden target forever.
@@ -4674,7 +4719,7 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
         const BOOL made_half = half; /* what is made here is for this format: the pick goes round again if it changed */
         id<MTLTexture> mid = fit ? make_resample_mid(self, DW, H, made_half) : nil;
         const float scale = cursor_scale();
-        NSNumber *sharpSetting = [[NSUserDefaults standardUserDefaults] objectForKey:@"henge.cursor.sharp"];
+        const BOOL sharp = cursor_sharp_cached();
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         os_unfair_lock_lock(&screen_lock);
         tex = screen_tex, half = screen_half, ctex = cursor_tex, shown = cursor_shown, hidden = pointer_hidden;
@@ -4698,7 +4743,7 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
         float rect[4] = {-1, -1, 2, 2};
         if (fit && !mid) fit = NO; /* made before the pick, for the same format (nothing is made in the hold); none (no memory for it): the screen is drawn straight into the drawable, stretched by its sampler */
         if (fit) {
-            MTLRenderPassDescriptor *across = [MTLRenderPassDescriptor renderPassDescriptor];
+            MTLRenderPassDescriptor *across = resample_pass ?: [MTLRenderPassDescriptor renderPassDescriptor];
             across.colorAttachments[0].texture = mid;
             across.colorAttachments[0].loadAction = MTLLoadActionDontCare;
             across.colorAttachments[0].storeAction = MTLStoreActionStore;
@@ -4712,7 +4757,7 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
             [a drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
             [a endEncoding];
         }
-        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        MTLRenderPassDescriptor *pass = screen_pass ?: [MTLRenderPassDescriptor renderPassDescriptor];
         pass.colorAttachments[0].texture = drawable.texture;
         pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
@@ -4747,7 +4792,7 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
             [e setVertexBytes:r length:sizeof r atIndex:0];
             [e setFragmentTexture:ctex atIndex:0];
             /* Sharp is pixel for pixel; fitted to another size, that would leave it ragged. */
-            [e setFragmentSamplerState:fit || (sharpSetting && !sharpSetting.boolValue) ? screen_sampler : cursor_sampler atIndex:0];
+            [e setFragmentSamplerState:fit || !sharp ? screen_sampler : cursor_sampler atIndex:0];
             [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         }
         [e endEncoding];
@@ -5184,9 +5229,9 @@ static BOOL presenter_commit(HvReplay *r, uint64_t generation, CAMetalLayer *tar
         r->screen_dirty = YES; /* drawn again, for the new target */
         [r keepWaitingSwap:swap_ns];
     }
-    [cb commit]; /* either way */
     const uint64_t hold_ns = stage_now() - take_from;
     os_unfair_lock_unlock(&r->screen_lock);
+    [cb commit]; /* either way - outside lock to prevent worker and UI stall */
     [r noteHold:hold_ns];
     return same;
 }

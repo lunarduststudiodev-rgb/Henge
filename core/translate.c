@@ -1698,6 +1698,58 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
     case SR(3, 3, 4, 2, 6): /* SSBS */
         put_pstate_bit(e, rt, reg == SR(3, 3, 4, 2, 5) ? 24 : 12, read);
         return 1;
+    case SR(3, 3, 0, 0, 7): /* DCZID_EL0: constant 4 for both EL0 and EL1 */
+        if (!read) return 0;
+        put_const_to(e, rt, 4);
+        return 1;
+    case SR(3, 3, 0, 0, 1): /* CTR_EL0: constant in EL1 */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, CTR_EL0);
+        return 1;
+    case SR(3, 3, 14, 0, 0): /* CNTFRQ_EL0: constant in EL1 */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, CNTFRQ);
+        return 1;
+    case SR(3, 0, 0, 0, 0): /* MIDR_EL1 */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, MIDR);
+        return 1;
+    case SR(3, 0, 0, 0, 5): /* MPIDR_EL1 */
+        if (!read || !el1) return 0;
+        put_load_field(e, rt, HV_CPU_MPIDR_EL1);
+        return 1;
+    case SR(3, 0, 0, 0, 6): /* REVIDR_EL1 */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, 0);
+        return 1;
+    case SR(3, 0, 0, 4, 0): /* ID_AA64PFR0_EL1 */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, ID_AA64PFR0);
+        return 1;
+    case SR(3, 0, 0, 5, 0): /* ID_AA64DFR0_EL1 */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, ID_AA64DFR0);
+        return 1;
+    case SR(3, 0, 0, 6, 0): /* ID_AA64ISAR0_EL1 */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, e->m->rosetta ? ID_AA64ISAR0_ROSETTA : ID_AA64ISAR0);
+        return 1;
+    case SR(3, 0, 0, 6, 1): /* ID_AA64ISAR1_EL1 */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, ID_AA64ISAR1);
+        return 1;
+    case SR(3, 0, 0, 7, 0): /* ID_AA64MMFR0_EL1 */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, ID_AA64MMFR0);
+        return 1;
+    case SR(3, 0, 0, 7, 1): /* ID_AA64MMFR1_EL1 */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, ID_AA64MMFR1 | (e->m->rosetta ? 1ull << 44 : 0));
+        return 1;
+    case SR(3, 1, 0, 0, 1): /* CLIDR_EL1 */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, CLIDR);
+        return 1;
     default:
         return 0;
     }
@@ -1854,7 +1906,8 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
     case HV_INSN_BARRIER: {
         uint32_t op2 = (insn >> 5) & 7;
         if (op2 == 2) {
-            put_helper(e, pc, insn, HV_OP_CLREX);
+            put(e, 0x92800006u);                                   /* movn x6, #0 */
+            put(e, STR_X(6, 28, HV_CPU_EXCL_ADDR));
             return 0;
         }
         if (op2 == 6) { /* ISB: later instructions must see earlier system register writes */

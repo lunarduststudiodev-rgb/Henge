@@ -31,6 +31,7 @@
    Ring entries are {op (1 map, 2 unmap, 3 test), mapping id, result, 0}. */
 
 #include <unistd.h>
+#include <mach/mach_time.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <os/lock.h>
 #include <stdatomic.h>
@@ -97,6 +98,8 @@ struct HvPvgLite {
     _Atomic(HvPvgMetal *) metal; /* release-published after the cached layer is applied */
     int metal_tried;
     uint32_t stamps_pending; /* channels Metal finished, for the next poll */
+    uint64_t vblanks;        /* refresh events sent (HV_PVG_VBLANK) */
+    int vblank_on;           /* enabled via HV_PVG_VBLANK or hv_pvg_lite_set_vblank */
     /* The mapper: io_regs[0x20 / 8] (completed) is read and written atomically, for the GPU's completion
        publishes it. mapper_rp: the next entry to walk; mapper_fenced: the index the last fence will complete;
        mapper_gen: bumped whenever the guest restarts the ring (or a snapshot loads), so a fence asked for
@@ -1216,6 +1219,37 @@ void hv_pvg_lite_mapper_done(HvPvgLite *p, uint64_t index, uint64_t gen) {
 /* Device work no doorbell took care of: a channel that had to wait for another one's work. */
 /* Also work the guest added with no doorbell: its driver rings only for a ring it found empty, so work added
    while an earlier doorbell was being answered would otherwise wait for the next one. */
+/* Experiment (HV_PVG_VBLANK=1): the display's refresh event. The guest asks for event 8 in its mask (+104) while
+   something waits on the display's timing (a display link); without it a video wallpaper stops when nothing else
+   draws. Sent at the mode's rate while asked for. */
+static void vblank(HvPvgLite *p) {
+    if (!p || !p->display_pa) return;
+    static int env_checked = 0;
+    static uint64_t period, next;
+    if (!env_checked) {
+        env_checked = 1;
+        const char *e = getenv("HV_PVG_VBLANK");
+        if (e && atoi(e)) p->vblank_on = 1;
+        const char *hz = getenv("HV_HZ");
+        uint64_t r = hz && atoi(hz) > 0 ? (uint64_t)atoi(hz) : 60;
+        period = 24000000ull / r; /* host counter ticks (24 MHz) */
+    }
+    if (!p->vblank_on) return;
+    uint8_t *d = hv_phys_ptr_w(p->m, p->display_pa, 0x4000);
+    if (!d || !(__atomic_load_n((uint32_t *)(d + 0x104), __ATOMIC_ACQUIRE) & 8)) return;
+    uint64_t now = mach_absolute_time();
+    if (now < next) return;
+    next = now + period;
+    __atomic_fetch_or((uint32_t *)(d + 0x100), 8, __ATOMIC_RELEASE);
+    p->vblanks++;
+    hv_gicv3_pend(p->gic, p->gfx_irq);
+    if (p->m && p->m->ncpus == 1) hv_machine_wake(p->m);
+}
+
+void hv_pvg_lite_set_vblank(HvPvgLite *p, int on) {
+    if (p) p->vblank_on = on;
+}
+
 static HV_HOST_FP_WORK void poll_work(HvPvgLite *p);
 void hv_pvg_lite_poll(HvPvgLite *p) { /* CPU 0's tick, under the guest's FPCR: as the doorbells (gfx_write) */
     if (!p) return;
@@ -1225,6 +1259,7 @@ void hv_pvg_lite_poll(HvPvgLite *p) { /* CPU 0's tick, under the guest's FPCR: a
 }
 
 static HV_HOST_FP_WORK void poll_work(HvPvgLite *p) {
+    vblank(p);
     if (p->mapper_more) do_mapper(p); /* a long ring's next batch */
     if (p->root_waiting) do_root(p); /* a root command whose barrier was not met */
     uint32_t chans = p->chan_pending;
@@ -1616,6 +1651,29 @@ void hv_pvg_lite_restored(HvPvgLite *p) {
     } else {
         fprintf(stderr, "hengevm: snapshot: no Metal here: the screen starts blank\n");
         hv_pvg_bytes_release(&bytes);
+    }
+}
+
+/* Debugging (the Mac runner's devstate): each channel's ring and stamps, to tell work never taken from work never
+   finished. */
+void hv_pvg_lite_debug(HvPvgLite *p, FILE *f) {
+    if (!p) return;
+    uint64_t root = (uint64_t)reg(p, 0x101c) << 14, buf = (uint64_t)reg(p, 0x1030) << 14;
+    const uint8_t *d = p->display_pa ? hv_phys_ptr_r(p->m, p->display_pa, 0x4000) : NULL;
+    if (d) fprintf(f, "devstate pvg display: +100 %x +104 %x +108 %x +10c %x +f98 %llx +fb0 %llx +fa9 %x +fbc %x +fc0 %x\n",
+                   *(const uint32_t *)(d + 0x100), *(const uint32_t *)(d + 0x104), *(const uint32_t *)(d + 0x108),
+                   *(const uint32_t *)(d + 0x10c), (unsigned long long)*(const uint64_t *)(d + 0xf98), (unsigned long long)*(const uint64_t *)(d + 0xfb0), d[0xfa9],
+                   *(const uint32_t *)(d + 0xfbc), *(const uint32_t *)(d + 0xfc0));
+    fprintf(f, "devstate pvg: vblanks %llu\n", (unsigned long long)p->vblanks);
+    fprintf(f, "devstate pvg: status %x chan_pending %x draining %x stamps_pending %x root_rp %x metal %p swaps %llu\n",
+            __atomic_load_n(&p->status, __ATOMIC_ACQUIRE), p->chan_pending, p->draining, p->stamps_pending, p->root_rp,
+            (void *)atomic_load_explicit(&p->metal, memory_order_acquire), (unsigned long long)p->swaps);
+    for (uint32_t ch = 1; root && buf && ch < MAX_CHANNELS; ch++) {
+        uint32_t *rec = hv_phys_ptr_w(p->m, root + 0x400 + 0x14 * (ch - 1), 0x14);
+        uint32_t *stamp = guest32_w(p, buf + 4 * ch);
+        if (!rec || (!rec[0] && !rec[1] && !p->submitted[ch])) continue;
+        fprintf(f, "devstate pvg ch %u: write %x read %x id %x submitted %x stamp-back %x\n", ch, rec[0], rec[1],
+                rec[3], p->submitted[ch], stamp ? *stamp : 0);
     }
 }
 #undef PUT

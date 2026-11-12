@@ -20,24 +20,45 @@ echo "Time Machine's automatic backups and Power Nap off..."
 sudo tmutil disable
 sudo pmset -a powernap 0
 
-echo "Window, Dock and Finder animation off..."
+echo "Window, Dialog, Quick Look and WindowServer animation speedups..."
 defaults write NSGlobalDomain NSAutomaticWindowAnimationsEnabled -bool false
 defaults write NSGlobalDomain NSWindowResizeTime -float 0.001
 defaults write NSGlobalDomain NSScrollAnimationEnabled -bool false
+defaults write NSGlobalDomain QLPanelAnimationDuration -float 0
+defaults write NSGlobalDomain NSWindowDocumentVersionsFileProviderSpringLoadingDelay -float 0
+defaults write NSGlobalDomain NSToolbarTitleViewRolloverDelay -float 0
+defaults write NSGlobalDomain NSDocumentSaveNewDocumentsToCloud -bool false
+defaults write NSGlobalDomain NSNavPanelExpandedStateForSaveMode -bool true
+defaults write NSGlobalDomain NSNavPanelExpandedStateForSaveMode2 -bool true
+defaults write NSGlobalDomain PMPrintingExpandedStateForPrint -bool true
+defaults write NSGlobalDomain PMPrintingExpandedStateForPrint2 -bool true
+defaults write NSGlobalDomain CGDisableCursorLocationMagnification -bool true
+
+echo "Dock, Spaces and Mission Control speedups and zero autohide delays..."
 defaults write com.apple.dock launchanim -bool false
-defaults write com.apple.dock expose-animation-duration -float 0.1
+defaults write com.apple.dock expose-animation-duration -float 0.05
+defaults write com.apple.dock autohide-delay -float 0
 defaults write com.apple.dock autohide-time-modifier -float 0
 defaults write com.apple.dock mineffect -string scale
+defaults write com.apple.dock workspaces-swoosh-animation-off -bool true
+defaults write com.apple.dock mru-spaces -bool false
+defaults write com.apple.dock expose-group-apps -bool false
+
+echo "Finder animations off..."
 defaults write com.apple.finder DisableAllAnimations -bool true
+defaults write com.apple.finder AnimateWindowZoom -bool false
+defaults write com.apple.finder AnimateInfoPanes -bool false
+defaults write com.apple.finder AnimateSnapToGrid -bool false
 
 echo "Reduce motion and transparency..."
 if defaults write com.apple.universalaccess reduceMotion -bool true 2>/dev/null &&
    defaults write com.apple.universalaccess reduceTransparency -bool true 2>/dev/null; then
-    echo "  done"
+    echo "  done (user preferences)"
 else
-    echo "  macOS refused (Terminal has no Full Disk Access): turn both on yourself in"
-    echo "  System Settings > Accessibility > Display"
+    echo "  macOS refused user domain: turn both on in System Settings > Accessibility > Display"
 fi
+sudo defaults write /Library/Preferences/com.apple.universalaccess reduceMotion -bool true 2>/dev/null || true
+sudo defaults write /Library/Preferences/com.apple.universalaccess reduceTransparency -bool true 2>/dev/null || true
 
 echo "Photos and media background analysis off..."
 launchctl disable "gui/$(id -u)/com.apple.photoanalysisd" 2>/dev/null

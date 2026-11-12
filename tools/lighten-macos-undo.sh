@@ -10,13 +10,34 @@ sudo pmset -a powernap 1
 defaults delete NSGlobalDomain NSAutomaticWindowAnimationsEnabled 2>/dev/null
 defaults delete NSGlobalDomain NSWindowResizeTime 2>/dev/null
 defaults delete NSGlobalDomain NSScrollAnimationEnabled 2>/dev/null
+defaults delete NSGlobalDomain QLPanelAnimationDuration 2>/dev/null
+defaults delete NSGlobalDomain NSWindowDocumentVersionsFileProviderSpringLoadingDelay 2>/dev/null
+defaults delete NSGlobalDomain NSToolbarTitleViewRolloverDelay 2>/dev/null
+defaults delete NSGlobalDomain NSDocumentSaveNewDocumentsToCloud 2>/dev/null
+defaults delete NSGlobalDomain NSNavPanelExpandedStateForSaveMode 2>/dev/null
+defaults delete NSGlobalDomain NSNavPanelExpandedStateForSaveMode2 2>/dev/null
+defaults delete NSGlobalDomain PMPrintingExpandedStateForPrint 2>/dev/null
+defaults delete NSGlobalDomain PMPrintingExpandedStateForPrint2 2>/dev/null
+defaults delete NSGlobalDomain CGDisableCursorLocationMagnification 2>/dev/null
+
 defaults delete com.apple.dock launchanim 2>/dev/null
 defaults delete com.apple.dock expose-animation-duration 2>/dev/null
+defaults delete com.apple.dock autohide-delay 2>/dev/null
 defaults delete com.apple.dock autohide-time-modifier 2>/dev/null
 defaults delete com.apple.dock mineffect 2>/dev/null
+defaults delete com.apple.dock workspaces-swoosh-animation-off 2>/dev/null
+defaults delete com.apple.dock mru-spaces 2>/dev/null
+defaults delete com.apple.dock expose-group-apps 2>/dev/null
+
 defaults delete com.apple.finder DisableAllAnimations 2>/dev/null
+defaults delete com.apple.finder AnimateWindowZoom 2>/dev/null
+defaults delete com.apple.finder AnimateInfoPanes 2>/dev/null
+defaults delete com.apple.finder AnimateSnapToGrid 2>/dev/null
+
 defaults delete com.apple.universalaccess reduceMotion 2>/dev/null
 defaults delete com.apple.universalaccess reduceTransparency 2>/dev/null
+sudo defaults delete /Library/Preferences/com.apple.universalaccess reduceMotion 2>/dev/null
+sudo defaults delete /Library/Preferences/com.apple.universalaccess reduceTransparency 2>/dev/null
 
 launchctl enable "gui/$(id -u)/com.apple.photoanalysisd" 2>/dev/null
 launchctl enable "gui/$(id -u)/com.apple.mediaanalysisd" 2>/dev/null

@@ -2480,6 +2480,64 @@ static void benchAsked(const char *steps) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ benchRelay(asked, gen); });
 }
 
+// MARK: - Lightweight macOS responsiveness
+
+// Makes macOS lighter in the guest by disabling costly window/dock/finder animations
+// and enabling reduce motion / reduce transparency.
+static void applyLightweightUIFlags(void) {
+    @autoreleasepool {
+        // NSGlobalDomain UI speedups
+        CFPreferencesSetAppValue(CFSTR("NSAutomaticWindowAnimationsEnabled"), kCFBooleanFalse, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("NSWindowResizeTime"), (__bridge CFPropertyListRef)@0.001, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("NSScrollAnimationEnabled"), kCFBooleanFalse, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("QLPanelAnimationDuration"), (__bridge CFPropertyListRef)@0, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("NSWindowDocumentVersionsFileProviderSpringLoadingDelay"), (__bridge CFPropertyListRef)@0, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("NSToolbarTitleViewRolloverDelay"), (__bridge CFPropertyListRef)@0, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("NSDocumentSaveNewDocumentsToCloud"), kCFBooleanFalse, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("NSNavPanelExpandedStateForSaveMode"), kCFBooleanTrue, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("NSNavPanelExpandedStateForSaveMode2"), kCFBooleanTrue, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("PMPrintingExpandedStateForPrint"), kCFBooleanTrue, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("PMPrintingExpandedStateForPrint2"), kCFBooleanTrue, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("CGDisableCursorLocationMagnification"), kCFBooleanTrue, kCFPreferencesAnyApplication);
+        CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
+
+        // Dock: expose animation, autohide delays, launch animations, swoosh
+        CFStringRef dock = CFSTR("com.apple.dock");
+        CFPreferencesSetAppValue(CFSTR("launchanim"), kCFBooleanFalse, dock);
+        CFPreferencesSetAppValue(CFSTR("expose-animation-duration"), (__bridge CFPropertyListRef)@0.05, dock);
+        CFPreferencesSetAppValue(CFSTR("autohide-time-modifier"), (__bridge CFPropertyListRef)@0, dock);
+        CFPreferencesSetAppValue(CFSTR("autohide-delay"), (__bridge CFPropertyListRef)@0, dock);
+        CFPreferencesSetAppValue(CFSTR("mineffect"), CFSTR("scale"), dock);
+        CFPreferencesSetAppValue(CFSTR("workspaces-swoosh-animation-off"), kCFBooleanTrue, dock);
+        CFPreferencesSetAppValue(CFSTR("mru-spaces"), kCFBooleanFalse, dock);
+        CFPreferencesSetAppValue(CFSTR("expose-group-apps"), kCFBooleanFalse, dock);
+        CFPreferencesAppSynchronize(dock);
+
+        // Finder animations
+        CFStringRef finder = CFSTR("com.apple.finder");
+        CFPreferencesSetAppValue(CFSTR("DisableAllAnimations"), kCFBooleanTrue, finder);
+        CFPreferencesSetAppValue(CFSTR("AnimateWindowZoom"), kCFBooleanFalse, finder);
+        CFPreferencesSetAppValue(CFSTR("AnimateInfoPanes"), kCFBooleanFalse, finder);
+        CFPreferencesSetAppValue(CFSTR("AnimateSnapToGrid"), kCFBooleanFalse, finder);
+        CFPreferencesAppSynchronize(finder);
+
+        // Accessibility: reduce motion and transparency
+        CFStringRef ua = CFSTR("com.apple.universalaccess");
+        CFPreferencesSetAppValue(CFSTR("reduceMotion"), kCFBooleanTrue, ua);
+        CFPreferencesSetAppValue(CFSTR("reduceTransparency"), kCFBooleanTrue, ua);
+        CFPreferencesAppSynchronize(ua);
+
+        // Broadcast notifications so running processes immediately pick up changes
+        CFNotificationCenterRef dist = CFNotificationCenterGetDistributedCenter();
+        if (dist) {
+            CFNotificationCenterPostNotification(dist, CFSTR("com.apple.dock.prefschanged"), NULL, NULL, YES);
+            CFNotificationCenterPostNotification(dist, CFSTR("com.apple.universalaccess.reduceMotionChanged"), NULL, NULL, YES);
+            CFNotificationCenterPostNotification(dist, CFSTR("com.apple.universalaccess.reduceTransparencyChanged"), NULL, NULL, YES);
+        }
+        note(@"applied lightweight macOS UI preferences (reduced motion/transparency, zero-delay animations)");
+    }
+}
+
 static void handleLine(const char *line) {
     unsigned id;
     double x, y, dx, dy;
@@ -2496,6 +2554,7 @@ static void handleLine(const char *line) {
         linkSend([NSString stringWithFormat:@"stopped %u\n", id]); // a click Henge holds for it goes now
     });
     else if (!strcmp(line, "stop")) dispatch_async(scrollQueue, ^{ stopGlide(); });
+    else if (!strcmp(line, "lighten")) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ applyLightweightUIFlags(); });
     else if (!strcmp(line, "ask")) dispatch_async(dispatch_get_main_queue(), ^{ showTrustSettings(); });
     else if (!strcmp(line, "tools")) {
         toolsWanted = YES; // now, before the device plugs the disk in: not ejected on sight
@@ -3456,6 +3515,16 @@ static void systemLinkedMark(void) {
     close(fd);
 }
 
+static void applySystemLightweightFlags(void) {
+    @autoreleasepool {
+        CFStringRef ua = CFSTR("com.apple.universalaccess");
+        CFPreferencesSetValue(CFSTR("reduceMotion"), kCFBooleanTrue, ua, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
+        CFPreferencesSetValue(CFSTR("reduceTransparency"), kCFBooleanTrue, ua, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
+        CFPreferencesSynchronize(ua, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
+        note(@"system: applied system-wide accessibility lightweight flags");
+    }
+}
+
 static void keepSystemLinked(void) {
     for (;; usleep(500000)) {
         int fd = connect_host(0);
@@ -3506,6 +3575,7 @@ static void keepSystemLinked(void) {
                 }
                 if (!strcmp(line, "update")) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ update(); });
                 else if (!strcmp(line, "trace")) recordTouchMessages(); // a test Henge asks for (HENGE_TOUCH_TRACE)
+                else if (!strcmp(line, "lighten")) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ applySystemLightweightFlags(); });
             }
         }
     done:
@@ -3603,6 +3673,7 @@ static void recordTouchMessages(void) {
 
 static int runSystem(void) {
     startedAt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!getenv("HENGE_NO_LIGHTEN")) applySystemLightweightFlags();
     sessionQueue = dispatch_queue_create("henge.session", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
     keepAwake();
     turnOnTouchscreen(); // before the link: what it says first
@@ -3657,6 +3728,10 @@ int main(int argc, char **argv) {
         if ((argc == 3 || argc == 4) && !strcmp(argv[1], "--bench-work")) return benchWork(atoi(argv[2]), argc == 4 && !strcmp(argv[3], "x86_64"));
         if (argc == 2 && !strcmp(argv[1], "--version")) {
             printf("%d\n", HV_AGENT_VERSION);
+            return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--lighten")) {
+            applyLightweightUIFlags();
             return 0;
         }
         if (argc == 2 && !strcmp(argv[1], "--focus")) { // what the device would be told, for a look by hand
@@ -3726,6 +3801,11 @@ int main(int argc, char **argv) {
         watchTouchscreen();
         watchScreen();
         keepAwake();
+        if (!test && !getenv("HENGE_NO_LIGHTEN")) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                applyLightweightUIFlags();
+            });
+        }
         if (!test || getenv("HENGE_AGENT_TEST_TOOLS")) watchToolsDisk();
         // At login macOS mounts My Shared Files about when this starts: a moment for it before WebDAV instead.
         if (!test) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (sharedFolderOnVolume() ? 0 : 8) * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ keepMounted(); });

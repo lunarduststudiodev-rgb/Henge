@@ -1381,6 +1381,7 @@ int hv_snap_get_cpus(HvSnapReader *r, HvMachine *m) {
         }
         cpu->el0_cnt = (uint32_t)(cpu->cntkctl_el1 & 3);
         cpu->excl_addr = ~0ull;
+        cpu->mpidr_el1 = cpu->mpidr;
         hv_tlb_flush(cpu);
         hv_ijc_switch(cpu); /* the branch cache's ids for the address space now in TTBR0 */
     }
