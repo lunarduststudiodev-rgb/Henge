@@ -37,7 +37,7 @@ struct MacSettingsView: View {
                     MemoryNote(gb: mac.ramMB / 1024)
                     if Device.memoryTooHigh(mac.ramMB / 1024) {
                         Button {
-                            mac.ramMB = UInt64(Device.suggestedRAMGB * 1024)
+                            mac.ramMB = Device.suggestedRAMGB * 1024
                             save()
                         } label: {
                             Label("Set to suggested \(Device.suggestedRAMGB) GB", systemImage: "bolt.shield")
