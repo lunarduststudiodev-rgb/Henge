@@ -139,9 +139,7 @@ static inline int hv_pvg_view_format_ok(uint32_t from, uint32_t f) {
         lo != 174 && lo != 176)
         return 1;
     if (lo >= 186 && lo <= 200 && hi == lo + 18) return 1;
-    if ((from == 260 || from == 255) && (f == 261 || f == 262)) return 1;
-    if ((from == 255 && f == 260) || (from == 260 && f == 255)) return 1;
-    if ((from == 262 && f == 261) || (from == 261 && f == 262)) return 1;
+    if ((from == 260 || from == 255 || from == 261 || from == 262) && (f == 260 || f == 255 || f == 261 || f == 262)) return 1;
     return 0;
 }
 
@@ -167,8 +165,12 @@ static inline const char *hv_pvg_linear_problem(const HvTexDesc *d, HvTexCaps ca
     if (why) return why;
     uint32_t bpp = hv_pvg_linear_bpp(d->format);
     if (!bpp || (d->type != HV_TEX_2D && d->type != HV_TEX_BUFFER) || d->mips != 1) return "linear layout";
-    if (row < (uint64_t)d->width * bpp || (align && (row % align || offset % align))) return "bytes per row";
-    if (offset > buffer_len || d->height > (buffer_len - offset) / row) return "past the end of the buffer";
+    uint64_t last_row = (uint64_t)d->width * bpp;
+    if (row < last_row || (align && (row % align || offset % align))) return "bytes per row";
+    if (offset > buffer_len) return "past the end of the buffer";
+    if (d->height > 1 && row > (UINT64_MAX - last_row) / (d->height - 1)) return "past the end of the buffer";
+    uint64_t needed = d->height ? (uint64_t)(d->height - 1) * row + last_row : 0;
+    if (needed > buffer_len - offset) return "past the end of the buffer";
     return 0;
 }
 

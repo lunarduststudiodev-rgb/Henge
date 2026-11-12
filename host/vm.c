@@ -1208,6 +1208,7 @@ void hv_vm_set_speaker_listener(void (*cb)(void *opaque, double level, int mute)
 void hv_vm_speaker_host_volume(double level) {
     HvUsbAudio *a = speaker();
     if (a) hv_usb_audio_host_volume(a, hv_usb_audio_scalar_to_db(level));
+    hv_share_volume_level(level);
 }
 
 static _Atomic int pending_volume_key;

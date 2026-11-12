@@ -123,8 +123,7 @@ final class MacSpeaker {
             for _ in 0..<steps {
                 henge_vm_speaker_host_key(delta > 0 ? 1 : -1) // a button: macOS steps its volume and shows it
             }
-        } else {
-            henge_vm_speaker_host_volume(Double(new))
         }
+        henge_vm_speaker_host_volume(Double(new))
     }
 }

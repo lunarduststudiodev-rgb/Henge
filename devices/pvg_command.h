@@ -461,7 +461,7 @@ static inline int hv_pvg_color_format(uint32_t f) {
     }
 }
 static inline int hv_pvg_depth_format(uint32_t f) { return f == 250 || f == 252 || f == 255 || f == 260; }
-static inline int hv_pvg_stencil_format(uint32_t f) { return f == 253 || f == 255 || f == 260 || f == 262; }
+static inline int hv_pvg_stencil_format(uint32_t f) { return f == 253 || f == 255 || f == 260 || f == 261 || f == 262; }
 
 static inline int hv_pvg_is_cube(uint32_t type) { return type == HV_TEX_CUBE || type == HV_TEX_CUBE_ARRAY; }
 
@@ -716,10 +716,10 @@ static inline const char *hv_pvg_pipeline_problem(const HvPipe *p, HvTexCaps cap
     if (p->form == 0) {
         if (p->depth && !hv_pvg_depth_format(p->depth)) return "the depth pixel format";
         if (p->stencil && !hv_pvg_stencil_format(p->stencil)) return "the stencil pixel format";
-        if (p->depth && p->stencil && p->depth != p->stencil &&
-            (p->depth == 260 || p->stencil == 260 || p->depth == 255 || p->stencil == 255) &&
-            !((p->depth == 255 && p->stencil == 260) || (p->depth == 260 && p->stencil == 255) ||
-              (p->depth == 255 && p->stencil == 255)))
+        if (!p->depth && (p->stencil == 255 || p->stencil == 260)) return "the stencil pixel format";
+        int d_comb = p->depth == 260 || p->depth == 255;
+        int s_comb = p->stencil == 260 || p->stencil == 255 || p->stencil == 261 || p->stencil == 262;
+        if (p->depth && p->stencil && (d_comb != s_comb))
             return "a depth and stencil format that don't match";
     }
     if (p->form == 0 && caps.color_bytes && hv_pvg_format_bytes(p->color) > caps.color_bytes) return "colour targets' bytes a sample";

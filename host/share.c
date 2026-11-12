@@ -999,6 +999,21 @@ int hv_share_volume_key(int key) {
     return 1;
 }
 
+static pthread_mutex_t volume_mu = PTHREAD_MUTEX_INITIALIZER;
+static double volume_level = -1.0;
+
+int hv_share_volume_level(double level) {
+    if (level < 0.0) level = 0.0;
+    if (level > 1.0) level = 1.0;
+    pthread_mutex_lock(&volume_mu);
+    volume_level = level;
+    pthread_mutex_unlock(&volume_mu);
+
+    if (!link_can(HV_AGENT_SINCE_VOLUME_LEVEL)) return 0;
+    link_send("vollevel %.4f\n", level);
+    return 1;
+}
+
 static pthread_mutex_t battery_mu = PTHREAD_MUTEX_INITIALIZER;
 static double battery_percent = 100.0;
 static int battery_external = 1;
@@ -1414,6 +1429,12 @@ static int touch_link(Conn *c, Request *r) {
     pthread_mutex_unlock(&battery_mu);
     if (b_known && version >= HV_AGENT_SINCE_BATTERY) {
         link_send("battery %.0f %d %d %d\n", b_pct, b_ext, b_chg, b_fl);
+    }
+    pthread_mutex_lock(&volume_mu);
+    double v_lvl = volume_level;
+    pthread_mutex_unlock(&volume_mu);
+    if (v_lvl >= 0.0 && version >= HV_AGENT_SINCE_VOLUME_LEVEL) {
+        link_send("vollevel %.4f\n", v_lvl);
     }
     char line[2304]; /* a "context" line is the longest */
     while (link_line(c, line, sizeof line) == 0) {

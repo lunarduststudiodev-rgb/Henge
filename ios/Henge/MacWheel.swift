@@ -43,7 +43,7 @@ final class MacScroller {
 
     /// Slower than this as the fingers lift is a page put down, not flung. The Mac's points a second.
     static let glideSpeed: CGFloat = 600
-    private static let topSpeed: CGFloat = 24000
+    private static let topSpeed: CGFloat = 8000
 
     private var active = false
     private var helper = false

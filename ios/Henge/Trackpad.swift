@@ -43,7 +43,7 @@ struct Trackpad: UIViewRepresentable {
         private static let tapTime: TimeInterval = 0.3
         private static let tapDistance: CGFloat = 8
         /// The Mac's points the pointer and a scroll move for each of the pad's.
-        private static let scrollScale: CGFloat = 3
+        private static let scrollScale: CGFloat = 1.2
         private var fingers: [UITouch] = []
         private var started = Date()
         private var travelled: CGFloat = 0

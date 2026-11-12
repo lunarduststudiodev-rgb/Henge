@@ -304,7 +304,7 @@ final class HardwareMouse {
         let vertical = verticalChanged && !mostlyHorizontal && first.isFinite ? CGFloat(-first) : 0
         let horizontal = horizontalChanged && !mostlyVertical && second.isFinite ? CGFloat(-second) : 0
         let way: CGFloat = UserDefaults.standard.bool(forKey: Self.reverseKey) ? -1 : 1
-        let scale = pointsPerUnit * ScrollSpeed.factor * way
+        let scale = pointsPerUnit * ScrollSpeed.factor * 0.6 * way
         let d = CGPoint(x: horizontal * scale, y: vertical * scale)
         if scrollsLogged < 24 {
             scrollsLogged += 1

@@ -19,6 +19,15 @@
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #import <IOKit/hidsystem/IOHIDEventSystemClient.h>
 #import <IOKit/hidsystem/IOHIDServiceClient.h>
+#import <AudioToolbox/AudioServices.h>
+#import <CoreAudio/CoreAudio.h>
+
+#ifndef kAudioObjectPropertyElementMaster
+#define kAudioObjectPropertyElementMaster 0
+#endif
+#ifndef kAudioHardwareServiceDeviceProperty_VirtualMasterVolume
+#define kAudioHardwareServiceDeviceProperty_VirtualMasterVolume 'vmvc'
+#endif
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -1827,12 +1836,12 @@ static void stopGlide(void) {
     if (glideStarted) postScroll(0, 0, 0, kCGMomentumScrollPhaseEnd);
 }
 
-// Slows as an iPad's pages do (0.998 a millisecond), until it is too slow to see.
+// Slows as an iPad's pages do (0.995 a millisecond), until it is too slow to see.
 static void glideStep(void) {
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     double dt = MIN((now - glideLast) / 1e9, 0.05);
     glideLast = now;
-    double slow = pow(0.998, dt * 1000);
+    double slow = pow(0.995, dt * 1000);
     glideX *= slow, glideY *= slow;
     double speed = hypot(glideX, glideY);
     if (speed < 15) {
@@ -1926,7 +1935,7 @@ static void scrollLine(char phase, double x, double y, double dx, double dy) {
     case 'e':
         postScroll(0, 0, kCGScrollPhaseEnded, kCGMomentumScrollPhaseNone);
         if (hypot(dx, dy) < 150) break;
-        glideX = MAX(MIN(dx, 12000), -12000), glideY = MAX(MIN(dy, 12000), -12000);
+        glideX = MAX(MIN(dx, 6000), -6000), glideY = MAX(MIN(dy, 6000), -6000);
         glideLast = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         glideStarted = NO;
         unsigned currentGlide = atomic_fetch_add(&glideNumber, 1) + 1;
@@ -2784,9 +2793,56 @@ static void postMediaKey(int key) {
     }
 }
 
+static void setMasterVolume(double level) {
+    Float32 vol = (Float32)level;
+    if (vol < 0.0f) vol = 0.0f;
+    if (vol > 1.0f) vol = 1.0f;
+
+    AudioDeviceID deviceID = kAudioObjectUnknown;
+    UInt32 propSize = sizeof(deviceID);
+    AudioObjectPropertyAddress devAddr = {
+        .mSelector = kAudioHardwarePropertyDefaultOutputDevice,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMaster
+    };
+
+    OSStatus err = AudioObjectGetPropertyData(kAudioObjectSystemObject, &devAddr, 0, NULL, &propSize, &deviceID);
+    if (err != noErr || deviceID == kAudioObjectUnknown) return;
+
+    AudioObjectPropertyAddress volAddr = {
+        .mSelector = kAudioHardwareServiceDeviceProperty_VirtualMasterVolume,
+        .mScope = kAudioDevicePropertyScopeOutput,
+        .mElement = kAudioObjectPropertyElementMaster
+    };
+    UInt32 volSize = sizeof(vol);
+
+    err = AudioHardwareServiceSetPropertyData(deviceID, &volAddr, 0, NULL, volSize, &vol);
+    if (err == noErr) return;
+
+    err = AudioObjectSetPropertyData(deviceID, &volAddr, 0, NULL, volSize, &vol);
+    if (err == noErr) return;
+
+    AudioObjectPropertyAddress scalarAddr = {
+        .mSelector = kAudioDevicePropertyVolumeScalar,
+        .mScope = kAudioDevicePropertyScopeOutput,
+        .mElement = kAudioObjectPropertyElementMaster
+    };
+    err = AudioObjectSetPropertyData(deviceID, &scalarAddr, 0, NULL, volSize, &vol);
+    if (err == noErr) return;
+
+    for (UInt32 ch = 1; ch <= 2; ch++) {
+        scalarAddr.mElement = ch;
+        Boolean settable = false;
+        if (AudioObjectIsPropertySettable(deviceID, &scalarAddr, &settable) == noErr && settable) {
+            AudioObjectSetPropertyData(deviceID, &scalarAddr, 0, NULL, volSize, &vol);
+        }
+    }
+}
+
 static void handleLine(const char *line) {
     unsigned id;
     int vol;
+    double volLevel;
     double x, y, dx, dy;
     char phase;
     double bpct;
@@ -2798,6 +2854,11 @@ static void handleLine(const char *line) {
     else if (sscanf(line, "volume %d", &vol) == 1) {
         dispatch_async(dispatch_get_main_queue(), ^{
             postMediaKey(vol > 0 ? NX_KEYTYPE_SOUND_UP : vol < 0 ? NX_KEYTYPE_SOUND_DOWN : NX_KEYTYPE_MUTE);
+        });
+    }
+    else if (sscanf(line, "vollevel %lf", &volLevel) == 1 || sscanf(line, "volume_level %lf", &volLevel) == 1) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            setMasterVolume(volLevel);
         });
     }
     else if (sscanf(line, "battery %lf %d %d %d", &bpct, &bext, &bchg, &bfl) == 4) {

@@ -671,7 +671,10 @@ static BOOL linear_texture_fits(id<MTLDevice> device, MTLTextureDescriptor *t, u
     static NSUInteger cached_align;
     if (!cached_align) cached_align = [device minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm] ?: 64;
     NSUInteger align = cached_align;
-    BOOL ok = row >= t.width * bpp && (!align || (row % align == 0 && offset % align == 0)) && offset + row * t.height <= length;
+    uint64_t last_row = (uint64_t)t.width * bpp;
+    BOOL wrap = t.height > 1 && row > (UINT64_MAX - last_row) / (t.height - 1);
+    uint64_t needed = wrap ? UINT64_MAX : (t.height ? (t.height - 1) * row + last_row : 0);
+    BOOL ok = !wrap && row >= last_row && (!align || (row % align == 0 && offset % align == 0)) && offset <= length && needed <= length - offset;
     if (!ok) {
         static int told;
         if (told++ < 8) fprintf(stderr, "hengevm: pvg-metal: a %lux%lu format %lu texture can't sit on rows of %llu bytes at %llu in %lu: left empty\n",
@@ -2202,14 +2205,16 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
     MTLTextureDescriptor *t = h.tag == 0x39 ? descriptor_v2(h.d) : descriptor_v1(h.d);
     t.storageMode = MTLStorageModeShared;
     set_framebuffer_only(t, NO);
-    t.usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
-    /* Metal aborts on a swizzled render target, and a surface is always drawn into here: views over it
-       (tags 7/8/0x1b) can still swizzle. */
-    MTLTextureSwizzleChannels sw = t.swizzle;
-    if (sw.red != MTLTextureSwizzleRed || sw.green != MTLTextureSwizzleGreen || sw.blue != MTLTextureSwizzleBlue || sw.alpha != MTLTextureSwizzleAlpha) {
-        static int told;
-        if (told++ < 3) fprintf(stderr, "hengevm: pvg-metal: surface %llu asked for swizzle %u %u %u %u; drawing it unswizzled\n", h.mapping, sw.red, sw.green, sw.blue, sw.alpha);
-        t.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
+    t.usage |= MTLTextureUsageShaderRead;
+    /* Metal aborts on a swizzled render target: views over it (tags 7/8/0x1b) can still swizzle.
+       Preserve swizzle on non-render-targets. */
+    if (t.usage & MTLTextureUsageRenderTarget) {
+        MTLTextureSwizzleChannels sw = t.swizzle;
+        if (sw.red != MTLTextureSwizzleRed || sw.green != MTLTextureSwizzleGreen || sw.blue != MTLTextureSwizzleBlue || sw.alpha != MTLTextureSwizzleAlpha) {
+            static int told;
+            if (told++ < 3) fprintf(stderr, "hengevm: pvg-metal: surface %llu asked for swizzle %u %u %u %u; drawing it unswizzled\n", h.mapping, sw.red, sw.green, sw.blue, sw.alpha);
+            t.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
+        }
     }
     o->surface = surface;
     over_surface(o);
@@ -2243,8 +2248,21 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
     }
     if (!o->object) {
         [self complain:[NSString stringWithFormat:@"surface %llu: format %lu row %llu not possible", h.mapping, (unsigned long)t.pixelFormat, surface->row]];
-        t.storageMode = MTLStorageModePrivate;
-        if (![self refuse:t what:@"surface stand-in"]) o->object = [device newTextureWithDescriptor:t]; /* something to bind: it stays empty */
+        t.storageMode = MTLStorageModeShared;
+        if (![self refuse:t what:@"surface stand-in"]) {
+            o->object = [device newTextureWithDescriptor:t];
+            if (o->object && surface->mapped) {
+                NSUInteger bpp = pixel_bytes(t.pixelFormat);
+                NSUInteger src_row = (NSUInteger)surface->row;
+                uint64_t needed = t.height ? (t.height - 1) * surface->row + (uint64_t)t.width * bpp : 0;
+                if (bpp && src_row >= t.width * bpp && surface->first <= surface->length && needed <= surface->length - surface->first) {
+                    [o->object replaceRegion:MTLRegionMake2D(0, 0, t.width, t.height)
+                                 mipmapLevel:0
+                                   withBytes:surface->mapped + surface->first
+                                 bytesPerRow:src_row];
+                }
+            }
+        }
     }
 }
 
@@ -4801,18 +4819,6 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
         uint32_t W = screen_w, H = screen_h, cw0 = cursor_w, ch0 = cursor_h;
         int hx = cursor_hot_x, hy = cursor_hot_y;
         os_unfair_lock_unlock(&screen_lock);
-        int heat = hv_thermal_get_state();
-        if (heat >= 2) {
-            static uint64_t last_present_ns;
-            uint64_t min_interval_ns = heat >= 3 ? 31000000ull : 15500000ull;
-            uint64_t now_ns = stage_now();
-            if (last_present_ns && now_ns < last_present_ns + min_interval_ns) {
-                uint64_t wait_ns = (last_present_ns + min_interval_ns) - now_ns;
-                struct timespec ts = {.tv_sec = (time_t)(wait_ns / 1000000000ull), .tv_nsec = (long)(wait_ns % 1000000000ull)};
-                nanosleep(&ts, NULL);
-            }
-            last_present_ns = stage_now();
-        }
         if (![self prepareScreenForLayer:target]) {
             os_unfair_lock_lock(&screen_lock);
             BOOL changed = layer_generation != generation;
@@ -4876,7 +4882,7 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
                     // A monitor can connect before its first drawable is available.
                     // Retry even if the guest is idle, but never poll a hidden target forever.
                     drawable_retry_pending = YES;
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), presenter, ^{
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC), presenter, ^{
                         os_unfair_lock_lock(&self->screen_lock);
                         if (self->layer_generation == generation) {
                             self->drawable_retry_pending = NO;
@@ -5204,7 +5210,7 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
         r->heap_limit = dev.recommendedMaxWorkingSetSize ? dev.recommendedMaxWorkingSetSize : dev.maxBufferLength;
         r->heap_total = calloc(1, sizeof *r->heap_total);
         if (!r->heap_total) return NULL;
-        r->mapper_q = dispatch_queue_create("hengevm.pvg-mapper", DISPATCH_QUEUE_SERIAL);
+        r->mapper_q = dispatch_queue_create("hengevm.pvg-mapper", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
         r->complete_q = dispatch_queue_create("hengevm.pvg-complete", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
         r->shot = getenv("HV_PVG_SHOT");
         read_env(r);

@@ -108,7 +108,7 @@ AGENT_KC_FLAG = $(if $(AGENT_KEYCHAIN),--keychain "$(AGENT_KEYCHAIN)")
 # Built for Intel too: the benchmark's Rosetta step runs its Intel half (henge-agent --bench-work N x86_64).
 $(B)/henge-agent: tools/henge-agent.m tools/agent-ports.c tools/agent-ports.h tools/focus-said.h host/share.h tools/henge-agent-Info.plist
 	@mkdir -p $(B)
-	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -framework AppKit -framework ApplicationServices -framework Carbon -framework IOKit -lz -Wl,-sectcreate,__TEXT,__info_plist,tools/henge-agent-Info.plist $< tools/agent-ports.c -o $@
+	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -framework AppKit -framework ApplicationServices -framework AudioToolbox -framework Carbon -framework CoreAudio -framework IOKit -lz -Wl,-sectcreate,__TEXT,__info_plist,tools/henge-agent-Info.plist $< tools/agent-ports.c -o $@
 	codesign -f -s "$(AGENT_SIGN)" $(AGENT_KC_FLAG) --identifier com.henge.agent $@
 
 # The benchmark's video (host/bench.h; the helper plays it on a loop): 8 s of ffmpeg's moving test pattern, 1280x720 at
