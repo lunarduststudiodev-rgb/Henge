@@ -53,6 +53,8 @@ uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task);
 /* The Metal side's worker reached a command (op, its arguments after the barriers, their bytes): a define (0x38) or
    object list (0x44) is what the task reads above use from now on. Only the worker calls it, in the guest's order. */
 void hv_pvg_lite_task_command(HvPvgLite *p, uint32_t op, const uint32_t *args, uint32_t n);
+/* The guest's GPU driver is an older one (macOS 14 and earlier): no object list command, compact surface descriptions. */
+int hv_pvg_lite_old_driver(HvPvgLite *p);
 /* A surface's descriptor (1 KB), or NULL if the mapper has none for it. The id as the guest gave it, all 64 bits: an
    id past 32 bits is none of the mapper's, not its low half. */
 const uint8_t *hv_pvg_lite_surface(HvPvgLite *p, uint64_t mapping);

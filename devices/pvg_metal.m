@@ -198,6 +198,9 @@ static PresenterPick presenter_pick(HvReplay *r, uint64_t generation, CAMetalLay
     uint8_t tex_block_h;
     uint8_t *tex_layout; /* the mip table, 36 bytes each */
     BOOL guest_backed;
+    uint32_t retries; /* a mapped texture made before its surface was described: tried again on later uses */
+    uint8_t described[0x30]; /* a surface: the older driver's compact description it was made from */
+    uint64_t on_mapping; /* a mapped texture: the surface id it is over */
     /* A surface: */
     HvObject *surface;
     /* A surface whose mapping the guest unmapped (hv_pvg_metal_unmap): its pages are the guest's to reuse once the
@@ -601,6 +604,8 @@ static void over_surface(HvObject *o) {
     dispatch_source_t shot_timer;
 }
 - (void)complain:(NSString *)what;
+- (HvObject *)newSurface:(uint64_t)mapping;
+- (HvObject *)currentSurface:(uint64_t)mapping;
 - (HvObject *)object:(uint32_t)ref task:(uint32_t)task;
 - (HvObject *)object:(uint32_t)ref task:(uint32_t)task kind:(HvKind)kind;
 - (void)drawCursor;
@@ -637,6 +642,41 @@ static BOOL power_of_ten(uint32_t k) {
     NSMapTable *refs; /* each function it handed Metal: the guest's ref for it (note_building) */
 }
 @end
+
+/* Bytes a pixel takes in the uncompressed formats a surface gets viewed as; 0 for one not listed. */
+static NSUInteger pixel_bytes(MTLPixelFormat f) {
+    switch (f) {
+    case MTLPixelFormatA8Unorm: case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Unorm_sRGB: case MTLPixelFormatR8Snorm:
+    case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: return 1;
+    case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Snorm: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint: case MTLPixelFormatR16Float:
+    case MTLPixelFormatRG8Unorm: case MTLPixelFormatRG8Unorm_sRGB: case MTLPixelFormatRG8Snorm: case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
+    case MTLPixelFormatB5G6R5Unorm: case MTLPixelFormatA1BGR5Unorm: case MTLPixelFormatABGR4Unorm: case MTLPixelFormatBGR5A1Unorm: return 2;
+    case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint: case MTLPixelFormatR32Float: case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG16Snorm:
+    case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRG16Float: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB:
+    case MTLPixelFormatRGBA8Snorm: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
+    case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG11B10Float: case MTLPixelFormatRGB9E5Float:
+    case MTLPixelFormatBGR10A2Unorm: return 4;
+    case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRG32Float: case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Snorm:
+    case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA16Float: return 8;
+    case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: case MTLPixelFormatRGBA32Float: return 16;
+    default: return 0;
+    }
+}
+
+/* Metal aborts the app, rather than failing, on a linear texture whose rows don't hold its width or don't fit the buffer.
+   A view the guest makes in another format, or a surface read with the wrong description, can ask for one. */
+static BOOL linear_texture_fits(id<MTLDevice> device, MTLTextureDescriptor *t, uint64_t offset, uint64_t row, NSUInteger length) {
+    NSUInteger bpp = pixel_bytes(t.pixelFormat);
+    if (!bpp) return YES;
+    NSUInteger align = [device minimumLinearTextureAlignmentForPixelFormat:t.pixelFormat];
+    BOOL ok = row >= t.width * bpp && (!align || (row % align == 0 && offset % align == 0)) && offset + row * t.height <= length;
+    if (!ok) {
+        static int told;
+        if (told++ < 8) fprintf(stderr, "hengevm: pvg-metal: a %lux%lu format %lu texture can't sit on rows of %llu bytes at %llu in %lu: left empty\n",
+                                (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, row, offset, (unsigned long)length);
+    }
+    return ok;
+}
 
 static double now_seconds(void) {
     return (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) * 1e-9;
@@ -1615,7 +1655,7 @@ static void pipeline_timed(HvReplay *r, double t) {
     if ([self refuse:t what:@"linear texture" buffer:buffer.length offset:h.offset row:h.row]) return;
     o->parent = b;
     o->follows = b, o->follows_generation = b->generation;
-    o->object = [buffer newTextureWithDescriptor:t offset:h.offset bytesPerRow:h.row];
+    if (linear_texture_fits(device, t, h.offset, h.row, buffer.length)) o->object = [buffer newTextureWithDescriptor:t offset:h.offset bytesPerRow:h.row];
     if (!o->object) [self complain:[NSString stringWithFormat:@"linear texture format %lu row %llu failed", (unsigned long)t.pixelFormat, h.row]];
 }
 
@@ -1659,17 +1699,58 @@ static NSData *video_key(const uint32_t *list, uint64_t n, uint32_t first, uint6
     return k;
 }
 
+/* macOS 13/14 compact plane layout: 0x40 bytes header, then 0x40 per plane */
+static uint32_t video_layout_compact(const uint8_t *desc, uint64_t alloc, HvVideoPlane pl[4]) {
+    uint32_t planes = 1;
+    memcpy(&planes, desc + 0x24, 4);
+    if (planes < 2 || planes > 4) return 0;
+    uint64_t at = 0;
+    for (uint32_t i = 0; i < planes; i++) {
+        const uint8_t *cp = desc + 0x40 + i * 0x40;
+        uint32_t v[6], base;
+        memcpy(v, cp + 0x0c, sizeof v);
+        memcpy(&base, cp + 0x08, 4);
+        uint64_t off = v[0], size = v[1], w = v[2] >> 8, h = v[3] >> 8, row = v[4];
+        uint16_t bpe = (uint16_t)v[5];
+        if (base > off && base - off < size) size -= base - off, off = base;
+        pl[i].offset = off;
+        pl[i].row = row;
+        pl[i].rows = (uint32_t)h;
+        pl[i].width = (uint32_t)w;
+        pl[i].bpe = bpe;
+        pl[i].row_bytes = (uint64_t)w * bpe;
+        uint64_t packed;
+        if (__builtin_mul_overflow(pl[i].row, pl[i].rows, &packed) ||
+            __builtin_add_overflow(at, packed, &at) || at > HV_PVG_VIDEO_MAX)
+            return 0;
+    }
+    return planes;
+}
+
 /* A multi-plane surface as a real IOSurface, laid out as the guest laid it out (video_layout's planes). Its planes must
    hold the guest's rows, or there is none: copies between the two trust both. */
-static IOSurfaceRef make_iosurface(const uint8_t *desc, uint64_t alloc, const HvVideoPlane *pl, uint32_t planes) {
+static IOSurfaceRef make_iosurface(const uint8_t *desc, uint64_t alloc, const HvVideoPlane *pl, uint32_t planes, BOOL compact) {
     uint32_t fourcc;
     uint64_t width, height;
-    memcpy(&fourcc, desc + 4, 4), memcpy(&width, desc + 0x20, 8), memcpy(&height, desc + 0x28, 8);
+    memcpy(&fourcc, desc + 4, 4);
+    if (compact) {
+        uint32_t w32, h32;
+        memcpy(&w32, desc + 0x14, 4), memcpy(&h32, desc + 0x18, 4);
+        width = w32 >> 8, height = h32 >> 8;
+    } else {
+        memcpy(&width, desc + 0x20, 8), memcpy(&height, desc + 0x28, 8);
+    }
     NSMutableArray *info = [NSMutableArray new], *plain = [NSMutableArray new];
     uint64_t at = 0;
     for (uint32_t i = 0; i < planes; i++) {
         uint64_t size, packed = pl[i].row * pl[i].rows; /* video_layout's: no overflow */
-        memcpy(&size, desc + 0x80 + i * 0x80 + 0x18, 8);
+        if (compact) {
+            uint32_t v[6];
+            memcpy(v, desc + 0x40 + i * 0x40 + 0x0c, sizeof v);
+            size = v[1];
+        } else {
+            memcpy(&size, desc + 0x80 + i * 0x80 + 0x18, 8);
+        }
         [info addObject:@{(__bridge id)kIOSurfacePlaneWidth: @(pl[i].width), (__bridge id)kIOSurfacePlaneHeight: @(pl[i].rows),
                           (__bridge id)kIOSurfacePlaneBytesPerRow: @(pl[i].row), (__bridge id)kIOSurfacePlaneOffset: @(pl[i].offset),
                           (__bridge id)kIOSurfacePlaneSize: @(size), (__bridge id)kIOSurfacePlaneBytesPerElement: @(pl[i].bpe),
@@ -1945,6 +2026,133 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
     [writeback addObject:s];
 }
 
+/* A guest surface (IOSurface) from its description: its pages in one host buffer (or a real IOSurface for planes). */
+- (HvObject *)newSurface:(uint64_t)mapping {
+    NSNumber *key = @(mapping);
+    HvObject *surface = nil;
+    const uint8_t *guest_desc = hv_pvg_lite_surface(lite, mapping);
+    if (!guest_desc) { [self complain:[NSString stringWithFormat:@"surface %llu has no descriptor", mapping]]; return nil; }
+    uint8_t desc[0x400];
+    memcpy(desc, guest_desc, sizeof desc);
+    uint32_t list, first;
+    uint64_t alloc, row;
+    /* macOS 15 and later: u64 allocation, width, height and row at 0x18..0x30, plane count at 0x3e, first byte at 0x60.
+       macOS 14's (and Ventura's) driver writes a compact one: u32 allocation at 0x10, width and height << 8 at 0x14 and 0x18, u32 row
+       at 0x1c, bytes per pixel at 0x20; plane count at 0x24. */
+    BOOL compact = hv_pvg_lite_old_driver(lite) != 0;
+    uint32_t compact_planes = 1;
+    if (compact) memcpy(&compact_planes, desc + 0x24, 4);
+    uint8_t planes = compact ? (uint8_t)MIN(MAX(compact_planes, 1u), 4u) : desc[0x3e];
+    memcpy(&list, desc, 4), memcpy(&alloc, desc + 0x18, 8), memcpy(&row, desc + 0x30, 8), memcpy(&first, desc + 0x60, 4);
+    if (compact) {
+        uint32_t a32, r32;
+        memcpy(&a32, desc + 0x10, 4), memcpy(&r32, desc + 0x1c, 4);
+        alloc = a32, row = r32, first = 0;
+    }
+    if (!alloc || alloc > max_buffer || first > max_buffer - alloc) {
+        [self complain:[NSString stringWithFormat:@"surface %llu of %llu bytes from %u refused", mapping, alloc, first]];
+        return nil;
+    }
+    surface = [HvObject new];
+    if (compact) memcpy(surface->described, desc, sizeof surface->described);
+    surface->length = (alloc + first + 0x3fff) & ~0x3fffull;
+    surface->row = row;
+    surface->first = first;
+    uint64_t sw, sh;
+    memcpy(&sw, desc + 0x20, 8), memcpy(&sh, desc + 0x28, 8), memcpy(&surface->fourcc, desc + 4, 4);
+    if (compact) {
+        uint32_t w32, h32;
+        memcpy(&w32, desc + 0x14, 4), memcpy(&h32, desc + 0x18, 4);
+        sw = w32 >> 8, sh = h32 >> 8;
+    }
+    surface->surface_w = (uint32_t)sw, surface->surface_h = (uint32_t)sh;
+    uint64_t n = surface->length >> 14;
+    vm_address_t region = 0;
+    const uint32_t *guest_pages = (list & 1) ? hv_pvg_lite_phys(lite, (uint64_t)(list & ~1u) << 12, n * 4) : NULL;
+    uint32_t *pages = guest_pages ? malloc(n * 4) : NULL;
+    void **srcs = pages ? calloc(n, sizeof(void *)) : NULL;
+    if (!srcs || vm_allocate(mach_task_self(), &region, surface->length, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
+        free(pages), free(srcs);
+        [self complain:[NSString stringWithFormat:@"surface %llu has no pages", mapping]];
+        return nil;
+    }
+    memcpy(pages, guest_pages, n * 4);
+    surface->mapped = (uint8_t *)region;
+    uint64_t misaligned = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        void *src = (pages[i] & 1) ? hv_pvg_lite_phys(lite, (uint64_t)(pages[i] & ~1u) << 12, 0x4000) : NULL;
+        if ((uintptr_t)src & 0x3fff) src = NULL, misaligned++;
+        srcs[i] = src;
+    }
+    if (misaligned) {
+        pages_misaligned += misaligned;
+        [self complain:[NSString stringWithFormat:@"surface pages not on a 16 KB boundary: shown as zeros (fourcc %08x)", surface->fourcc]];
+    }
+    hv_ramfile_gpu_map((void *)region, srcs, n);
+    if (remap_runs(region, srcs, n)) {
+        hv_ramfile_gpu_relist((void *)region, srcs, n);
+    }
+    free(srcs);
+    surface->object = [device newBufferWithBytesNoCopy:surface->mapped length:surface->length options:MTLResourceStorageModeShared
+                                           deallocator:^(void *at, NSUInteger size) {
+                                               hv_ramfile_gpu_unmap(at);
+                                               vm_deallocate(mach_task_self(), (vm_address_t)at, size);
+                                           }];
+    surface->mapping_in_buffer = surface->object != nil;
+    surfaces[key] = surface;
+    if (planes >= 2) {
+        HvVideoPlane pl[4];
+        uint32_t pl_count = compact ? video_layout_compact(desc, alloc, pl) : video_layout(desc, alloc, pl);
+        NSData *vk = pl_count ? video_key(pages, n, first, alloc, surface->fourcc, sw, sh, pl, pl_count) : nil;
+        HvVideo *v = vk ? [planar objectForKey:vk] : nil;
+        if (v) {
+            planar_unkeep(self, v);
+            static int told;
+            if (told++ < 8) fprintf(stderr, "hengevm: pvg-metal: surface %llu shares the host surface of the same guest memory (fourcc %08x, %u planes)\n", mapping, surface->fourcc, pl_count);
+        } else if (pl_count) {
+            IOSurfaceRef made = make_iosurface(desc, alloc, pl, pl_count, compact);
+            uint8_t *shadow = made ? calloc(1, (size_t)alloc) : NULL;
+            uint8_t *merged = shadow ? calloc(1, (size_t)hv_pvg_video_row_bits(pl, pl_count)) : NULL;
+            if (made && shadow && merged) {
+                v = [HvVideo new];
+                v->iosurface = made, v->shadow = shadow, v->merged = merged, v->alloc = alloc, v->plane_count = pl_count;
+                memcpy(v->plane, pl, pl_count * sizeof *pl);
+                v->video_lock = OS_UNFAIR_LOCK_INIT, v->reader_lock = OS_UNFAIR_LOCK_INIT;
+                v->held = alloc + hv_pvg_video_iosurface_bytes(pl, pl_count);
+                if (vk) planar_add(self, vk, v);
+            } else {
+                if (made) CFRelease(made);
+                free(shadow);
+                free(merged);
+            }
+        }
+        surface->video = v;
+        if (!v) {
+            NSMutableString *m = [NSMutableString stringWithFormat:@"surface %llu: no IOSurface for its planes (alloc %llu):", mapping, alloc];
+            for (int i = 0; i < 96; i++) [m appendFormat:@" %08x", ((const uint32_t *)desc)[i]];
+            [self complain:m];
+        }
+        sync_iosurface(self, surface);
+    }
+    free(pages);
+    surfaces_made++;
+    fprintf(stderr, "hengevm: pvg-metal: surface %llu: %llux%llu, row %llu, %llu KB, fourcc %c%c%c%c planes %u\n",
+            mapping, (unsigned long long)sw, (unsigned long long)sh, row, alloc >> 10, desc[7], desc[6], desc[5], desc[4], planes);
+    return surface;
+}
+
+- (HvObject *)currentSurface:(uint64_t)mapping {
+    HvObject *surface = surfaces[@(mapping)];
+    if (surface && hv_pvg_lite_old_driver(lite)) {
+        const uint8_t *now = hv_pvg_lite_surface(lite, mapping);
+        if (now && (now[0] | now[0x10]) && memcmp(surface->described, now, sizeof surface->described)) {
+            [surfaces removeObjectForKey:@(mapping)];
+            surface = nil;
+        }
+    }
+    return surface ? surface : [self newSurface:mapping];
+}
+
 /* A surface (IOSurface in the guest): a texture over its guest pages, so the
    guest's CPU and the GPU see the same pixels, as they do through a real one.
    {mapping id, tag, size, ref, description}. Its descriptor: page list at +0
@@ -1962,122 +2170,18 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
     if (h.size > head - 8 + 32 && hv_pvg_lite_task_read(lite, task, at, &h, (uint32_t)MIN(8 + (uint64_t)h.size, sizeof h))) {
         memset(h.d + 32, 0, sizeof h.d - 32); /* past the end of the task: keep what the first read had (plane 0) */
     }
-    NSNumber *key = @(h.mapping);
-    HvObject *surface = surfaces[key];
-    if (!surface && h.mapping < HV_PVG_MAPPING_IDS && (unmapped[h.mapping / 8] >> (h.mapping % 8) & 1)) {
+    o->on_mapping = h.mapping;
+    if (h.mapping < HV_PVG_MAPPING_IDS && (unmapped[h.mapping / 8] >> (h.mapping % 8) & 1)) {
         /* unmapped: what its descriptor names may be the guest's other memory now */
         static int told;
         if (told++ < 8) fprintf(stderr, "hengevm: pvg-metal: surface %llu used after the guest unmapped it: not drawn\n", h.mapping);
         o->gone = YES; /* tried again once it is mapped again (object:task:) */
         return;
     }
+    HvObject *surface = [self currentSurface:h.mapping];
+    if (!surface) surface = [self newSurface:h.mapping];
+    if (!surface) return;
     MTLTextureDescriptor *t = h.tag == 0x39 ? descriptor_v2(h.d) : descriptor_v1(h.d);
-    if (!surface) {
-        const uint8_t *guest_desc = hv_pvg_lite_surface(lite, h.mapping);
-        if (!guest_desc) { [self complain:[NSString stringWithFormat:@"surface %llu has no descriptor", h.mapping]]; return; }
-        uint8_t desc[0x400]; /* read once: the guest can change its own while this looks */
-        memcpy(desc, guest_desc, sizeof desc);
-        uint32_t list, first;
-        uint64_t alloc, row;
-        memcpy(&list, desc, 4), memcpy(&alloc, desc + 0x18, 8), memcpy(&row, desc + 0x30, 8), memcpy(&first, desc + 0x60, 4);
-        if (!alloc || alloc > max_buffer || first > max_buffer - alloc) { /* the guest's sizes: no more than a buffer over it takes */
-            [self complain:[NSString stringWithFormat:@"surface %llu of %llu bytes from %u refused", h.mapping, alloc, first]];
-            return;
-        }
-        surface = [HvObject new];
-        surface->length = (alloc + first + 0x3fff) & ~0x3fffull;
-        surface->row = row;
-        surface->first = first;
-        uint64_t sw, sh;
-        memcpy(&sw, desc + 0x20, 8), memcpy(&sh, desc + 0x28, 8), memcpy(&surface->fourcc, desc + 4, 4);
-        surface->surface_w = (uint32_t)sw, surface->surface_h = (uint32_t)sh;
-        uint64_t n = surface->length >> 14;
-        vm_address_t region = 0;
-        const uint32_t *guest_pages = (list & 1) ? hv_pvg_lite_phys(lite, (uint64_t)(list & ~1u) << 12, n * 4) : NULL;
-        uint32_t *pages = guest_pages ? malloc(n * 4) : NULL; /* read once too: what is mapped is what video_key names */
-        void **srcs = pages ? calloc(n, sizeof(void *)) : NULL;
-        if (!srcs || vm_allocate(mach_task_self(), &region, surface->length, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
-            free(pages), free(srcs);
-            [self complain:[NSString stringWithFormat:@"surface %llu has no pages", h.mapping]];
-            return;
-        }
-        memcpy(pages, guest_pages, n * 4);
-        surface->mapped = (uint8_t *)region;
-        /* The page list is in 4 KB units, the host's pages 16 KB: one not on a 16 KB boundary can't be remapped (vm_remap
-           would take the 16 KB page below it, the bytes shifted by 8 KB: bit 0 of an entry is its present bit), so it is zeros, as a page that isn't
-           there, and counted (S3-2); told in the log once per pixel format (complain tells each message once) */
-        uint64_t misaligned = 0;
-        for (uint64_t i = 0; i < n; i++) {
-            void *src = (pages[i] & 1) ? hv_pvg_lite_phys(lite, (uint64_t)(pages[i] & ~1u) << 12, 0x4000) : NULL;
-            if ((uintptr_t)src & 0x3fff) src = NULL, misaligned++;
-            srcs[i] = src;
-        }
-        if (misaligned) {
-            pages_misaligned += misaligned;
-            [self complain:[NSString stringWithFormat:@"surface pages not on a 16 KB boundary: shown as zeros (fourcc %08x)", surface->fourcc]];
-        }
-        /* The guest's pages under the GPU: always in a save while mapped (core/ramfile.h). Pinned before they are
-           remapped, as in map_pages (S3-1) */
-        hv_ramfile_gpu_map((void *)region, srcs, n);
-        if (remap_runs(region, srcs, n)) {
-            /* A run that failed is zeros, as a page that isn't there, and its srcs cleared: listed again without them,
-               in one step (no mapped page is unpinned meanwhile, whatever memory there is) */
-            hv_ramfile_gpu_relist((void *)region, srcs, n);
-        }
-        free(srcs);
-        surface->object = [device newBufferWithBytesNoCopy:surface->mapped length:surface->length options:MTLResourceStorageModeShared
-                                               deallocator:^(void *at, NSUInteger size) {
-                                                   hv_ramfile_gpu_unmap(at); /* first: the address may be reused */
-                                                   vm_deallocate(mach_task_self(), (vm_address_t)at, size);
-                                               }];
-        surface->mapping_in_buffer = surface->object != nil;
-        surfaces[key] = surface;
-        if (desc[0x3e] >= 2) {
-            HvVideoPlane pl[4];
-            uint32_t planes = video_layout(desc, alloc, pl);
-            NSData *vk = planes ? video_key(pages, n, first, alloc, surface->fourcc, sw, sh, pl, planes) : nil;
-            /* The same guest memory, format and layout under another mapping id (another process): the same host side,
-               or what that process drew is not what this one sees. What differs from its shadow is this guest
-               memory's own writing, and goes up as for any other mapping of it (sync_iosurface). */
-            HvVideo *v = vk ? [planar objectForKey:vk] : nil;
-            if (v) {
-                planar_unkeep(self, v); /* mapped again: its mappings hold it */
-                static int told;
-                if (told++ < 8) fprintf(stderr, "hengevm: pvg-metal: surface %llu shares the host surface of the same guest memory (fourcc %08x, %u planes)\n", h.mapping, surface->fourcc, planes);
-            } else if (planes) {
-                IOSurfaceRef made = make_iosurface(desc, alloc, pl, planes);
-                uint8_t *shadow = made ? calloc(1, (size_t)alloc) : NULL; /* as a new IOSurface is: zeros */
-                uint8_t *merged = shadow ? calloc(1, (size_t)hv_pvg_video_row_bits(pl, planes)) : NULL;
-                if (made && merged) {
-                    v = [HvVideo new];
-                    v->iosurface = made, v->shadow = shadow, v->merged = merged, v->alloc = alloc, v->plane_count = planes;
-                    memcpy(v->plane, pl, sizeof pl);
-                    v->held = IOSurfaceGetAllocSize(made) + alloc;
-                    planar_add(self, vk, v);
-                } else {
-                    if (made) CFRelease(made);
-                    free(shadow);
-                }
-            }
-            surface->video = v;
-            if (!v) {
-                NSMutableString *m = [NSMutableString stringWithFormat:@"surface %llu: no IOSurface for its planes (alloc %llu):", h.mapping, alloc];
-                for (int i = 0; i < 96; i++) [m appendFormat:@" %08x", ((const uint32_t *)desc)[i]];
-                [self complain:m];
-            }
-            sync_iosurface(self, surface);
-        }
-        free(pages);
-        /* Said once for each shape: macOS maps about 14 surfaces a second (the window server's layers, the same few
-           sizes again and again), and a line for each was most of the log. The stats line counts them all. */
-        surfaces_made++;
-        uint64_t shape[3] = {(uint64_t)t.width << 32 | t.height, (uint64_t)t.pixelFormat << 32 | ((const uint32_t *)desc)[1], row << 8 | desc[0x3e]};
-        NSData *shape_key = [NSData dataWithBytes:shape length:sizeof shape];
-        if (![surface_shapes containsObject:shape_key] && surface_shapes.count < 4096) {
-            [surface_shapes addObject:shape_key];
-            fprintf(stderr, "hengevm: pvg-metal: surface %llu: %lux%lu format %lu, row %llu, %llu KB, fourcc %c%c%c%c planes %u (a new shape)\n", h.mapping, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, row, alloc >> 10, desc[7], desc[6], desc[5], desc[4], desc[0x3e]);
-        }
-    }
     t.storageMode = MTLStorageModeShared;
     set_framebuffer_only(t, NO);
     t.usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
@@ -2111,7 +2215,7 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
                 o->object = [device newTextureWithDescriptor:t iosurface:v->iosurface plane:(NSUInteger)plane];
             }
         }
-    } else if (surface->object && ![self refuse:t what:@"surface texture" buffer:[(id<MTLBuffer>)surface->object length] offset:surface->first row:surface->row])
+    } else if (surface->object && linear_texture_fits(device, t, surface->first, surface->row, [(id<MTLBuffer>)surface->object length]))
         o->object = [(id<MTLBuffer>)surface->object newTextureWithDescriptor:t offset:surface->first bytesPerRow:surface->row];
     if (!o->object) {
         [self complain:[NSString stringWithFormat:@"surface %llu: format %lu row %llu not possible", h.mapping, (unsigned long)t.pixelFormat, surface->row]];
@@ -2128,6 +2232,14 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
     if (!ref || !list || hv_pvg_lite_task_read(lite, task, list + (uint64_t)ref * 12, e, 12)) return NO;
     HvObject *o = objs_get(task_objects(self, task, NO), ref);
     if (o && !memcmp(o->entry, e, 12) && !o->gone && !(o->surface && o->surface->gone)) { /* over an unmapped surface: made anew */
+        /* macOS 14's (and Ventura's) driver names a surface before it writes the surface's description: try again a while.
+           And it reuses surface ids: a texture over a surface that has since been replaced is made again. */
+        BOOL replaced = o->object && (e[0] & 0xff) == OBJ_MAPPED_TEXTURE && hv_pvg_lite_old_driver(lite) &&
+                        o->surface != [self currentSurface:o->on_mapping];
+        if (replaced) o->retries = 0;
+        if ((!o->object || replaced) && (e[0] & 0xff) == OBJ_MAPPED_TEXTURE && o->retries < 600) {
+            return YES;
+        }
         if (!o->follows) *kept = o;
         else {
             BOOL current = !o->follows->mapped || refresh_pages(self, task, o->follows); /* else made anew, over it made anew */
@@ -2180,10 +2292,13 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
     HvObject *o;
     if (![self entry:ref task:task into:e kept:&o]) return nil;
     if (o) return o;
+    HvTaskObjects *objs = task_objects(self, task, YES); /* entry: read it, so task < HV_TASKS */
+    HvObject *old = objs ? objs_get(objs, ref) : nil;
+    uint32_t tries = old ? old->retries + 1 : 0;
     o = [HvObject new];
     memcpy(o->entry, e, 12);
+    o->retries = tries;
     o->cache_task = task, o->cache_ref = ref;
-    HvTaskObjects *objs = task_objects(self, task, YES); /* entry: read it, so task < HV_TASKS */
     if (!objs || !objs_set(objs, ref, o)) {
         [self complain:@"no memory for a task's object table"];
         return nil;
@@ -2223,6 +2338,10 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
             : type == OBJ_FUNCTION ? KIND_FUNCTION
             : type == 13 ? KIND_HEAP : KIND_NONE;
     if (o->kind == KIND_NONE) o->object = nil;
+    if (o->object && tries > 0) {
+        static int told;
+        if (told++ < 30) fprintf(stderr, "hengevm: pvg-metal: task %u ref %u: texture made on try %u\n", task, ref, tries);
+    }
     return o;
 }
 
@@ -2403,6 +2522,18 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
     p.raster_samples = pre_raster_samples, p.imageblock = pre_imageblock, p.threadgroup = pre_threadgroup;
     p.tile_w = pre_tile_w, p.tile_h = pre_tile_h;
     pre_raster_samples = pre_imageblock = pre_threadgroup = pre_tile_w = pre_tile_h = 0;
+    int named = 0, made = 0;
+    for (int i = -2; i < 8; i++) {
+        uint32_t o = i == -2 ? 0 : i == -1 ? 0x28 : 0x4c + (uint32_t)i * 0x3c;
+        if (o + 4 > r.size || !U32(o)) continue;
+        named++;
+        made += (i == -2 ? tex[0] : i == -1 ? tex[1] : tex[2 + i]) != nil;
+    }
+    if (named && made < named) {
+        static int told;
+        if (told++ < 20) fprintf(stderr, "hengevm: pvg-metal: pass skipped: %d of its %d attachments were never made\n", named - made, named);
+        return nil;
+    }
     const char *why = hv_pvg_pass_problem(&p, caps);
     if (why) {
         NSMutableString *m = [NSMutableString stringWithFormat:@"render pass dropped: %s;", why];
@@ -4569,7 +4700,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 }
 
 - (void)showOnLayer:(uint64_t)mapping swappedAt:(uint64_t)swap_ns {
-    HvObject *surface = surfaces[@(mapping)];
+    HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]);
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     on_screen = mapping;
     BOOL half = surface->fourcc == 'RGhA';
@@ -4582,7 +4713,8 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         t.usage = MTLTextureUsageShaderRead;
         id<MTLBuffer> over = surface->object; /* a surface's object is the buffer over its pages */
         if (!over || [self refuse:t what:@"scanout" buffer:over.length offset:surface->first row:surface->row]) return;
-        surface->scanout = [over newTextureWithDescriptor:t offset:surface->first bytesPerRow:surface->row];
+        if (linear_texture_fits(device, t, surface->first, surface->row, over.length))
+            surface->scanout = [over newTextureWithDescriptor:t offset:surface->first bytesPerRow:surface->row];
         if (!surface->scanout) { [self complain:[NSString stringWithFormat:@"no scanout for surface %llu, row %llu", mapping, surface->row]]; return; }
     }
     os_unfair_lock_lock(&screen_lock);
@@ -4868,7 +5000,8 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
 - (void)present:(uint64_t)mapping swappedAt:(uint64_t)swap_ns {
     double now = now_seconds();
     /* An unmapped id is not brought back to the screen (a late present below, or set_layer's): unmap let it go (5c) */
-    if (!surfaces[@(mapping)]) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
+    HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]);
+    if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     on_screen = mapping;
     if ([self hasDisplayLayer]) {
         late = NO;
@@ -4887,8 +5020,6 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
         return;
     }
     late = NO;
-    HvObject *surface = surfaces[@(mapping)];
-    if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     last_capture = now;
     if (!cb_wait(self, last_cb, HV_PVG_GPU_WAIT, NULL)) { /* the CPU copies the pixels here, so the GPU must be done with them */
         atomic_fetch_add(&gpu_waits_given_up, 1);

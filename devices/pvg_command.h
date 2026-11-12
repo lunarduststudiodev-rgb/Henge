@@ -622,7 +622,7 @@ static inline const char *hv_pvg_pass_problem(HvPass *p, HvTexCaps caps) {
     if (p->raster_samples && (p->raster_samples > 31 || !(caps.samples >> p->raster_samples & 1))) return "raster sample count";
     if (!any) {
         if (!p->width || !p->height || p->width > 16384 || p->height > 16384) return "size, with no attachments";
-        if (!p->raster_samples) return "raster sample count, with no attachments";
+        if (!p->raster_samples) p->raster_samples = 1;
         if (p->layers > 2048) return "render target array length";
         samples = p->raster_samples;
     } else {

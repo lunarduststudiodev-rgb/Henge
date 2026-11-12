@@ -85,6 +85,7 @@ struct HvPvgLite {
        them), and as the Metal side's worker has reached them, which every read the worker makes uses. The device reads
        a define or an object list ahead of the worker, which may still have the number's old task's work queued. */
     PvgTasks tasks, worker_tasks;
+    int old_driver; /* macOS 14's (and older) GPU driver: object lists at a fixed place, compact surface descriptions */
     uint32_t root_told[8]; /* root ring ops below 0x100 already logged as seen, a bit each */
     uint32_t long_told[8]; /* root ring ops already logged as too long to take, a bit each */
     int mapping_told; /* a mapper id outside what Apple's host takes, logged */
@@ -673,8 +674,23 @@ void *hv_pvg_lite_phys(HvPvgLite *p, uint64_t pa, uint64_t length) {
     return (void *)(uintptr_t)hv_phys_ptr_r(p->m, pa, length);
 }
 
+/* macOS 15 and later name each task's object list with command 0x44. Older guest drivers (macOS 13/14
+   seen) never send it: their list is at task offset 0x4000, the same 12-byte entries. */
+#define OLD_DRIVER_OBJECTS 0x4000
 uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task) {
-    return task < 512 ? p->worker_tasks.objects[task] : 0;
+    if (task >= 512) return 0;
+    if (!p->worker_tasks.objects[task] && p->worker_tasks.root[task]) {
+        if (!p->old_driver) {
+            p->old_driver = 1;
+            fprintf(stderr, "hengevm: pvg-lite: an older guest GPU driver (no object list command): its own layouts\n");
+        }
+        return OLD_DRIVER_OBJECTS;
+    }
+    return p->worker_tasks.objects[task];
+}
+
+int hv_pvg_lite_old_driver(HvPvgLite *p) {
+    return p ? p->old_driver : 0;
 }
 
 /* A stamp Metal finished: the guest sees it and the next poll raises the interrupt. */
@@ -932,6 +948,12 @@ static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, 
     uint32_t op = hdr[0] & 0xffff, args[32], skip = (hdr[0] >> 16) * 8; /* the barriers come first */
     uint32_t n = hdr[1] > 12 + skip ? hdr[1] - 12 - skip : 0;
     if (n > sizeof args) n = sizeof args;
+    if (op == 0x37) {
+        if (!p->old_driver) {
+            p->old_driver = 1;
+            fprintf(stderr, "hengevm: pvg-lite: older guest GPU driver (op 0x37): compact layouts enabled\n");
+        }
+    }
     if ((op == 0x38 && n < 16) || (op == 0x44 && n < 28)) return; /* shorter than what it says */
     if (op == 0x38) {
         ring_read(p, table, size, rd + 12 + skip, args, 16);
@@ -960,14 +982,16 @@ static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, 
 #define PVG_MAPPING_IDS HV_PVG_MAPPING_IDS
 static int mapping_id(uint64_t id) { return id - 1 < PVG_MAPPING_IDS - 1; }
 
-/* The mapper's table: a u32 per 16 KB of descriptors (16 of them), physical
-   address >> 12 with bit 0 meaning present. */
+/* The mapper's table: a u32 per 16 KB of descriptors, physical address >> 12 with bit 0 meaning present. */
 const uint8_t *hv_pvg_lite_surface(HvPvgLite *p, uint64_t mapping) {
     if (!mapping_id(mapping)) return NULL; /* none of the ids the mapper takes: no surface, as with Apple's host */
+    /* macOS 14's (and older) driver writes 0x200-byte descriptions, 32 to a page; later ones 0x400, 16 to a page. Reading the
+       older ones as 0x400 apart put id 2k on the first half of "slot" k and never read id 2k+1 at all. */
+    uint32_t per = p->old_driver ? 32 : 16, size = 0x4000 / per;
     uint64_t table = p->io_regs[0x10 / 8];
-    const uint32_t *e = table ? hv_phys_ptr_r(p->m, table + (mapping / 16) * 4ull, 4) : NULL;
+    const uint32_t *e = table ? hv_phys_ptr_r(p->m, table + (mapping / per) * 4ull, 4) : NULL;
     if (!e || !(*e & 1)) return NULL;
-    return hv_phys_ptr_r(p->m, ((uint64_t)(*e & ~1u) << 12) + (mapping % 16) * 0x400ull, 0x400);
+    return hv_phys_ptr_r(p->m, ((uint64_t)(*e & ~1u) << 12) + (mapping % per) * (uint64_t)size, size);
 }
 
 const uint8_t *hv_pvg_lite_display_page(HvPvgLite *p) {
