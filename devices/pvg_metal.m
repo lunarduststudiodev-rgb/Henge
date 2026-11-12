@@ -2215,6 +2215,7 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
                 o->object = [device newTextureWithDescriptor:t iosurface:v->iosurface plane:(NSUInteger)plane];
             }
         }
+    }
     if (!o->object && surface->object) {
         NSUInteger req_row = surface->row >= t.width * pixel_bytes(t.pixelFormat) ? surface->row : t.width * pixel_bytes(t.pixelFormat);
         NSUInteger align = [device minimumLinearTextureAlignmentForPixelFormat:t.pixelFormat];
