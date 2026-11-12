@@ -40,6 +40,7 @@ ALLOWED = {
     },
     "vm.o": {
         "_board_work": BRACKETED + " (board_poll)",
+        "_park_send": BRACKETED + " (board_poll: park_tick)",
         "_hv_vm_boot_display": UI, "_hv_vm_touch": UI, "_hv_vm_touch_button": UI, "_hv_vm_touchscreen_frame": UI,
         "_pause_l": UI, "_restore": UI, "_resume_watch": OWN + " (the resume watcher)", "_save": UI,
     },

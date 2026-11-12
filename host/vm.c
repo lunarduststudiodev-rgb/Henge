@@ -1325,7 +1325,7 @@ void hv_vm_park_pointer(double x, double y) {
     atomic_store(&park_wanted, 1);
 }
 
-static void park_send(void) {
+static HV_HOST_FP_WORK void park_send(void) {
     hv_virtio_input_send(board.tablet, HV_EV_ABS, HV_ABS_X, touch_axis(park_x));
     hv_virtio_input_send(board.tablet, HV_EV_ABS, HV_ABS_Y, touch_axis(park_y));
     hv_virtio_input_send(board.tablet, HV_EV_SYN, 0, 0);
