@@ -5375,11 +5375,7 @@ static BOOL presenter_commit(HvReplay *r, uint64_t generation, CAMetalLayer *tar
                 CFTimeInterval at = d.presentedTime; /* host time, as CLOCK_UPTIME_RAW */
                 hv_frame_presented(at > 0 ? (uint64_t)(at * 1e9) : 0, swap_ns);
             }];
-        if ([cb respondsToSelector:@selector(presentDrawable:afterMinimumDuration:)]) {
-            [cb presentDrawable:drawable afterMinimumDuration:1.0 / 60.0];
-        } else {
-            [cb presentDrawable:drawable];
-        }
+        [cb presentDrawable:drawable];
         r->gpu_frames++;
     } else {
         r->screen_dirty = YES; /* drawn again, for the new target */

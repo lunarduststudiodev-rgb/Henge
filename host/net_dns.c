@@ -49,19 +49,19 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_PENDING 64
+#define MAX_PENDING 128
 #define MAX_SERVERS 12
-#define MAX_INBOX 64
-#define MAX_GAI 8
+#define MAX_INBOX 128
+#define MAX_GAI 24
 #define MAX_ADDRS 16
-#define STAGGER_MS 700
-#define GAI_AFTER_MS 1500
-#define GIVE_UP_MS 5000
+#define STAGGER_MS 80
+#define GAI_AFTER_MS 80
+#define GIVE_UP_MS 3000
 #define SERVERS_FRESH_MS 30000
 #define MTU 1500
 #define TCP_CONNS 16
-#define TCP_TRY_MS 3000
-#define TCP_GIVE_UP_MS 10000
+#define TCP_TRY_MS 800
+#define TCP_GIVE_UP_MS 3000
 #define TCP_IDLE_MS 10000
 
 typedef struct Query { /* as the guest sent it */
@@ -572,7 +572,7 @@ static void new_query(Query q, int64_t now) {
     p->up_id = (uint16_t)arc4random();
     put16(p->q.msg, p->up_id);
     send_next(p, now);
-    if (told_gai && p->gai_type) start_gai(p); /* lately only getaddrinfo answers: no waiting for it */
+    if ((!have_best || told_gai) && p->gai_type) start_gai(p); /* ask the host's own fast resolver without delay */
     maybe_done(p);
 }
 

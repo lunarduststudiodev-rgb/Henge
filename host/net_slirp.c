@@ -586,7 +586,7 @@ static void transmit(void *opaque, const uint8_t *frame, uint32_t len) {
 }
 
 void hv_net_poll(void) {
-    if (!net) return;
+    if (!net || to_guest.head == to_guest.tail) return;
     for (;;) {
         pthread_mutex_lock(&to_guest.mu);
         Frame f = {0, NULL, 0};

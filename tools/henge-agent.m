@@ -914,7 +914,17 @@ static int editability(AXUIElementRef e, BOOL *secure, NSString **role, NSString
             return EDIT_UNKNOWN;
         }
     }
-    if ([r isEqualToString:@"AXWebArea"] || [r isEqualToString:(__bridge NSString *)kAXGroupRole] ||
+    if ([r isEqualToString:@"AXWebArea"]) {
+        // An AXWebArea is the web document container; only check editable ancestor if fast.
+        // If it times out or returns error, it's not a text field (EDIT_NO).
+        CFTypeRef editable = NULL;
+        error = AXUIElementCopyAttributeValue(e, CFSTR("AXEditableAncestor"), &editable);
+        BOOL yes = error == kAXErrorSuccess && editable;
+        if (editable) CFRelease(editable);
+        if (yes) return EDIT_YES;
+        return EDIT_NO;
+    }
+    if ([r isEqualToString:(__bridge NSString *)kAXGroupRole] ||
         [r isEqualToString:(__bridge NSString *)kAXStaticTextRole]) {
         CFTypeRef editable = NULL;
         error = AXUIElementCopyAttributeValue(e, CFSTR("AXEditableAncestor"), &editable);
@@ -1261,7 +1271,16 @@ static void safetyTick(void) {
         if (![signature isEqualToString:overlaysSeen] ||
             (!panelSeen && overlaysCount && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - overlaysSeenAt < panelSettles)) return lookAtFocus();
         if (ticks % 2) return;
-        if ([stateSent isEqualToString:@"unknown"] || focusMovedQuietly()) lookAtFocus();
+        if ([stateSent isEqualToString:@"unknown"]) {
+            // When focus could not be determined (e.g. browser is busy compiling or loading a page),
+            // back off to every ~5s instead of hammering it every second with 250ms timeouts.
+            static unsigned unknownTicks;
+            if (++unknownTicks < 5) return;
+            unknownTicks = 0;
+            lookAtFocus();
+            return;
+        }
+        if (focusMovedQuietly()) lookAtFocus();
     }
 }
 

@@ -23,6 +23,7 @@ enum EngineTuning {
         "HV_FLUSH": "2",       // disk flush: F_BARRIERFSYNC, ordered but without a full fsync
         "HV_WRITE_CACHE": "1", // host disk write caching: avoids 2-3x F_NOCACHE penalty
         "HV_TLBT": "1",        // table-major TLB layout: 9-20% faster in benchmarks
+        "HV_QOS": "ui",        // user-interactive CPU thread QoS for performance core scheduling
         // No HV_STATS: the engine's detailed statistics (a stats block in the log every N seconds, and the extra
         // probes behind it) are for diagnosis, opted into with HV_STATS=10 in henge-env.txt. The counters the
         // freeze and lag records use are counted per CPU without it.
@@ -40,7 +41,7 @@ enum EngineTuning {
             env["HV_WFI_SPIN"] = "50"
         }
         // The Mac's CPU threads at the user-interactive class instead of user-initiated (host/vm.c hv_vm_cpu_qos).
-        if d.bool(forKey: highPriorityKey) { env["HV_QOS"] = "ui" } else { unsetenv("HV_QOS") }
+        if d.object(forKey: highPriorityKey) as? Bool == false { unsetenv("HV_QOS") } else { env["HV_QOS"] = "ui" }
         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }
         if d.object(forKey: writeCacheKey) as? Bool == false { env["HV_WRITE_CACHE"] = "0" }
         if d.bool(forKey: wfeSpinKey) { env["HV_WFE_SPIN"] = "1" } else { unsetenv("HV_WFE_SPIN") }
