@@ -26,13 +26,13 @@ typedef struct HvTexCaps {
 enum { HV_TEX_1D = 0, HV_TEX_1D_ARRAY, HV_TEX_2D, HV_TEX_2D_ARRAY, HV_TEX_2D_MS, HV_TEX_CUBE, HV_TEX_CUBE_ARRAY, HV_TEX_3D,
        HV_TEX_2D_MS_ARRAY, HV_TEX_BUFFER };
 
-/* Formats Metal knows here (any other is an assertion). 255 and 262 are Mac-only. */
+/* Formats Metal knows here (any other is an assertion). 255 and 262 are Mac-only, mapped to 260/261 on iOS. */
 static inline int hv_pvg_format_known(uint32_t f) {
     switch (f) {
     case 1: case 10 ... 14: case 20: case 22 ... 26: case 30 ... 34: case 40 ... 44: case 53 ... 55: case 60: case 62 ... 66:
     case 70 ... 74: case 80: case 81: case 84: case 85: case 90 ... 94: case 103 ... 105: case 110: case 112 ... 116: case 123 ... 125:
     case 130 ... 135: case 140 ... 143: case 150 ... 153: case 160 ... 167: case 170: case 172: case 174: case 176: case 178 ... 183:
-    case 185 ... 200: case 203 ... 218: case 221 ... 236: case 240: case 241: case 250: case 252: case 253: case 260: case 261: case 263:
+    case 185 ... 200: case 203 ... 218: case 221 ... 236: case 240: case 241: case 250: case 252: case 253: case 255: case 260 ... 263:
     case 300 ... 304: case 313 ... 315: case 323 ... 325: case 500 ... 510: case 520 ... 530: case 540 ... 548: case 550 ... 556:
     case 560: case 562 ... 613: case 615 ... 652:
         return 1;
@@ -65,7 +65,7 @@ static inline int hv_pvg_format_limits(uint32_t f) {
     case 130 ... 153: case 185 ... 236: return HV_PF_NO_MSAA | HV_PF_NO_1D; /* BC, ASTC */
     case 170 ... 183: case 651: case 652: return HV_PF_NO_MSAA | HV_PF_NO_1D | HV_PF_NO_3D; /* ETC2, EAC */
     case 160 ... 167: return HV_PF_NO_MSAA | HV_PF_NO_1D | HV_PF_NO_3D | HV_PF_PVRTC;
-    case 250 ... 261: return HV_PF_NO_1D | HV_PF_NO_3D; /* depth, stencil */
+    case 250 ... 263: return HV_PF_NO_1D | HV_PF_NO_3D; /* depth, stencil */
     case 240: case 241: return HV_PF_NO_MSAA | HV_PF_NO_1D | HV_PF_NO_3D | HV_PF_422;
     default: return HV_PF_NO_MSAA; /* video and the other formats Apple keeps to itself */
     }
@@ -139,7 +139,10 @@ static inline int hv_pvg_view_format_ok(uint32_t from, uint32_t f) {
         lo != 174 && lo != 176)
         return 1;
     if (lo >= 186 && lo <= 200 && hi == lo + 18) return 1;
-    return from == 260 && f == 261;
+    if ((from == 260 || from == 255) && (f == 261 || f == 262)) return 1;
+    if ((from == 255 && f == 260) || (from == 260 && f == 255)) return 1;
+    if ((from == 262 && f == 261) || (from == 261 && f == 262)) return 1;
+    return 0;
 }
 
 /* A view of parent (as made) with this format, type, levels and slices. */

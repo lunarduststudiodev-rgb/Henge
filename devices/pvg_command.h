@@ -460,8 +460,8 @@ static inline int hv_pvg_color_format(uint32_t f) {
     default: return hv_pvg_format_known(f) && hv_pvg_linear_bpp(f) != 0;
     }
 }
-static inline int hv_pvg_depth_format(uint32_t f) { return f == 250 || f == 252 || f == 260; }
-static inline int hv_pvg_stencil_format(uint32_t f) { return f == 253 || f == 260; }
+static inline int hv_pvg_depth_format(uint32_t f) { return f == 250 || f == 252 || f == 255 || f == 260; }
+static inline int hv_pvg_stencil_format(uint32_t f) { return f == 253 || f == 255 || f == 260 || f == 262; }
 
 static inline int hv_pvg_is_cube(uint32_t type) { return type == HV_TEX_CUBE || type == HV_TEX_CUBE_ARRAY; }
 
@@ -604,7 +604,7 @@ static inline const char *hv_pvg_pass_problem(HvPass *p, HvTexCaps caps) {
        the same level and slice for both", and the same of their resolve textures. Two textures of their own formats
        (Depth32Float and Stencil8) are fine. */
     const HvPassAttach *pd = &p->depth, *ps = &p->stencil;
-    if (pd->present && ps->present && (pd->tex.format == 260 || ps->tex.format == 260)) {
+    if (pd->present && ps->present && (pd->tex.format == 260 || ps->tex.format == 260 || pd->tex.format == 255 || ps->tex.format == 255)) {
         if (pd->texture != ps->texture || pd->level != ps->level || pd->slice != ps->slice)
             return "depth and stencil in the combined format, but not the same texture, level and slice";
         if (pd->has_resolve && ps->has_resolve &&
@@ -716,7 +716,10 @@ static inline const char *hv_pvg_pipeline_problem(const HvPipe *p, HvTexCaps cap
     if (p->form == 0) {
         if (p->depth && !hv_pvg_depth_format(p->depth)) return "the depth pixel format";
         if (p->stencil && !hv_pvg_stencil_format(p->stencil)) return "the stencil pixel format";
-        if (p->depth && p->stencil && p->depth != p->stencil && (p->depth == 260 || p->stencil == 260))
+        if (p->depth && p->stencil && p->depth != p->stencil &&
+            (p->depth == 260 || p->stencil == 260 || p->depth == 255 || p->stencil == 255) &&
+            !((p->depth == 255 && p->stencil == 260) || (p->depth == 260 && p->stencil == 255) ||
+              (p->depth == 255 && p->stencil == 255)))
             return "a depth and stencil format that don't match";
     }
     if (p->form == 0 && caps.color_bytes && hv_pvg_format_bytes(p->color) > caps.color_bytes) return "colour targets' bytes a sample";
@@ -775,7 +778,8 @@ static inline const char *hv_pvg_buffer_image_problem(HvPixelBlock b, const uint
 
 /* The block a copy moves: depth with stencil says which of the two (blit options 1 depth, 2 stencil); others say none. */
 static inline HvPixelBlock hv_pvg_copy_block(uint32_t f, uint64_t options) {
-    if (f == 260) return options == 1 ? (HvPixelBlock){1, 1, 4} : options == 2 ? (HvPixelBlock){1, 1, 1} : (HvPixelBlock){0, 0, 0};
+    if (f == 260 || f == 255) return options == 1 ? (HvPixelBlock){1, 1, 4} : options == 2 ? (HvPixelBlock){1, 1, 1} : (HvPixelBlock){0, 0, 0};
+    if (f == 261 || f == 262) return (HvPixelBlock){1, 1, 1};
     return options ? (HvPixelBlock){0, 0, 0} : hv_pvg_block(f);
 }
 

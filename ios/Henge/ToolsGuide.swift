@@ -14,6 +14,7 @@ struct ToolsGuide: View {
 
     @State private var stage = Stage.none
     @State private var expanded = false // the card, rather than the small button
+    @State private var dismissed = false // dismissed for this session by tapping (x) or Not Now
 
     var body: some View {
         // Clear and out of the way of touches, so it is there (and follows along) with or without a card.
@@ -37,31 +38,50 @@ struct ToolsGuide: View {
 
     // MARK: The small button
 
-    /// Waits in the corner until the person is ready: tapping it opens the card.
+    /// Waits in the corner until the person is ready: tapping it opens the card, or (x) dismisses it.
     private var chip: some View {
-        Button { expanded = true } label: {
-            HStack(spacing: 8) {
-                Image(systemName: symbol).font(.system(size: 14, weight: .semibold)).foregroundStyle(Color.accentColor)
-                Text(stage == .permission ? "Allow Henge Tools" : "Set Up Henge Tools").font(.subheadline.weight(.semibold))
+        HStack(spacing: 0) {
+            Button { expanded = true } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: symbol).font(.system(size: 14, weight: .semibold)).foregroundStyle(Color.accentColor)
+                    Text(stage == .permission ? "Allow Henge Tools" : "Set Up Henge Tools").font(.subheadline.weight(.semibold))
+                }
+                .padding(.leading, 14)
+                .padding(.trailing, 6)
+                .frame(height: 36)
             }
-            .padding(.horizontal, 14)
-            .frame(height: 36)
-            .background(.regularMaterial, in: Capsule())
-            .overlay(Capsule().strokeBorder(.white.opacity(0.12)))
-            .shadow(color: .black.opacity(0.3), radius: 10, y: 3)
-            .contentShape(Capsule())
+            .buttonStyle(.plain)
+
+            Button {
+                dismissed = true
+                stage = .none
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .frame(height: 36)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss")
         }
-        .buttonStyle(.plain)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(.white.opacity(0.12)))
+        .shadow(color: .black.opacity(0.3), radius: 10, y: 3)
         .environment(\.colorScheme, .dark)
         .contextMenu {
-            if stage == .install {
-                Button("Don't Show for This Mac", systemImage: "eye.slash") { neverAsk() }
+            Button("Dismiss", systemImage: "xmark") {
+                dismissed = true
+                stage = .none
             }
+            Button("Don't Show for This Mac", systemImage: "eye.slash") { neverAsk() }
         }
         .accessibilityHint("Shows how to install Henge Tools on this Mac")
     }
 
     private func neverAsk() {
+        dismissed = true
         Sharing.setNeverAskAboutTools(true, for: mac.id)
         HengeLog.log("tools", "asked not to show Henge Tools for this Mac")
         stage = .none
@@ -139,18 +159,20 @@ struct ToolsGuide: View {
     @ViewBuilder private func actions<Primary: View>(@ViewBuilder _ primary: () -> Primary) -> some View {
         HStack(spacing: 10) {
             primary()
-            Button("Not Now") { expanded = false }
-                .buttonStyle(.bordered)
+            Button("Not Now") {
+                expanded = false
+                dismissed = true
+                stage = .none
+            }
+            .buttonStyle(.bordered)
         }
         .controlSize(.regular)
         .padding(.top, 2)
-        if stage == .install {
-            Button("Don't show this for this Mac") { neverAsk() }
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .buttonStyle(.plain)
-                .accessibilityHint("You can still install Henge Tools from Details")
-        }
+        Button("Don't show this for this Mac") { neverAsk() }
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+            .buttonStyle(.plain)
+            .accessibilityHint("You can still install Henge Tools from Details")
     }
 
     /// Something to know before pressing the button.
@@ -220,12 +242,13 @@ struct ToolsGuide: View {
             switch watch.look(at: Date().timeIntervalSince(began), keys: henge_vm_keys_pressed() > 0, clicks: henge_vm_clicks() > 0,
                               linked: linked, current: current, ready: henge_share_touch_ready() != 0) {
             case .ready: next = asked ? .done : .none
-            case .permission: next = .permission
+            case .permission:
+                next = Sharing.neverAskAboutTools(for: mac.id) || dismissed ? .none : .permission
             case .missing:
                 // No helper by now: removed, or never installed. Install plugs the Henge Tools disk in and opens its
                 // installer, unless the disk couldn't be unpacked: then there's nothing to offer.
                 Sharing.noteTools(current: false, for: mac.id)
-                next = Sharing.neverAskAboutTools(for: mac.id) || Sharing.toolsDisk == nil ? .none : .install
+                next = Sharing.neverAskAboutTools(for: mac.id) || Sharing.toolsDisk == nil || dismissed ? .none : .install
             case .wait: next = .none
             }
             if next != stage {

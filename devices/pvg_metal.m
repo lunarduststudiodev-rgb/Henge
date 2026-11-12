@@ -908,6 +908,8 @@ static MTLTextureSwizzleChannels safe_swizzle(const uint8_t *sw, const uint8_t *
 
 /* Metal's pixel format setter stops the app on a number it doesn't know: those are Invalid, which the checks refuse */
 static MTLPixelFormat guest_format(uint32_t f) {
+    if (f == 255) return MTLPixelFormatDepth32Float_Stencil8; /* MTLPixelFormatDepth24Unorm_Stencil8 (macOS only) -> Depth32Float_Stencil8 on iOS */
+    if (f == 262) return MTLPixelFormatX32_Stencil8; /* MTLPixelFormatX24_Stencil8 (macOS only) -> X32_Stencil8 on iOS */
     return hv_pvg_format_known(f) ? (MTLPixelFormat)f : MTLPixelFormatInvalid;
 }
 
@@ -1143,6 +1145,9 @@ static HvPipe pipe_desc(id descriptor, int form /* 0 render, 1 tile, 2 compute *
         return p;
     }
     MTLRenderPipelineDescriptor *d = descriptor;
+    if ((uint32_t)d.depthAttachmentPixelFormat == 255) d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    if ((uint32_t)d.stencilAttachmentPixelFormat == 255) d.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    else if ((uint32_t)d.stencilAttachmentPixelFormat == 262) d.stencilAttachmentPixelFormat = MTLPixelFormatX32_Stencil8;
     p.vertex = d.vertexFunction != nil, p.fragment = d.fragmentFunction != nil;
     p.alpha_to_coverage = d.alphaToCoverageEnabled, p.alpha_to_one = d.alphaToOneEnabled;
     for (int i = 0; i < 8; i++) {
@@ -1632,9 +1637,12 @@ static void pipeline_timed(HvReplay *r, double t) {
         o->surface = parent->surface;
         over_surface(o);
         NSRange levels = NSMakeRange((NSUInteger)v.levels[0], (NSUInteger)v.levels[1]), slices = NSMakeRange((NSUInteger)v.slices[0], (NSUInteger)v.slices[1]);
-        if (h.tag == 7) o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)v.format];
-        else if (h.tag == 8) o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)v.format textureType:(MTLTextureType)v.type levels:levels slices:slices];
-        else o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)v.format textureType:(MTLTextureType)v.type levels:levels slices:slices
+        uint32_t vf = v.format;
+        if (vf == 255) vf = (uint32_t)MTLPixelFormatDepth32Float_Stencil8;
+        if (vf == 262) vf = (uint32_t)MTLPixelFormatX32_Stencil8;
+        if (h.tag == 7) o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)vf];
+        else if (h.tag == 8) o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)vf textureType:(MTLTextureType)v.type levels:levels slices:slices];
+        else o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)vf textureType:(MTLTextureType)v.type levels:levels slices:slices
                                                      swizzle:safe_swizzle(v.swizzle, (const uint8_t *)&v, sizeof v, "view")];
         if (!o->object) [self complain:[NSString stringWithFormat:@"view tag %u of format %lu as %u failed", h.tag, (unsigned long)from.pixelFormat, v.format]];
         return;
@@ -2519,8 +2527,11 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
     memset(&p, 0, sizeof p);
     id<MTLTexture> tex[10], res[10]; /* depth, stencil, colours */
     [self attach:&p.depth texture:&tex[0] resolve:&res[0] rec:r at:0 task:task];
+    if (p.depth.present && p.depth.tex.format == 255) p.depth.tex.format = 260;
     memcpy(&p.clear_depth, r.p + 0x1c, 8);
     [self attach:&p.stencil texture:&tex[1] resolve:&res[1] rec:r at:0x28 task:task];
+    if (p.stencil.present && p.stencil.tex.format == 255) p.stencil.tex.format = 260;
+    else if (p.stencil.present && p.stencil.tex.format == 262) p.stencil.tex.format = 261;
     double clear[8][4];
     memset(clear, 0, sizeof clear);
     for (int i = 0; i < 8; i++) {
@@ -5767,8 +5778,8 @@ static void lab_add(LabTally *t, uint64_t bytes) { t->n++, t->bytes += bytes; }
 /* Bytes a pixel, for plain formats; 0 for compressed and packed ones this test skips. */
 static uint32_t lab_bpp(MTLPixelFormat f) {
     if (f == MTLPixelFormatDepth16Unorm) return 2;
-    if (f == MTLPixelFormatDepth32Float) return 4;
-    if (f == MTLPixelFormatStencil8) return 1;
+    if (f == MTLPixelFormatDepth32Float || f == (MTLPixelFormat)255 || f == MTLPixelFormatDepth32Float_Stencil8) return 4;
+    if (f == MTLPixelFormatStencil8 || f == (MTLPixelFormat)262 || f == MTLPixelFormatX32_Stencil8) return 1;
     if (f >= 1 && f < 20) return 1;
     if (f >= 20 && f < 50) return 2;
     if (f >= 50 && f < 100) return 4;
@@ -6336,7 +6347,7 @@ static id<MTLBlitCommandEncoder> sw_blit(SnapW *w) {
 static BOOL snap_is_depth(MTLPixelFormat f) {
     switch (f) {
     case MTLPixelFormatDepth16Unorm: case MTLPixelFormatDepth32Float: case MTLPixelFormatStencil8:
-    case MTLPixelFormatDepth32Float_Stencil8: case MTLPixelFormatX32_Stencil8:
+    case (MTLPixelFormat)255: case MTLPixelFormatDepth32Float_Stencil8: case (MTLPixelFormat)262: case MTLPixelFormatX32_Stencil8:
         return YES;
     default: return NO;
     }
