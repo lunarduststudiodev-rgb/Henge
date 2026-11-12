@@ -19,6 +19,16 @@ defaults delete NSGlobalDomain NSNavPanelExpandedStateForSaveMode2 2>/dev/null
 defaults delete NSGlobalDomain PMPrintingExpandedStateForPrint 2>/dev/null
 defaults delete NSGlobalDomain PMPrintingExpandedStateForPrint2 2>/dev/null
 defaults delete NSGlobalDomain CGDisableCursorLocationMagnification 2>/dev/null
+defaults delete NSGlobalDomain KeyRepeat 2>/dev/null
+defaults delete NSGlobalDomain InitialKeyRepeat 2>/dev/null
+defaults delete NSGlobalDomain ApplePressAndHoldEnabled 2>/dev/null
+defaults delete NSGlobalDomain NSAutomaticSpellingCorrectionEnabled 2>/dev/null
+defaults delete NSGlobalDomain NSAutomaticCapitalizationEnabled 2>/dev/null
+defaults delete NSGlobalDomain NSAutomaticPeriodSubstitutionEnabled 2>/dev/null
+defaults delete NSGlobalDomain NSAutomaticQuoteSubstitutionEnabled 2>/dev/null
+defaults delete NSGlobalDomain NSAutomaticDashSubstitutionEnabled 2>/dev/null
+defaults delete NSGlobalDomain AppleEnableSwipeNavigateWithScrolls 2>/dev/null
+defaults delete NSGlobalDomain AppleMiniaturizeOnDoubleClick 2>/dev/null
 
 defaults delete com.apple.dock launchanim 2>/dev/null
 defaults delete com.apple.dock expose-animation-duration 2>/dev/null
@@ -26,6 +36,8 @@ defaults delete com.apple.dock autohide-delay 2>/dev/null
 defaults delete com.apple.dock autohide-time-modifier 2>/dev/null
 defaults delete com.apple.dock mineffect 2>/dev/null
 defaults delete com.apple.dock workspaces-swoosh-animation-off 2>/dev/null
+defaults delete com.apple.dock workspaces-auto-swoosh 2>/dev/null
+defaults delete com.apple.dock appswitcher-all-displays 2>/dev/null
 defaults delete com.apple.dock mru-spaces 2>/dev/null
 defaults delete com.apple.dock expose-group-apps 2>/dev/null
 

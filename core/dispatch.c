@@ -1399,26 +1399,26 @@ static void *fast_resume(HvCpu *cpu) {
     if (off < 0) off = getenv("HV_NO_FAST_RESUME") != NULL;
     HvMachine *m = cpu->m;
     HvPerCpu *p = cpu->pc_state;
-    if (off || !m->chain || m->trace || m->log >= 2 || !p || hv_at_stop(m, cpu->pc) || cpu->halted || cpu->off) { if (m->stats_interval) HV_CPU_COUNT(cpu, fr_fail[0], 1); return NULL; }
-    if (__atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED) || __atomic_load_n(&m->flush_pending, __ATOMIC_RELAXED) ||
-        __atomic_load_n(&m->stw_active, __ATOMIC_RELAXED) || __atomic_load_n(&m->pause_req, __ATOMIC_RELAXED)) {
+    if (__builtin_expect(off || !m->chain || m->trace || m->log >= 2 || !p || hv_at_stop(m, cpu->pc) || cpu->halted || cpu->off, 0)) { if (m->stats_interval) HV_CPU_COUNT(cpu, fr_fail[0], 1); return NULL; }
+    if (__builtin_expect(__atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED) || __atomic_load_n(&m->flush_pending, __ATOMIC_RELAXED) ||
+        __atomic_load_n(&m->stw_active, __ATOMIC_RELAXED) || __atomic_load_n(&m->pause_req, __ATOMIC_RELAXED), 0)) {
         if (m->stats_interval) HV_CPU_COUNT(cpu, fr_fail[1], 1);
         return NULL;
     }
-    if ((p->irq_line && !(cpu->daif & HV_PSTATE_I)) || (p->fiq_line && !(cpu->daif & HV_PSTATE_F))) { if (m->stats_interval) HV_CPU_COUNT(cpu, fr_fail[2], 1); return NULL; }
-    if (cpu->timer_due && mach_absolute_time() >= cpu->timer_due) { if (m->stats_interval) HV_CPU_COUNT(cpu, fr_fail[3], 1); return NULL; }
+    if (__builtin_expect((p->irq_line && !(cpu->daif & HV_PSTATE_I)) || (p->fiq_line && !(cpu->daif & HV_PSTATE_F)), 0)) { if (m->stats_interval) HV_CPU_COUNT(cpu, fr_fail[2], 1); return NULL; }
+    if (__builtin_expect(cpu->timer_due && mach_absolute_time() >= cpu->timer_due, 0)) { if (m->stats_interval) HV_CPU_COUNT(cpu, fr_fail[3], 1); return NULL; }
     uint32_t flags = block_flags(cpu);
     int kernel = flags & HV_BLOCK_EL1;
     uint64_t va = cpu->pc;
-    if ((int)((va >> 55) & 1) != kernel || (va & 3)) return NULL;
+    if (__builtin_expect((int)((va >> 55) & 1) != kernel || (va & 3), 0)) return NULL;
     uint64_t tag = va ^ cpu->ijc_salt[kernel];
     uint64_t *ent = p->ijc + (size_t)hv_ijc_table(flags) * (HV_IJC_TABLE_BYTES / 8) + (size_t)hv_ijc_index(tag) * 2;
     void *code = ent[0] == tag ? (void *)(uintptr_t)ent[1] : ent[2] == tag ? (void *)(uintptr_t)ent[3] : NULL;
-    if (code) {
+    if (__builtin_expect(code != NULL, 1)) {
         int z = hv_jit_zone_of(m, code);
         if (z >= 0) p->zone_hits[z]++; /* which zones are in use (make_room) */
     } else code = hv_ijc_resolve(cpu, va, flags); /* made already but not cached: cache it */
-    if (code) {
+    if (__builtin_expect(code != NULL, 1)) {
         cpu->exit_reason = HV_EXIT_BRANCH;
         if (m->stats_interval) HV_CPU_COUNT(cpu, fast_resumes, 1);
     } else if (m->stats_interval) HV_CPU_COUNT(cpu, fr_fail[4], 1);

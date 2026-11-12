@@ -134,6 +134,10 @@ int henge_vm_knob(const char *name, int value);
 /* Microseconds an idle CPU watches for work before it sleeps (HV_WFI_SPIN), changed while a Mac runs: read at each
    sleep, so nothing is translated again for it (as henge_vm_knob would have). */
 void henge_vm_idle_spin(int us);
+/* Current thermal pressure state (0 nominal, 1 fair, 2 hot/serious, 3 critical).
+   Adapts frame pacing and display refresh dynamically to prevent M1 overheating and throttle. */
+void henge_vm_set_thermal(int state);
+int henge_vm_get_thermal(void);
 /* The memory balloon (only with HV_BALLOON set before boot): asks the guest to hand over target_mb (when >= 0)
    and returns how many MB it has handed over, or -1 without a balloon. */
 long henge_vm_balloon(long target_mb);

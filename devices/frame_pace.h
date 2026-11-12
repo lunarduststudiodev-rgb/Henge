@@ -108,4 +108,9 @@ extern _Atomic int hv_frame_watch;
 static inline int hv_frame_watching(void) { return atomic_load_explicit(&hv_frame_watch, memory_order_relaxed); }
 void hv_frame_watch_set(int on);
 
+/* Dynamic thermal state tracking (0: nominal, 1: fair/warm, 2: serious/hot, 3: critical).
+   Enables frame pacing adaptation and refresh clamping to prevent thermal throttling. */
+void hv_thermal_set_state(int state);
+int hv_thermal_get_state(void);
+
 #endif

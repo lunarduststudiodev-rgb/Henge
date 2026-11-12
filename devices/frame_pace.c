@@ -168,3 +168,14 @@ void hv_frame_flow_summary(const HvFrameFlowCopy *a, const HvFrameFlowCopy *b, H
     span_summary(&a->held, &b->held, &s->held);
     span_summary(&a->guest_waited, &b->guest_waited, &s->guest_waited);
 }
+
+static _Atomic int hv_thermal_state_val;
+
+void hv_thermal_set_state(int state) {
+    atomic_store_explicit(&hv_thermal_state_val, state, memory_order_release);
+}
+
+int hv_thermal_get_state(void) {
+    return atomic_load_explicit(&hv_thermal_state_val, memory_order_acquire);
+}
+

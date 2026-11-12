@@ -36,6 +36,7 @@
 #include <os/lock.h>
 #include <stdatomic.h>
 #include "pvg_lite.h"
+#include "frame_pace.h"
 #include "gpu_switch.h"
 #include "../host/host_fp.h"
 
@@ -1249,7 +1250,8 @@ void hv_pvg_lite_mapper_done(HvPvgLite *p, uint64_t index, uint64_t gen) {
 static void vblank(HvPvgLite *p) {
     if (!p || !p->display_pa) return;
     static int env_checked = 0;
-    static uint64_t period, next;
+    static uint64_t base_period, period, next;
+    static int last_thermal = -1;
     if (!env_checked) {
         env_checked = 1;
         p->vblank_on = 1;
@@ -1257,9 +1259,25 @@ static void vblank(HvPvgLite *p) {
         if (e && !atoi(e)) p->vblank_on = 0;
         const char *hz = getenv("HV_HZ");
         uint64_t r = hz && atoi(hz) > 0 ? (uint64_t)atoi(hz) : 60;
-        period = 24000000ull / r; /* host counter ticks (24 MHz) */
+        base_period = 24000000ull / r; /* host counter ticks (24 MHz) */
+        period = base_period;
     }
     if (!p->vblank_on) return;
+    int heat = hv_thermal_get_state();
+    if (heat != last_thermal) {
+        last_thermal = heat;
+        if (heat >= 3) {
+            /* Critical: clamp refresh to 30 Hz (800,000 ticks) */
+            uint64_t crit_period = 24000000ull / 30;
+            period = crit_period > base_period ? crit_period : base_period;
+        } else if (heat >= 2) {
+            /* Hot / Serious: clamp refresh to 60 Hz (400,000 ticks) */
+            uint64_t hot_period = 24000000ull / 60;
+            period = hot_period > base_period ? hot_period : base_period;
+        } else {
+            period = base_period;
+        }
+    }
     uint8_t *d = hv_phys_ptr_w(p->m, p->display_pa, 0x4000);
     if (!d || !(__atomic_load_n((uint32_t *)(d + 0x104), __ATOMIC_ACQUIRE) & 8)) return;
     uint64_t now = mach_absolute_time();

@@ -149,6 +149,7 @@ const char *hv_vm_reason_name(int r) {
 static void touchscreen_tick(void);
 static void park_tick(void);
 static void power_tick(void);
+static void volume_tick(void);
 
 /* Host-side device work on CPU 0's thread each tick, under the host's FPCR (host/host_fp.h): the pointer's
    parking computes in floating point, and the network and the Mac's graphics poll may. */
@@ -158,6 +159,7 @@ static HV_HOST_FP_WORK void board_work(void) {
     touchscreen_tick();
     park_tick();
     power_tick();
+    volume_tick();
 }
 static void board_poll(void) {
     HvHostFp fp = hv_host_fp_begin();
@@ -381,6 +383,7 @@ void hv_vm_set_power(double percent, int external, int charging, int full) {
     power_known = 1;
     if (power_dev) hv_power_source_set(power_dev, &power_state);
     pthread_mutex_unlock(&power_mu);
+    hv_share_set_battery(percent, external, charging, full);
 }
 
 static void add_power_source(int which) {
@@ -1180,6 +1183,10 @@ void hv_vm_host_network(int up) {
 
 void hv_vm_key(uint16_t code, int down) {
     hv_xhci_key_linux(board.usb, code, down);
+    if (board.keyboard) {
+        hv_virtio_input_send(board.keyboard, HV_EV_KEY, code, down);
+        hv_virtio_input_send(board.keyboard, HV_EV_SYN, 0, 0);
+    }
 }
 
 void hv_vm_key_hid(uint8_t usage, int down) {
@@ -1203,9 +1210,43 @@ void hv_vm_speaker_host_volume(double level) {
     if (a) hv_usb_audio_host_volume(a, hv_usb_audio_scalar_to_db(level));
 }
 
+static _Atomic int pending_volume_key;
+static int volume_key_held, volume_key_ticks;
+
+static void volume_tick(void) {
+    int key = atomic_exchange(&pending_volume_key, 0);
+    if (key) {
+        if (volume_key_held) {
+            hv_xhci_key_linux(board.usb, (uint16_t)volume_key_held, 0);
+            if (board.keyboard) {
+                hv_virtio_input_send(board.keyboard, HV_EV_KEY, (uint16_t)volume_key_held, 0);
+                hv_virtio_input_send(board.keyboard, HV_EV_SYN, 0, 0);
+            }
+        }
+        volume_key_held = key > 0 ? 115 : key < 0 ? 114 : 113;
+        volume_key_ticks = 2; /* hold for ~16-32 ms across ticks */
+        hv_xhci_key_linux(board.usb, (uint16_t)volume_key_held, 1);
+        if (board.keyboard) {
+            hv_virtio_input_send(board.keyboard, HV_EV_KEY, (uint16_t)volume_key_held, 1);
+            hv_virtio_input_send(board.keyboard, HV_EV_SYN, 0, 0);
+        }
+    } else if (volume_key_held) {
+        if (--volume_key_ticks <= 0) {
+            hv_xhci_key_linux(board.usb, (uint16_t)volume_key_held, 0);
+            if (board.keyboard) {
+                hv_virtio_input_send(board.keyboard, HV_EV_KEY, (uint16_t)volume_key_held, 0);
+                hv_virtio_input_send(board.keyboard, HV_EV_SYN, 0, 0);
+            }
+            volume_key_held = 0;
+        }
+    }
+}
+
 void hv_vm_speaker_host_key(int key) {
     HvUsbAudio *a = speaker();
     if (a) hv_usb_audio_host_key(a, key > 0 ? HV_USB_AUDIO_KEY_VOLUME_UP : key < 0 ? HV_USB_AUDIO_KEY_VOLUME_DOWN : HV_USB_AUDIO_KEY_MUTE);
+    atomic_store(&pending_volume_key, key);
+    hv_share_volume_key(key);
 }
 
 int hv_vm_speaker_volume(double *level, int *mute) {
@@ -1308,6 +1349,9 @@ static void park_tick(void) {
         if (where == 0xffffffff) fprintf(stderr, "hengevm: pointer: macOS has it, off the screen; kept at %.2f,%.2f\n", park_x, park_y);
         else fprintf(stderr, "hengevm: pointer: macOS has it at %u,%u; kept at %.2f,%.2f of the screen\n", where & 0xffff,
                      where >> 16, park_x, park_y);
+        park_send();
+        atomic_store(&park_wanted, 0);
+        return;
     }
     park_send();
 }
@@ -1321,7 +1365,7 @@ void hv_vm_touch(double x, double y) {
 
 void hv_vm_touch_button(double x, double y, int button, int down) {
     if (button < 0 || button > 2) return;
-    atomic_store_explicit(&park_wanted, 0, memory_order_relaxed);
+    mouse_shows_pointer();
     hv_virtio_input_send(board.tablet, HV_EV_ABS, HV_ABS_X, touch_axis(x));
     hv_virtio_input_send(board.tablet, HV_EV_ABS, HV_ABS_Y, touch_axis(y));
     hv_virtio_input_send(board.tablet, HV_EV_KEY, button_codes[button], down);
@@ -1330,6 +1374,7 @@ void hv_vm_touch_button(double x, double y, int button, int down) {
 
 /* The guest takes a wheel event as 8 bits: -200 arrives as +56, the wrong way. So big moves go in pieces. */
 static void wheel(uint16_t axis, int amount) { /* not the pointer back: a finger's swipe scrolls with this too */
+    atomic_store_explicit(&park_wanted, 0, memory_order_relaxed);
     while (amount) {
         int piece = amount > 100 ? 100 : amount < -100 ? -100 : amount;
         mouse_report(0, 0, axis == HV_REL_WHEEL ? piece : 0, axis == HV_REL_HWHEEL ? piece : 0);
@@ -1337,8 +1382,14 @@ static void wheel(uint16_t axis, int amount) { /* not the pointer back: a finger
     }
 }
 
-void hv_vm_mouse_wheel(int dy) { wheel(HV_REL_WHEEL, dy); }
-void hv_vm_mouse_hwheel(int dx) { wheel(HV_REL_HWHEEL, dx); }
+void hv_vm_mouse_wheel(int dy) {
+    mouse_shows_pointer();
+    wheel(HV_REL_WHEEL, dy);
+}
+void hv_vm_mouse_hwheel(int dx) {
+    mouse_shows_pointer();
+    wheel(HV_REL_HWHEEL, dx);
+}
 
 int hv_vm_pointer(int *x, int *y) {
     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);

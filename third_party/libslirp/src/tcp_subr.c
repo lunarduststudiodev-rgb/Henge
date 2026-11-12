@@ -428,6 +428,9 @@ int tcp_fconnect(struct socket *so, unsigned short af)
         setsockopt(s, SOL_SOCKET, SO_OOBINLINE, (const void *) &opt, sizeof(opt));
         opt = 1;
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const void *) &opt, sizeof(opt));
+        int buf_sz = 1024 * 1024;
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const void *)&buf_sz, sizeof(buf_sz));
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const void *)&buf_sz, sizeof(buf_sz));
 
         addr = so->fhost.ss;
         DEBUG_CALL(" connect()ing");

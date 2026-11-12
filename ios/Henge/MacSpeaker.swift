@@ -109,8 +109,20 @@ final class MacSpeaker {
             setByMac = nil // the Mac's own change, coming back
             return
         }
-        if abs(abs(new - old) - Self.buttonStep) < 0.01 {
-            henge_vm_speaker_host_key(new > old ? 1 : -1) // a button: macOS steps its volume and shows it
+        let delta = new - old
+        let absDelta = abs(delta)
+        // A physical button press moves volume in ~1/16 (0.0625) increments.
+        // It can also hit the min/max boundary (0.0 or 1.0) with a smaller fractional step,
+        // or deliver multiple steps if pressed rapidly.
+        let isBoundary = (new >= 0.99 && old > 0.9) || (new <= 0.01 && old < 0.1)
+        let isButtonStep = abs(absDelta - Self.buttonStep) < 0.02 || isBoundary
+        let isMultiButton = absDelta > 0.04 && absDelta <= Self.buttonStep * 3.5 && abs(absDelta.remainder(dividingBy: Self.buttonStep)) < 0.025
+
+        if isButtonStep || isMultiButton {
+            let steps = max(1, Int(round(absDelta / Self.buttonStep)))
+            for _ in 0..<steps {
+                henge_vm_speaker_host_key(delta > 0 ? 1 : -1) // a button: macOS steps its volume and shows it
+            }
         } else {
             henge_vm_speaker_host_volume(Double(new))
         }

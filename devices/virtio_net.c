@@ -16,6 +16,10 @@
 
 static void notify(HvVirtio *v, int q) {
     HvVirtioNet *n = v->dev;
+    if (q == RXQ) {
+        if (n->rx_notify) n->rx_notify(n->opaque);
+        return;
+    }
     if (q != TXQ) return; /* new receive buffers: nothing waiting to deliver */
     static HvVirtqElem e;
     static uint8_t frame[MAX_FRAME];

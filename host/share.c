@@ -992,6 +992,41 @@ int hv_share_touch_linked(void) {
 void hv_share_touch_ask(void) { link_send("ask\n"); }
 void hv_share_tools_open(void) { link_send("tools\n"); }
 
+int hv_share_volume_key(int key) {
+    if (!link_can(HV_AGENT_SINCE_VOLUME)) return 0;
+    link_send("volume %d\n", key);
+    return 1;
+}
+
+static pthread_mutex_t battery_mu = PTHREAD_MUTEX_INITIALIZER;
+static double battery_percent = 100.0;
+static int battery_external = 1;
+static int battery_charging = 0;
+static int battery_full = 1;
+static int battery_known = 0;
+
+void hv_share_set_battery(double percent, int external, int charging, int full) {
+    pthread_mutex_lock(&battery_mu);
+    battery_percent = percent;
+    battery_external = external != 0;
+    battery_charging = charging != 0;
+    battery_full = full != 0;
+    battery_known = 1;
+    pthread_mutex_unlock(&battery_mu);
+
+    char line[64];
+    int n = snprintf(line, sizeof line, "battery %.0f %d %d %d\n", percent, external != 0, charging != 0, full != 0);
+
+    pthread_mutex_lock(&link_mu);
+    if (link_fd >= 0 && link_version >= HV_AGENT_SINCE_BATTERY) {
+        link_send_l(line, n);
+    }
+    if (system_fd >= 0) {
+        send(system_fd, line, (size_t)n, 0);
+    }
+    pthread_mutex_unlock(&link_mu);
+}
+
 /* What the helper said of the drives it was asked to eject, newest over oldest. */
 static struct { char serial[48]; int answer; } ejects[8];
 static unsigned eject_next;
@@ -1371,6 +1406,14 @@ static int touch_link(Conn *c, Request *r) {
     signed_in_linked();
     link_told();
     if (!current && agent_path[0]) link_send("update\n");
+    pthread_mutex_lock(&battery_mu);
+    int b_known = battery_known;
+    double b_pct = battery_percent;
+    int b_ext = battery_external, b_chg = battery_charging, b_fl = battery_full;
+    pthread_mutex_unlock(&battery_mu);
+    if (b_known && version >= HV_AGENT_SINCE_BATTERY) {
+        link_send("battery %.0f %d %d %d\n", b_pct, b_ext, b_chg, b_fl);
+    }
     char line[2304]; /* a "context" line is the longest */
     while (link_line(c, line, sizeof line) == 0) {
         pthread_mutex_lock(&clip_mu);
@@ -1973,6 +2016,16 @@ static int system_link(Conn *c, Request *r) {
         static const char update[] = "update\n";
         send(c->fd, update, sizeof update - 1, 0);
     }
+    pthread_mutex_lock(&battery_mu);
+    int sys_b_known = battery_known;
+    double sys_b_pct = battery_percent;
+    int sys_b_ext = battery_external, sys_b_chg = battery_charging, sys_b_fl = battery_full;
+    pthread_mutex_unlock(&battery_mu);
+    if (ok && sys_b_known && version >= HV_AGENT_SINCE_BATTERY) {
+        char bline[64];
+        int bn = snprintf(bline, sizeof bline, "battery %.0f %d %d %d\n", sys_b_pct, sys_b_ext, sys_b_chg, sys_b_fl);
+        send(c->fd, bline, (size_t)bn, 0);
+    }
     static const char *const names[] = {"macOS is starting", "the login window", "someone's desktop"};
     char line[4096]; /* a "ports" line: up to HV_SHARE_MAX_PORTS numbers */
     int not_taken_said = 0;
@@ -2052,6 +2105,18 @@ static int system_link(Conn *c, Request *r) {
     return -1;
 }
 
+static int battery_get(Conn *c, Request *r) {
+    if (body_discard(c, r) != 0) return -1;
+    pthread_mutex_lock(&battery_mu);
+    double pct = battery_percent;
+    int ext = battery_external, chg = battery_charging, fl = battery_full;
+    pthread_mutex_unlock(&battery_mu);
+    char body[128];
+    int n = snprintf(body, sizeof body, "{\"percent\":%.0f,\"external\":%d,\"charging\":%d,\"full\":%d}\n",
+                     pct, ext, chg, fl);
+    return respond(c, r, 200, "OK", "Content-Type: application/json\r\n", body, (size_t)n);
+}
+
 static int serve_henge(Conn *c, Request *r) {
     const char *what = r->path + strlen("/.henge/");
     if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
@@ -2062,6 +2127,7 @@ static int serve_henge(Conn *c, Request *r) {
     if (!strcmp(what, "bench-video") && !strcmp(r->method, "GET")) return serve_file(c, r, bench_video);
     if (!strcmp(what, "link") && !strcmp(r->method, "GET")) return touch_link(c, r);
     if (!strcmp(what, "system") && !strcmp(r->method, "GET")) return system_link(c, r);
+    if (!strcmp(what, "battery") && !strcmp(r->method, "GET")) return battery_get(c, r);
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "GET")) return clipboard_get(c, r);
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "PUT")) return clipboard_put(c, r);
     if (body_discard(c, r) != 0) return -1;

@@ -324,6 +324,8 @@ int henge_share_sync_guest(unsigned timeout_ms) { return state == 1 && !hv_vm_pa
 /* Testing (Autopilot.swift): a translation knob, as "knob NAME VALUE" in the Mac tool's input file. */
 int henge_vm_knob(const char *name, int value) { return state == 1 ? hv_knob_set(hv_vm_machine(), name, value) : 0; }
 void henge_vm_idle_spin(int us) { __atomic_store_n(&hv_knob[HV_K_WFI_SPIN], us < 0 ? 0 : us, __ATOMIC_RELAXED); }
+void henge_vm_set_thermal(int state) { hv_thermal_set_state(state); }
+int henge_vm_get_thermal(void) { return hv_thermal_get_state(); }
 
 long henge_vm_trim_request(int now) {
     HvMachine *m = state == 1 ? hv_vm_machine() : NULL;

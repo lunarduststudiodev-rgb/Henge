@@ -34,6 +34,18 @@ defaults write NSGlobalDomain PMPrintingExpandedStateForPrint -bool true
 defaults write NSGlobalDomain PMPrintingExpandedStateForPrint2 -bool true
 defaults write NSGlobalDomain CGDisableCursorLocationMagnification -bool true
 
+echo "Keyboard responsiveness, zero key delay and disabled auto-substitutions..."
+defaults write NSGlobalDomain KeyRepeat -int 1
+defaults write NSGlobalDomain InitialKeyRepeat -int 10
+defaults write NSGlobalDomain ApplePressAndHoldEnabled -bool false
+defaults write NSGlobalDomain NSAutomaticSpellingCorrectionEnabled -bool false
+defaults write NSGlobalDomain NSAutomaticCapitalizationEnabled -bool false
+defaults write NSGlobalDomain NSAutomaticPeriodSubstitutionEnabled -bool false
+defaults write NSGlobalDomain NSAutomaticQuoteSubstitutionEnabled -bool false
+defaults write NSGlobalDomain NSAutomaticDashSubstitutionEnabled -bool false
+defaults write NSGlobalDomain AppleEnableSwipeNavigateWithScrolls -bool false
+defaults write NSGlobalDomain AppleMiniaturizeOnDoubleClick -bool false
+
 echo "Dock, Spaces and Mission Control speedups and zero autohide delays..."
 defaults write com.apple.dock launchanim -bool false
 defaults write com.apple.dock expose-animation-duration -float 0.05
@@ -41,6 +53,8 @@ defaults write com.apple.dock autohide-delay -float 0
 defaults write com.apple.dock autohide-time-modifier -float 0
 defaults write com.apple.dock mineffect -string scale
 defaults write com.apple.dock workspaces-swoosh-animation-off -bool true
+defaults write com.apple.dock workspaces-auto-swoosh -bool false
+defaults write com.apple.dock appswitcher-all-displays -bool true
 defaults write com.apple.dock mru-spaces -bool false
 defaults write com.apple.dock expose-group-apps -bool false
 

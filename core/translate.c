@@ -100,6 +100,7 @@ typedef struct {
     int no_ijc;          /* indirect branches always go to the dispatcher (breakpoints, tests' stop PC) */
     HvMachine *m;
     uint64_t cur_pc;     /* guest PC of the instruction being translated (or whose out-of-line exit is) */
+    uint64_t block_va;   /* guest PC of the start of the block */
     /* Grouped accesses (Group). */
     Group grp[MAX_GROUPS];
     uint32_t ngrp;
@@ -886,6 +887,25 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
             put_branch_exit(e, target, 1);
             return 1;
         }
+        /* In-block backwards loop (e.g. memcpy, memmove, bcopy, memset, strlen loops):
+           Direct jump to loop start in the hot part without cold-section or dispatcher hop,
+           checking exit_req on each iteration so interrupts/invalidations break cleanly. */
+        if (target >= e->block_va && target <= pc && !e->no_ijc) {
+            uint32_t target_insn = (uint32_t)((target - e->block_va) / 4);
+            if (target_insn <= e->cur_i) {
+                uint32_t target_word = target_insn == 0 ? 0 : e->after[target_insn - 1];
+                uint32_t to_exit = e->n;
+                put(e, 0x54000000u | (cond ^ 1)); /* b.(cond ^ 1) loop_exit */
+                put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 15); /* ldr w15, [x28, #exit_req] */
+                put(e, 0x35000000u | 15); /* cbnz w15, ool */
+                put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .plain = 1});
+                int64_t back_off = (int64_t)target_word - (int64_t)e->n;
+                put(e, B_OP | (uint32_t)(back_off & 0x3ffffff));
+                patch_branch(&e->w[to_exit], (int64_t)e->n - to_exit);
+                put_branch_exit(e, pc + 4, 1);
+                return 1;
+            }
+        }
         put(e, 0x54000000u | cond);
         put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .plain = 1});
         if (superblocks() && go_on(e, pc, target)) return 0;
@@ -898,6 +918,23 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
     uint32_t bare = tb ? insn & ~(0x3fffu << 5) : insn & ~(0x7ffffu << 5);
     int rt = insn & 0x1f;
     if (!is_stolen(rt)) {
+        /* In-block backwards loop for CBZ/CBNZ/TBZ/TBNZ */
+        if (target >= e->block_va && target <= pc && !e->no_ijc) {
+            uint32_t target_insn = (uint32_t)((target - e->block_va) / 4);
+            if (target_insn <= e->cur_i) {
+                uint32_t target_word = target_insn == 0 ? 0 : e->after[target_insn - 1];
+                uint32_t to_exit = e->n;
+                put(e, bare ^ (1u << 24)); /* invert condition (CBZ<->CBNZ or TBZ<->TBNZ) */
+                put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 15); /* ldr w15, [x28, #exit_req] */
+                put(e, 0x35000000u | 15); /* cbnz w15, ool */
+                put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .plain = 1});
+                int64_t back_off = (int64_t)target_word - (int64_t)e->n;
+                put(e, B_OP | (uint32_t)(back_off & 0x3ffffff));
+                patch_branch(&e->w[to_exit], (int64_t)e->n - to_exit);
+                put_branch_exit(e, pc + 4, 1);
+                return 1;
+            }
+        }
         put(e, bare);
         put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .plain = 1});
         if (superblocks() && go_on(e, pc, target)) return 0;
@@ -2176,6 +2213,7 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
     e->page = b->va & ~e->page_mask;
     e->no_ijc = !m->chain;
     e->m = m;
+    e->block_va = b->va;
     e->nogroup = nogroup;
     e->u_live = e->u_prev = 0;
 

@@ -11,6 +11,7 @@
 typedef struct HvVirtioNet {
     HvVirtio vio;
     void (*transmit)(void *opaque, const uint8_t *frame, uint32_t len);
+    void (*rx_notify)(void *opaque);
     void *opaque;
     uint64_t tx_frames, rx_frames, rx_dropped;
     uint64_t link_up_at; /* monotonic ns: the link comes back then (0: not down) */

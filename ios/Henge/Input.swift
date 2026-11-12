@@ -780,6 +780,9 @@ enum Keys {
     static let left: UInt16 = 105
     static let right: UInt16 = 106
     static let down: UInt16 = 108
+    static let volumeMute: UInt16 = 113
+    static let volumeDown: UInt16 = 114
+    static let volumeUp: UInt16 = 115
     private static let letters: [Character: UInt16] = [
         "q": 16, "w": 17, "e": 18, "r": 19, "t": 20, "y": 21, "u": 22, "i": 23, "o": 24, "p": 25,
         "a": 30, "s": 31, "d": 32, "f": 33, "g": 34, "h": 35, "j": 36, "k": 37, "l": 38,

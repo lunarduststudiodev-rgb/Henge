@@ -1266,10 +1266,16 @@ static void safetyTick(void) {
         // again), as is loginwindow asked while macOS doesn't say who holds it.
         if ((holder < 0 || [secureHolder isEqualToString:@"loginwindow"]) && screenLockedNow() != lockedSeen) return lookAtFocus();
         if (!trusted()) return;
-        NSString *signature = overlayWindows(NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier, nil);
-        // The windows changed, or a panel showing may yet focus its field (or answer at last).
-        if (![signature isEqualToString:overlaysSeen] ||
-            (!panelSeen && overlaysCount && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - overlaysSeenAt < panelSettles)) return lookAtFocus();
+        static pid_t lastFrontPid;
+        pid_t frontPid = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
+        BOOL appChanged = (frontPid != lastFrontPid);
+        lastFrontPid = frontPid;
+        BOOL settling = (!panelSeen && overlaysCount && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - overlaysSeenAt < panelSettles);
+        if (appChanged || settling || (ticks % 4 == 0)) {
+            NSString *signature = overlayWindows(frontPid, nil);
+            // The windows changed, or a panel showing may yet focus its field (or answer at last).
+            if (![signature isEqualToString:overlaysSeen] || settling) return lookAtFocus();
+        }
         if (ticks % 2) return;
         if ([stateSent isEqualToString:@"unknown"]) {
             // When focus could not be determined (e.g. browser is busy compiling or loading a page),
@@ -1335,6 +1341,11 @@ static void watchFocus(void) {
                                                                      queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
             (void)n;
             requestLook(); // the look watches the new app
+        }];
+        [NSWorkspace.sharedWorkspace.notificationCenter addObserverForName:NSWorkspaceActiveSpaceDidChangeNotification object:nil
+                                                                     queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+            (void)n;
+            requestLook(); // active space/desktop changed
         }];
     });
 }
@@ -1799,7 +1810,7 @@ static void postScroll(double dx, double dy, CGScrollPhase phase, CGMomentumScro
 // speed a tap goes through, so a page that has all but stopped never swallows one.
 static const double catchSpeed = 250; // points a second
 static BOOL glideCatches;
-static unsigned glideNumber;              // which glide the watcher below is watching
+static _Atomic unsigned glideNumber;      // which glide the watcher below is watching
 
 static void sayCatches(BOOL catches) {
     if (catches == glideCatches) return;
@@ -1810,7 +1821,7 @@ static void sayCatches(BOOL catches) {
 static void stopGlide(void) {
     sayCatches(NO);
     if (!glide) return;
-    glideNumber++;
+    atomic_fetch_add(&glideNumber, 1);
     dispatch_source_cancel(glide);
     glide = nil;
     if (glideStarted) postScroll(0, 0, 0, kCGMomentumScrollPhaseEnd);
@@ -1872,9 +1883,7 @@ static void watchGlide(unsigned number, CGPoint at, BOOL across, BOOL down) {
         int still = 0;
         for (int i = 0; i < 100 && (bars[0] || bars[1]); i++) { // checked every 50 ms, for as long as a glide can last
             usleep(50000);
-            __block BOOL running;
-            dispatch_sync(scrollQueue, ^{ running = glide && glideNumber == number; });
-            if (!running) break;
+            if (atomic_load(&glideNumber) != number) break;
             BOOL changed = NO, atEnd = YES, read = YES;
             for (int k = 0; k < 2; k++) {
                 if (!bars[k]) continue;
@@ -1920,13 +1929,13 @@ static void scrollLine(char phase, double x, double y, double dx, double dy) {
         glideX = MAX(MIN(dx, 12000), -12000), glideY = MAX(MIN(dy, 12000), -12000);
         glideLast = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         glideStarted = NO;
-        glideNumber++;
+        unsigned currentGlide = atomic_fetch_add(&glideNumber, 1) + 1;
         glide = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, scrollQueue);
         dispatch_source_set_timer(glide, DISPATCH_TIME_NOW, NSEC_PER_SEC / 120, NSEC_PER_SEC / 1000);
         dispatch_source_set_event_handler(glide, ^{ glideStep(); });
         dispatch_resume(glide);
         sayCatches(hypot(glideX, glideY) >= catchSpeed);
-        watchGlide(glideNumber, scrollAt, glideX != 0, glideY != 0);
+        watchGlide(currentGlide, scrollAt, glideX != 0, glideY != 0);
         break;
     }
 }
@@ -2520,6 +2529,18 @@ static void applyLightweightUIFlags(void) {
         CFPreferencesSetAppValue(CFSTR("PMPrintingExpandedStateForPrint"), kCFBooleanTrue, kCFPreferencesAnyApplication);
         CFPreferencesSetAppValue(CFSTR("PMPrintingExpandedStateForPrint2"), kCFBooleanTrue, kCFPreferencesAnyApplication);
         CFPreferencesSetAppValue(CFSTR("CGDisableCursorLocationMagnification"), kCFBooleanTrue, kCFPreferencesAnyApplication);
+
+        // Keyboard responsiveness & input latency: fast repeat rate, zero delay, disable synchronous autocorrect/substitutions
+        CFPreferencesSetAppValue(CFSTR("KeyRepeat"), (__bridge CFPropertyListRef)@1, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("InitialKeyRepeat"), (__bridge CFPropertyListRef)@10, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("ApplePressAndHoldEnabled"), kCFBooleanFalse, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("NSAutomaticSpellingCorrectionEnabled"), kCFBooleanFalse, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("NSAutomaticCapitalizationEnabled"), kCFBooleanFalse, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("NSAutomaticPeriodSubstitutionEnabled"), kCFBooleanFalse, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("NSAutomaticQuoteSubstitutionEnabled"), kCFBooleanFalse, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("NSAutomaticDashSubstitutionEnabled"), kCFBooleanFalse, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("AppleEnableSwipeNavigateWithScrolls"), kCFBooleanFalse, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("AppleMiniaturizeOnDoubleClick"), kCFBooleanFalse, kCFPreferencesAnyApplication);
         CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
 
         // Dock: expose animation, autohide delays, launch animations, swoosh
@@ -2530,6 +2551,8 @@ static void applyLightweightUIFlags(void) {
         CFPreferencesSetAppValue(CFSTR("autohide-delay"), (__bridge CFPropertyListRef)@0, dock);
         CFPreferencesSetAppValue(CFSTR("mineffect"), CFSTR("scale"), dock);
         CFPreferencesSetAppValue(CFSTR("workspaces-swoosh-animation-off"), kCFBooleanTrue, dock);
+        CFPreferencesSetAppValue(CFSTR("workspaces-auto-swoosh"), kCFBooleanFalse, dock);
+        CFPreferencesSetAppValue(CFSTR("appswitcher-all-displays"), kCFBooleanTrue, dock);
         CFPreferencesSetAppValue(CFSTR("mru-spaces"), kCFBooleanFalse, dock);
         CFPreferencesSetAppValue(CFSTR("expose-group-apps"), kCFBooleanFalse, dock);
         CFPreferencesAppSynchronize(dock);
@@ -2549,24 +2572,237 @@ static void applyLightweightUIFlags(void) {
         CFPreferencesAppSynchronize(ua);
 
         // Broadcast notifications so running processes immediately pick up changes
+        // Control Center: show Battery in Menu Bar
+        CFStringRef cc = CFSTR("com.apple.controlcenter");
+        CFPreferencesSetAppValue(CFSTR("NSStatusItem Visible Battery"), kCFBooleanTrue, cc);
+        CFPreferencesSetAppValue(CFSTR("Battery"), (__bridge CFPropertyListRef)@18, cc);
+        CFPreferencesAppSynchronize(cc);
+
         CFNotificationCenterRef dist = CFNotificationCenterGetDistributedCenter();
         if (dist) {
             CFNotificationCenterPostNotification(dist, CFSTR("com.apple.dock.prefschanged"), NULL, NULL, YES);
+            CFNotificationCenterPostNotification(dist, CFSTR("com.apple.keyboard.prefschanged"), NULL, NULL, YES);
             CFNotificationCenterPostNotification(dist, CFSTR("com.apple.universalaccess.reduceMotionChanged"), NULL, NULL, YES);
             CFNotificationCenterPostNotification(dist, CFSTR("com.apple.universalaccess.reduceTransparencyChanged"), NULL, NULL, YES);
+            CFNotificationCenterPostNotification(dist, CFSTR("com.apple.controlcenter.prefschanged"), NULL, NULL, YES);
+            CFNotificationCenterPostNotification(dist, CFSTR("AppleNoRedisplayAppearancePreferenceChanged"), NULL, NULL, YES);
         }
         note(@"applied lightweight macOS UI preferences (reduced motion/transparency, zero-delay animations)");
     }
 }
 
+// MARK: - Native battery reporting (helper 39)
+// On macOS 14 Sonoma and macOS 15 Sequoia, AppleVirtualPlatform.kext carries
+// AppleVirtualPlatformPowerSource which attaches to virtual PCI 0x106b:0x1a07.
+// On macOS 13 Ventura and earlier, that kernel driver does not exist.
+// We make battery percentage and charging state show natively in macOS Ventura by:
+// 1. Publishing an IOPMPowerSource via IOPSCreatePowerSource & IOPSSetPowerSourceDetails
+//    into powerd/IOKit so the entire system recognises the internal battery.
+// 2. Displaying a native NSStatusItem in the menu bar with dynamic SF Symbols, percentage,
+//    and dropdown status menu.
+// 3. Enabling Control Center battery menu bar preferences.
+
+typedef struct OpaqueIOPSPowerSourceID *IOPSPowerSourceID;
+static IOPSPowerSourceID hengePowerSourceID = NULL;
+static IOReturn (*fn_IOPSCreatePowerSource)(IOPSPowerSourceID *outPS) = NULL;
+static IOReturn (*fn_IOPSSetPowerSourceDetails)(IOPSPowerSourceID whichPS, CFDictionaryRef details) = NULL;
+
+static void ensurePowerSourceSymbols(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+        if (h) {
+            fn_IOPSCreatePowerSource = (IOReturn (*)(IOPSPowerSourceID *))dlsym(h, "IOPSCreatePowerSource");
+            fn_IOPSSetPowerSourceDetails = (IOReturn (*)(IOPSPowerSourceID, CFDictionaryRef))dlsym(h, "IOPSSetPowerSourceDetails");
+        }
+    });
+}
+
+static void updatePowerSource(double pct, int ext, int chg, int fl) {
+    ensurePowerSourceSymbols();
+    if (fn_IOPSCreatePowerSource && !hengePowerSourceID) {
+        IOReturn kr = fn_IOPSCreatePowerSource(&hengePowerSourceID);
+        if (kr != kIOReturnSuccess) hengePowerSourceID = NULL;
+    }
+    if (hengePowerSourceID && fn_IOPSSetPowerSourceDetails) {
+        int cap = (int)round(pct);
+        if (cap < 0) cap = 0;
+        if (cap > 100) cap = 100;
+        NSDictionary *details = @{
+            @"Name": @"InternalBattery-0",
+            @"Type": @"InternalBattery",
+            @"Current Capacity": @(cap),
+            @"Max Capacity": @100,
+            @"DesignCapacity": @100,
+            @"Is Charging": @(chg != 0),
+            @"Is Charged": @(fl != 0),
+            @"Power Source State": ext ? @"AC Power" : @"Battery Power",
+            @"Is Present": @YES,
+            @"BatteryHealth": @"Good",
+            @"ExternalConnected": @(ext != 0),
+        };
+        fn_IOPSSetPowerSourceDetails(hengePowerSourceID, (__bridge CFDictionaryRef)details);
+    }
+}
+
+@interface HengeBatteryAction : NSObject
++ (HengeBatteryAction *)shared;
+- (void)openBatterySettings:(id)sender;
+@end
+
+@implementation HengeBatteryAction
++ (HengeBatteryAction *)shared {
+    static HengeBatteryAction *act;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ act = [[HengeBatteryAction alloc] init]; });
+    return act;
+}
+- (void)openBatterySettings:(id)sender {
+    (void)sender;
+    NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.Battery-Settings.extension"];
+    if (![NSWorkspace.sharedWorkspace openURL:url]) {
+        [NSWorkspace.sharedWorkspace openFile:@"/System/Applications/System Settings.app"];
+    }
+}
+@end
+
+static NSStatusItem *batteryStatusItem = nil;
+
+static BOOL hasKernelBatteryDriver(void) {
+    if (NSProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 14) {
+        io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleVirtualPlatformPowerSource"));
+        if (s) {
+            IOObjectRelease(s);
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static void updateStatusItem(double pct, int ext, int chg, int fl) {
+    if (hasKernelBatteryDriver()) {
+        if (batteryStatusItem) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (batteryStatusItem) {
+                    [NSStatusBar.systemStatusBar removeStatusItem:batteryStatusItem];
+                    batteryStatusItem = nil;
+                }
+            });
+        }
+        return;
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        int cap = (int)round(pct);
+        if (cap < 0) cap = 0;
+        if (cap > 100) cap = 100;
+
+        if (!batteryStatusItem) {
+            batteryStatusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
+            batteryStatusItem.visible = YES;
+        }
+
+        NSStatusBarButton *button = batteryStatusItem.button;
+        if (button) {
+            NSString *sym;
+            if (chg) {
+                if (cap >= 90) sym = @"battery.100.bolt";
+                else if (cap >= 65) sym = @"battery.75.bolt";
+                else if (cap >= 35) sym = @"battery.50.bolt";
+                else if (cap >= 15) sym = @"battery.25.bolt";
+                else sym = @"battery.0.bolt";
+            } else {
+                if (cap >= 90) sym = @"battery.100";
+                else if (cap >= 65) sym = @"battery.75";
+                else if (cap >= 35) sym = @"battery.50";
+                else if (cap >= 15) sym = @"battery.25";
+                else sym = @"battery.0";
+            }
+
+            NSImage *img = [NSImage imageWithSystemSymbolName:sym accessibilityDescription:@"Battery"];
+            if (img) {
+                img.template = YES;
+                button.image = img;
+                button.imagePosition = NSImageLeft;
+            }
+            button.title = [NSString stringWithFormat:@"%d%%", cap];
+            button.toolTip = [NSString stringWithFormat:@"Battery: %d%%%s",
+                              cap,
+                              ext ? (fl ? ", Full on AC Power" : chg ? ", Charging" : ", On AC Power") : ", On Battery"];
+        }
+
+        NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Battery"];
+
+        NSMenuItem *headerItem = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"Battery: %d%%", cap] action:nil keyEquivalent:@""];
+        headerItem.enabled = NO;
+        [menu addItem:headerItem];
+
+        NSString *srcStr = ext ? @"Power Source: Power Adapter" : @"Power Source: Battery";
+        NSMenuItem *srcItem = [[NSMenuItem alloc] initWithTitle:srcStr action:nil keyEquivalent:@""];
+        srcItem.enabled = NO;
+        [menu addItem:srcItem];
+
+        NSString *stateStr = fl ? @"Fully Charged" : chg ? [NSString stringWithFormat:@"Charging (%d%%)", cap] : (ext ? @"Not Charging" : @"On Battery");
+        NSMenuItem *stateItem = [[NSMenuItem alloc] initWithTitle:stateStr action:nil keyEquivalent:@""];
+        stateItem.enabled = NO;
+        [menu addItem:stateItem];
+
+        [menu addItem:[NSMenuItem separatorItem]];
+
+        NSMenuItem *prefItem = [[NSMenuItem alloc] initWithTitle:@"Battery Settings..." action:@selector(openBatterySettings:) keyEquivalent:@""];
+        prefItem.target = [HengeBatteryAction shared];
+        [menu addItem:prefItem];
+
+        batteryStatusItem.menu = menu;
+    });
+}
+
+static void updateBattery(double pct, int ext, int chg, int fl) {
+    updatePowerSource(pct, ext, chg, fl);
+    updateStatusItem(pct, ext, chg, fl);
+}
+
+#ifndef NX_KEYTYPE_SOUND_UP
+#define NX_KEYTYPE_SOUND_UP 0
+#define NX_KEYTYPE_SOUND_DOWN 1
+#define NX_KEYTYPE_MUTE 7
+#endif
+
+static void postMediaKey(int key) {
+    for (int down = 1; down >= 0; down--) {
+        NSEvent *ev = [NSEvent otherEventWithType:NSEventTypeSystemDefined
+                                         location:NSZeroPoint
+                                    modifierFlags:(down ? 0xa00 : 0xb00)
+                                        timestamp:0
+                                     windowNumber:0
+                                          context:nil
+                                          subtype:8
+                                            data1:(key << 16) | ((down ? 0xa : 0xb) << 8)
+                                            data2:-1];
+        CGEventRef cg = [ev CGEvent];
+        if (cg) CGEventPost(kCGHIDEventTap, cg);
+    }
+}
+
 static void handleLine(const char *line) {
     unsigned id;
+    int vol;
     double x, y, dx, dy;
     char phase;
+    double bpct;
+    int bext, bchg, bfl;
     if (sscanf(line, "hit %u %lf %lf", &id, &x, &y) == 3) answerHit(id, x, y);
     else if (sscanf(line, "tap %u %lf %lf", &id, &x, &y) == 3) answerTap(id, x, y);
     else if (sscanf(line, "look %u", &id) == 1) answerLook(id);
     else if (sscanf(line, "touchwatch %u", &id) == 1) answerTouchWatch(id);
+    else if (sscanf(line, "volume %d", &vol) == 1) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            postMediaKey(vol > 0 ? NX_KEYTYPE_SOUND_UP : vol < 0 ? NX_KEYTYPE_SOUND_DOWN : NX_KEYTYPE_MUTE);
+        });
+    }
+    else if (sscanf(line, "battery %lf %d %d %d", &bpct, &bext, &bchg, &bfl) == 4) {
+        updateBattery(bpct, bext, bchg, bfl);
+    }
     else if (sscanf(line, "menuclose %u", &id) == 1) answerMenuClose(id);
     else if (sscanf(line, "menu %u", &id) == 1) answerMenu(id);
     else if (sscanf(line, "s %c %lf %lf %lf %lf", &phase, &x, &y, &dx, &dy) == 5) dispatch_async(scrollQueue, ^{ scrollLine(phase, x, y, dx, dy); });
@@ -3542,7 +3778,14 @@ static void applySystemLightweightFlags(void) {
         CFPreferencesSetValue(CFSTR("reduceMotion"), kCFBooleanTrue, ua, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
         CFPreferencesSetValue(CFSTR("reduceTransparency"), kCFBooleanTrue, ua, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
         CFPreferencesSynchronize(ua, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
-        note(@"system: applied system-wide accessibility lightweight flags");
+
+        // Control Center: show Battery in Menu Bar
+        CFStringRef cc = CFSTR("com.apple.controlcenter");
+        CFPreferencesSetValue(CFSTR("NSStatusItem Visible Battery"), kCFBooleanTrue, cc, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
+        CFPreferencesSetValue(CFSTR("Battery"), (__bridge CFPropertyListRef)@18, cc, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
+        CFPreferencesSynchronize(cc, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
+
+        note(@"system: applied system-wide accessibility lightweight flags and battery menu bar visibility");
     }
 }
 
@@ -3597,6 +3840,13 @@ static void keepSystemLinked(void) {
                 if (!strcmp(line, "update")) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ update(); });
                 else if (!strcmp(line, "trace")) recordTouchMessages(); // a test Henge asks for (HENGE_TOUCH_TRACE)
                 else if (!strcmp(line, "lighten")) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ applySystemLightweightFlags(); });
+                else {
+                    double bpct;
+                    int bext, bchg, bfl;
+                    if (sscanf(line, "battery %lf %d %d %d", &bpct, &bext, &bchg, &bfl) == 4) {
+                        updatePowerSource(bpct, bext, bchg, bfl);
+                    }
+                }
             }
         }
     done:
@@ -3798,6 +4048,8 @@ int main(int argc, char **argv) {
             return 0;
         }
         startedAt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        [NSApplication sharedApplication];
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
         dispatch_queue_attr_t quick = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
         hitQueue = dispatch_queue_create("henge.hit", quick);
         tapQueue = dispatch_queue_create("henge.tap", quick);

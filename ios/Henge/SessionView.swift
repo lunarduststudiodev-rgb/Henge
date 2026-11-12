@@ -1663,6 +1663,7 @@ struct SessionView: View {
         Sharing.prepare(mac)
         MacSpeaker.shared.prepare()
         EngineTuning.apply()
+        henge_vm_set_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
         henge_vm_set_display(UInt32(mac.screen.width), UInt32(mac.screen.height))
         if mac.isRetina {
             henge_vm_set_display_mm(UInt32(Device.retinaMM.width), UInt32(Device.retinaMM.height))
@@ -1827,6 +1828,7 @@ struct SessionView: View {
             if heat.rawValue != thermalState.rawValue {
                 thermalState = heat
                 HengeLog.log("session", "thermal state: \(Self.thermalLabel(heat))")
+                henge_vm_set_thermal(Int32(heat.rawValue))
             }
             // Quicker wake keeps idle CPUs watching for work before they sleep, which is heat; and once the device is
             // warm or hot iPadOS slows everything Henge does (an iPad was "Hot" from its third minute to the end of a session).

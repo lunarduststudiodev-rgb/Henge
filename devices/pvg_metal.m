@@ -668,7 +668,9 @@ static NSUInteger pixel_bytes(MTLPixelFormat f) {
 static BOOL linear_texture_fits(id<MTLDevice> device, MTLTextureDescriptor *t, uint64_t offset, uint64_t row, NSUInteger length) {
     NSUInteger bpp = pixel_bytes(t.pixelFormat);
     if (!bpp) return YES;
-    NSUInteger align = [device minimumLinearTextureAlignmentForPixelFormat:t.pixelFormat];
+    static NSUInteger cached_align;
+    if (!cached_align) cached_align = [device minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm] ?: 64;
+    NSUInteger align = cached_align;
     BOOL ok = row >= t.width * bpp && (!align || (row % align == 0 && offset % align == 0)) && offset + row * t.height <= length;
     if (!ok) {
         static int told;
@@ -1685,17 +1687,25 @@ static uint32_t video_layout(const uint8_t *desc, uint64_t alloc, HvVideoPlane p
    without would go up over the other's pixels). */
 static NSData *video_key(const uint32_t *list, uint64_t n, uint32_t first, uint64_t alloc, uint32_t fourcc, uint64_t w, uint64_t h,
                          const HvVideoPlane *pl, uint32_t planes) {
-    NSMutableData *k = [NSMutableData dataWithCapacity:48 + planes * 48 + n * 4];
+    size_t total = sizeof(uint64_t) * 6 + (size_t)planes * sizeof(uint64_t) * 6 + (size_t)n * sizeof(uint32_t);
+    uint8_t stack_buf[1024];
+    uint8_t *buf = total <= sizeof(stack_buf) ? stack_buf : malloc(total);
+    if (!buf) return nil;
+    uint8_t *dst = buf;
     const uint64_t head[6] = {first, alloc, fourcc, w, h, planes};
-    [k appendBytes:head length:sizeof head];
+    memcpy(dst, head, sizeof head);
+    dst += sizeof head;
     for (uint32_t i = 0; i < planes; i++) {
         const uint64_t p[6] = {pl[i].offset, pl[i].row, pl[i].rows, pl[i].row_bytes, pl[i].width, pl[i].bpe};
-        [k appendBytes:p length:sizeof p];
+        memcpy(dst, p, sizeof p);
+        dst += sizeof p;
     }
+    uint32_t *pages_dst = (uint32_t *)dst;
     for (uint64_t i = 0; i < n; i++) {
-        const uint32_t page = list[i] & 1 ? list[i] & ~1u : 0;
-        [k appendBytes:&page length:4];
+        pages_dst[i] = list[i] & 1 ? list[i] & ~1u : 0;
     }
+    NSData *k = [NSData dataWithBytes:buf length:total];
+    if (buf != stack_buf) free(buf);
     return k;
 }
 
@@ -4491,15 +4501,17 @@ static const uint8_t *half_to_byte(void) {
         [self complain:@"pointer image unreadable"];
         return;
     }
-    free(cursor);
     MTLTextureDescriptor *ct = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
     ct.storageMode = MTLStorageModeShared;
     id<MTLTexture> glyph = [device newTextureWithDescriptor:ct];
     [glyph replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bits bytesPerRow:(NSUInteger)stride];
     os_unfair_lock_lock(&screen_lock);
+    uint8_t *old_cursor = cursor;
     cursor = bits, cursor_w = w, cursor_h = h, cursor_stride = (uint32_t)stride, cursor_hot_x = hx, cursor_hot_y = hy;
     cursor_tex = glyph;
+    cursor_shown = YES;
     os_unfair_lock_unlock(&screen_lock);
+    free(old_cursor);
     if (env.cursor_log) fprintf(stderr, "pvgcursor glyph %ux%u hot %d,%d stride %u first alpha %u\n", w, h, hx, hy, (uint32_t)stride, bits[(size_t)(h / 2) * stride + (size_t)(w / 2) * 4 + 3]);
     [self drawCursor];
 }
@@ -4539,14 +4551,19 @@ static uint32_t cursor_glyph_at(int p, int origin, double step, uint32_t n) {
     for (int y = drawn_y; y < drawn_y + drawn_h; y++) memcpy(frame + (size_t)y * w * 4 + (size_t)drawn_x * 4, base + (size_t)y * w * 4 + (size_t)drawn_x * 4, (size_t)drawn_w * 4);
     drawn_w = drawn_h = 0;
     const uint8_t *page = hv_pvg_lite_display_page(lite);
-    if (!page || !cursor || pointer_hidden || !(cursor_shown || page[0xe04])) return;
+    if (!page || !cursor || pointer_hidden) return;
     uint32_t where = __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE);
+    if (where == 0xffffffff) return;
+    static uint32_t last_draw_where = 0xffffffff;
+    BOOL moved = (where != last_draw_where);
+    if (moved) cursor_shown = YES;
+    last_draw_where = where;
+    if (!(cursor_shown || page[0xe04] || moved)) return;
     if (env.cursor_log) {
         static uint32_t last;
         if (where != last) fprintf(stderr, "pvgcursor at %u,%u shown %d flag %d\n", where & 0xffff, where >> 16, cursor_shown, page[0xe04]);
         last = where;
     }
-    if (where == 0xffffffff) return;
     /* Bigger than the guest draws it. The hot spot stays where it points. Its position and glyph are in
        the display mode's pixels; a scaled picture is in its own. */
     uint32_t pw, ph;
@@ -4773,6 +4790,18 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
         uint32_t W = screen_w, H = screen_h, cw0 = cursor_w, ch0 = cursor_h;
         int hx = cursor_hot_x, hy = cursor_hot_y;
         os_unfair_lock_unlock(&screen_lock);
+        int heat = hv_thermal_get_state();
+        if (heat >= 2) {
+            static uint64_t last_present_ns;
+            uint64_t min_interval_ns = heat >= 3 ? 31000000ull : 15500000ull;
+            uint64_t now_ns = stage_now();
+            if (last_present_ns && now_ns < last_present_ns + min_interval_ns) {
+                uint64_t wait_ns = (last_present_ns + min_interval_ns) - now_ns;
+                struct timespec ts = {.tv_sec = (time_t)(wait_ns / 1000000000ull), .tv_nsec = (long)(wait_ns % 1000000000ull)};
+                nanosleep(&ts, NULL);
+            }
+            last_present_ns = stage_now();
+        }
         if (![self prepareScreenForLayer:target]) {
             os_unfair_lock_lock(&screen_lock);
             BOOL changed = layer_generation != generation;
@@ -4920,19 +4949,30 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
         [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         const uint8_t *page = hv_pvg_lite_display_page(lite);
         uint32_t where = page ? __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE) : 0xffffffff;
-        if (ctex && where != 0xffffffff && !hidden && (shown || page[0xe04])) {
+        static uint32_t last_where = 0xffffffff;
+        BOOL cursor_moved = (where != 0xffffffff && where != last_where);
+        if (cursor_moved) {
+            shown = YES;
+            os_unfair_lock_lock(&screen_lock);
+            cursor_shown = YES;
+            os_unfair_lock_unlock(&screen_lock);
+        }
+        last_where = where;
+        if (ctex && where != 0xffffffff && !hidden && (shown || page[0xe04] || cursor_moved)) {
             /* Placed in the display mode's pixels, which a scaled picture isn't in. */
             uint32_t PW, PH;
             hv_pvg_lite_pointer_space(W, H, &PW, &PH);
-            float x = (float)(where & 0xffff) - hx * scale, y = (float)(where >> 16) - hy * scale;
-            float cw = cw0 * scale, ch = ch0 * scale;
-            float r[4] = {x / PW * 2 - 1, 1 - (y + ch) / PH * 2, cw / PW * 2, ch / PH * 2};
-            [e setRenderPipelineState:cursor_pipe];
-            [e setVertexBytes:r length:sizeof r atIndex:0];
-            [e setFragmentTexture:ctex atIndex:0];
-            /* Sharp is pixel for pixel; fitted to another size, that would leave it ragged. */
-            [e setFragmentSamplerState:fit || !sharp ? screen_sampler : cursor_sampler atIndex:0];
-            [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+            if (PW && PH && cw0 && ch0) {
+                float x = (float)(where & 0xffff) - hx * scale, y = (float)(where >> 16) - hy * scale;
+                float cw = cw0 * scale, ch = ch0 * scale;
+                float r[4] = {x / PW * 2 - 1, 1 - (y + ch) / PH * 2, cw / PW * 2, ch / PH * 2};
+                [e setRenderPipelineState:cursor_pipe];
+                [e setVertexBytes:r length:sizeof r atIndex:0];
+                [e setFragmentTexture:ctex atIndex:0];
+                /* Sharp is pixel for pixel; fitted to another size, that would leave it ragged. */
+                [e setFragmentSamplerState:fit || !sharp ? screen_sampler : cursor_sampler atIndex:0];
+                [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+            }
         }
         [e endEncoding];
         if (cp.on) cp_capture_post(self, drawable.texture, W, H, cb);
@@ -5127,6 +5167,7 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
         r->screen_lock = OS_UNFAIR_LOCK_INIT;
         r->trail_lock = OS_UNFAIR_LOCK_INIT;
         r->gpu_strike_lock = OS_UNFAIR_LOCK_INIT;
+        r->cursor_shown = YES;
         r->answers = [NSMutableDictionary new];
         r->surfaces = [NSMutableDictionary new];
         r->surface_shapes = [NSMutableSet new];
@@ -5547,6 +5588,9 @@ int hv_pvg_metal_pointer_shown(HvPvgMetal *m) {
 void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
     if (!m) return;
     HvReplay *r = (__bridge HvReplay *)m;
+    os_unfair_lock_lock(&r->screen_lock);
+    r->cursor_shown = YES;
+    os_unfair_lock_unlock(&r->screen_lock);
     if ([r hasDisplayLayer]) { /* no need to queue behind the guest's GPU work */
         [r screenChanged];
         return;

@@ -259,6 +259,8 @@ static int is_reset(const uint8_t *p, size_t len) {
    the far side reset it, the Mac stopped acknowledging, or a packet came for a connection the NAT no longer
    has. At most RESET_LINES a RESET_SECS, so a burst doesn't flood the log; the rest are counted. */
 #define CONNS 256
+#define CONN_HASH_SIZE 512
+#define CONN_HASH_MASK (CONN_HASH_SIZE - 1)
 #define RESET_LINES 12
 #define RESET_SECS 10
 static struct Conn {
@@ -266,13 +268,23 @@ static struct Conn {
     uint16_t guest_port, far_port;
     int64_t opened, mac_fin, nat_fin, mac_rst, nat_rst; /* ms, 0: not seen */
 } conns[CONNS];
+static int16_t conn_hash[CONN_HASH_SIZE]; /* -1: empty, else index into conns[] */
+static int conn_hash_inited = 0;
 static uint32_t conn_next;
 static char last_reset[256];
 static pthread_mutex_t last_reset_mu = PTHREAD_MUTEX_INITIALIZER;
 
+static inline uint32_t conn_hash_fn(uint32_t far_ip, uint16_t guest_port, uint16_t far_port) {
+    return ((far_ip * 2654435761u) ^ ((uint32_t)guest_port * 40503u) ^ (uint32_t)far_port) & CONN_HASH_MASK;
+}
+
 static struct Conn *conn_find(const Tcp *t) {
-    for (int i = 0; i < CONNS; i++) {
-        struct Conn *c = &conns[i];
+    if (!conn_hash_inited) return NULL;
+    uint32_t h = conn_hash_fn(t->far_ip, t->guest_port, t->far_port);
+    for (int step = 0; step < 16; step++) {
+        int idx = conn_hash[(h + step) & CONN_HASH_MASK];
+        if (idx < 0) return NULL;
+        struct Conn *c = &conns[idx];
         if (c->opened && c->far_ip == t->far_ip && c->guest_port == t->guest_port && c->far_port == t->far_port) return c;
     }
     return NULL;
@@ -318,7 +330,31 @@ static void track(const uint8_t *frame, uint32_t len, int to_guest_dir) {
     int64_t now = now_ms();
     struct Conn *c = conn_find(&t);
     if (!to_guest_dir && (t.flags & 0x12) == 0x02) { /* the guest opens one */
-        if (!c) c = &conns[conn_next++ % CONNS];
+        if (!c) {
+            if (!conn_hash_inited) {
+                memset(conn_hash, -1, sizeof conn_hash);
+                conn_hash_inited = 1;
+            }
+            int slot = (int)(conn_next++ % CONNS);
+            c = &conns[slot];
+            if (c->opened) {
+                uint32_t old_h = conn_hash_fn(c->far_ip, c->guest_port, c->far_port);
+                for (int step = 0; step < 16; step++) {
+                    uint32_t pos = (old_h + step) & CONN_HASH_MASK;
+                    if (conn_hash[pos] == slot) { conn_hash[pos] = -1; break; }
+                }
+            }
+            *c = (struct Conn){.far_ip = t.far_ip, .guest_port = t.guest_port, .far_port = t.far_port, .opened = now};
+            uint32_t new_h = conn_hash_fn(t.far_ip, t.guest_port, t.far_port);
+            for (int step = 0; step < 16; step++) {
+                uint32_t pos = (new_h + step) & CONN_HASH_MASK;
+                if (conn_hash[pos] < 0 || conn_hash[pos] == slot) {
+                    conn_hash[pos] = (int16_t)slot;
+                    break;
+                }
+            }
+            return;
+        }
         *c = (struct Conn){.far_ip = t.far_ip, .guest_port = t.guest_port, .far_port = t.far_port, .opened = now};
         return;
     }
@@ -551,21 +587,31 @@ static void *net_thread(void *unused) {
                 slirp_henge_reset_why = NULL;
                 slirp_handle_timer(slirp, timers[i].id, timers[i].cb_opaque);
             }
-        /* What the guest sent since. */
+        /* What the guest sent since: batch dequeue up to 32 frames under one lock */
         for (;;) {
+            Frame batch[32];
+            uint32_t count = 0;
             pthread_mutex_lock(&to_host.mu);
-            Frame f = {0, NULL, 0};
-            if (to_host.head != to_host.tail) {
-                f = to_host.f[to_host.head++ % QUEUE];
-                to_host.bytes -= f.len;
+            uint32_t depth = to_host.tail - to_host.head;
+            if (depth > 32) depth = 32;
+            for (uint32_t i = 0; i < depth; i++) {
+                batch[i] = to_host.f[(to_host.head + i) % QUEUE];
             }
+            to_host.head += depth;
+            for (uint32_t i = 0; i < depth; i++) {
+                to_host.bytes -= batch[i].len;
+            }
+            count = depth;
             pthread_mutex_unlock(&to_host.mu);
-            if (!f.data) break;
-            if (!hv_mdns_take(f.data, f.len)) {
-                track(f.data, f.len, 0);
-                slirp_input(slirp, f.data, (int)f.len);
+            if (!count) break;
+
+            for (uint32_t i = 0; i < count; i++) {
+                if (!hv_mdns_take(batch[i].data, batch[i].len)) {
+                    track(batch[i].data, batch[i].len, 0);
+                    slirp_input(slirp, batch[i].data, (int)batch[i].len);
+                }
+                free(batch[i].data);
             }
-            free(f.data);
         }
     }
     return NULL;
@@ -588,22 +634,43 @@ static void transmit(void *opaque, const uint8_t *frame, uint32_t len) {
 void hv_net_poll(void) {
     if (!net || to_guest.head == to_guest.tail) return;
     for (;;) {
+        Frame batch[32];
+        uint32_t count = 0;
         pthread_mutex_lock(&to_guest.mu);
-        Frame f = {0, NULL, 0};
-        if (to_guest.head != to_guest.tail) f = to_guest.f[to_guest.head % QUEUE];
-        pthread_mutex_unlock(&to_guest.mu);
-        if (!f.data) return;
-        if (!hv_virtio_net_receive(net, f.data, f.len)) { /* no buffer posted yet: try again later */
-            atomic_fetch_add_explicit(&st.no_buffer, 1, memory_order_relaxed);
+        uint32_t depth = to_guest.tail - to_guest.head;
+        if (!depth) {
+            pthread_mutex_unlock(&to_guest.mu);
             return;
         }
-        hv_net_rx_frames++;
-        delivered(f.data, f.len, f.queued_ns);
-        pthread_mutex_lock(&to_guest.mu);
-        to_guest.head++;
-        to_guest.bytes -= f.len;
+        if (depth > 32) depth = 32;
+        for (uint32_t i = 0; i < depth; i++) {
+            batch[i] = to_guest.f[(to_guest.head + i) % QUEUE];
+        }
+        count = depth;
         pthread_mutex_unlock(&to_guest.mu);
-        free(f.data);
+
+        uint32_t delivered_count = 0;
+        uint64_t freed_bytes = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            if (!hv_virtio_net_receive(net, batch[i].data, batch[i].len)) {
+                atomic_fetch_add_explicit(&st.no_buffer, 1, memory_order_relaxed);
+                break;
+            }
+            hv_net_rx_frames++;
+            delivered(batch[i].data, batch[i].len, batch[i].queued_ns);
+            freed_bytes += batch[i].len;
+            free(batch[i].data);
+            delivered_count++;
+        }
+
+        if (delivered_count > 0) {
+            pthread_mutex_lock(&to_guest.mu);
+            to_guest.head += delivered_count;
+            to_guest.bytes -= freed_bytes;
+            pthread_mutex_unlock(&to_guest.mu);
+        }
+
+        if (delivered_count < count) return;
     }
 }
 
@@ -679,6 +746,8 @@ static int make_slirp(void) {
 static void restart(void) {
     if (slirp) slirp_cleanup(slirp); /* closes every socket it had, the shared folder's connection with them */
     for (int i = 0; i < MAX_TIMERS; i++) timers[i].used = 0;
+    conn_hash_inited = 0;
+    memset(conns, 0, sizeof conns);
     slirp = NULL;
     restarts++;
     hv_dns_network_changed();
@@ -695,6 +764,11 @@ static void carrier_changed(void *opaque, int up) {
     atomic_store(&restart_wanted, 1);
     char c = 0;
     (void)!write(wake_pipe[1], &c, 1);
+}
+
+static void on_rx_notify(void *opaque) {
+    (void)opaque;
+    hv_net_poll();
 }
 
 int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
@@ -714,6 +788,7 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     net = n;
     n->transmit = transmit;
     n->carrier_changed = carrier_changed;
+    n->rx_notify = on_rx_notify;
     pthread_t t;
     pthread_create(&t, NULL, net_thread, NULL);
     return 0;
