@@ -2118,7 +2118,7 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
                 v->iosurface = made, v->shadow = shadow, v->merged = merged, v->alloc = alloc, v->plane_count = pl_count;
                 memcpy(v->plane, pl, pl_count * sizeof *pl);
                 v->video_lock = OS_UNFAIR_LOCK_INIT, v->reader_lock = OS_UNFAIR_LOCK_INIT;
-                v->held = alloc + hv_pvg_video_iosurface_bytes(pl, pl_count);
+                v->held = alloc + (made ? IOSurfaceGetAllocSize(made) : 0);
                 if (vk) planar_add(self, vk, v);
             } else {
                 if (made) CFRelease(made);
