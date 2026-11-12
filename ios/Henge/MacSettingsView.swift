@@ -35,6 +35,17 @@ struct MacSettingsView: View {
                     Stepper("Memory", value: Binding(get: { mac.ramMB / 1024 }, set: { mac.ramMB = $0 * 1024; save() }), in: Device.memoryChoices)
                         .font(.system(size: 16))
                     MemoryNote(gb: mac.ramMB / 1024)
+                    if Device.memoryTooHigh(mac.ramMB / 1024) {
+                        Button {
+                            mac.ramMB = UInt64(Device.suggestedRAMGB * 1024)
+                            save()
+                        } label: {
+                            Label("Set to suggested \(Device.suggestedRAMGB) GB", systemImage: "bolt.shield")
+                                .font(.system(size: 13, weight: .medium))
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(Desk.warn)
+                    }
                 }
                 .padding(17)
                 .deskCard()

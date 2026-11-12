@@ -2934,15 +2934,36 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
         MTLRegion region;
         memcpy(&s, r.p, sizeof s);
         memcpy(&region, r.p + sizeof s, sizeof region);
-        if (!s.width || !s.height || s.depth != 1 || s.width > e.tileWidth || s.height > e.tileHeight ||
-            (uint64_t)s.width * s.height > cur_render.maxTotalThreadsPerThreadgroup) { /* both within a tile: no overflow */
-            /* Told with what decides it: the pipeline's own limit, and whether it wants a threadgroup a tile (on an iPad
-               the limit has come out under the 32x32 macOS dispatches, and the effect it draws is then missing) */
-            [self complain:[NSString stringWithFormat:@"tile dispatch of %lux%lux%lu in a %lux%lu tile dropped: the pipeline takes %lu threads a tile%s; pass %llux%llu",
-                            (unsigned long)s.width, (unsigned long)s.height, (unsigned long)s.depth, (unsigned long)e.tileWidth,
-                            (unsigned long)e.tileHeight, (unsigned long)cur_render.maxTotalThreadsPerThreadgroup,
-                            cur_render.threadgroupSizeMatchesTileSize ? " (a threadgroup a tile)" : "", pass_w, pass_h]];
+        if (!s.width || !s.height || s.depth != 1 || s.width > e.tileWidth || s.height > e.tileHeight) {
             break;
+        }
+        if ((uint64_t)s.width * s.height > cur_render.maxTotalThreadsPerThreadgroup) {
+            if (cur_render.threadgroupSizeMatchesTileSize) {
+                [self complain:[NSString stringWithFormat:@"tile dispatch of %lux%lux%lu in a %lux%lu tile dropped: the pipeline takes %lu threads a tile (a threadgroup a tile); pass %llux%llu",
+                                (unsigned long)s.width, (unsigned long)s.height, (unsigned long)s.depth, (unsigned long)e.tileWidth,
+                                (unsigned long)e.tileHeight, (unsigned long)cur_render.maxTotalThreadsPerThreadgroup, pass_w, pass_h]];
+                break;
+            }
+            // On iPad GPUs (like M1), the pipeline's max threads per threadgroup can be 448 or 640,
+            // while macOS dispatches 32x32 (1024 threads). Instead of dropping the whole dispatch
+            // (which causes missing menu bar backdrops and visual glitches), adaptively downscale s to fit.
+            static int told_adapted;
+            if (told_adapted < 8) {
+                told_adapted++;
+                [self complain:[NSString stringWithFormat:@"tile dispatch of %lux%lux%lu in a %lux%lu tile adapted to pipeline limit %lu; pass %llux%llu",
+                                (unsigned long)s.width, (unsigned long)s.height, (unsigned long)s.depth, (unsigned long)e.tileWidth,
+                                (unsigned long)e.tileHeight, (unsigned long)cur_render.maxTotalThreadsPerThreadgroup, pass_w, pass_h]];
+            }
+            NSUInteger maxThreads = cur_render.maxTotalThreadsPerThreadgroup;
+            while ((uint64_t)s.width * s.height > maxThreads) {
+                if (s.height >= s.width && s.height > 1) {
+                    s.height /= 2;
+                } else if (s.width > 1) {
+                    s.width /= 2;
+                } else {
+                    break;
+                }
+            }
         }
         if (tag == 162 && (region.origin.z || region.size.depth != 1 || region.origin.x >= pass_w || region.origin.y >= pass_h ||
                            !region.size.width || !region.size.height)) {

@@ -15,7 +15,7 @@ enum EngineTuning {
         // 60, not 120: every frame macOS draws is emulated and replayed, so 120 Hz
         // halves the CPU left for apps for animation few will notice.
         "HV_HZ": "60",         // the refresh rate macOS is told its display has
-        "HV_WFI_SPIN": "0",    // microseconds an idle CPU watches for work before sleeping
+        "HV_WFI_SPIN": "50",   // microseconds an idle CPU watches for work before sleeping (1-cycle cntvct_el0)
         "HV_FLUSH": "2",       // disk flush: F_BARRIERFSYNC, ordered but without a full fsync
         // No HV_STATS: the engine's detailed statistics (a stats block in the log every N seconds, and the extra
         // probes behind it) are for diagnosis, opted into with HV_STATS=10 in henge-env.txt. The counters the
@@ -28,7 +28,11 @@ enum EngineTuning {
         let d = UserDefaults.standard
         if [30, 120].contains(d.integer(forKey: refreshKey)) { env["HV_HZ"] = String(d.integer(forKey: refreshKey)) }
         if d.bool(forKey: superblocksKey) { env["HV_SUPERBLOCKS"] = "1" } else { unsetenv("HV_SUPERBLOCKS") }
-        if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
+        if let spin = d.object(forKey: wfiSpinKey) as? Bool {
+            env["HV_WFI_SPIN"] = spin ? "50" : "0"
+        } else {
+            env["HV_WFI_SPIN"] = "50"
+        }
         // The Mac's CPU threads at the user-interactive class instead of user-initiated (host/vm.c hv_vm_cpu_qos).
         if d.bool(forKey: highPriorityKey) { env["HV_QOS"] = "ui" } else { unsetenv("HV_QOS") }
         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }

@@ -96,6 +96,14 @@ struct SettingsView: View {
                 Toggle("Quick Suspend (experimental)", isOn: quickSuspendFromFile.map { .constant($0) } ?? $quickSuspend)
                     .disabled(quickSuspendFromFile != nil)
                     .onAppear { quickSuspendFromFile = GuestMemory.saveAheadFromFile }
+                if quickSuspend {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Desk.warn)
+                        Text("Quick Suspend keeps 48 memory files synced on flash storage as the Mac runs. On iPad, this causes severe I/O freezes and disk contention. Keep OFF for maximum speed.")
+                            .font(.caption)
+                            .foregroundStyle(Desk.warn)
+                    }
+                }
             } header: {
                 Text("Suspend")
             } footer: {

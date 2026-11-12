@@ -70,6 +70,8 @@ final class MemoryWatch {
     private var compressorTimer: DispatchSourceTimer?
     private var lastDecompressions: UInt64?
     private var busyRun = 0, quietRun = 0
+    private var balloonRetries = 0
+    private var balloonWarnedUnsupported = false
 
     private static let lock = NSLock()
     private static var criticalAtValue: Date?
@@ -206,6 +208,8 @@ final class MemoryWatch {
             lastDecompressions = nil
             busyRun = 0
             quietRun = 0
+            balloonRetries = 0
+            balloonWarnedUnsupported = false
             return
         }
         let have = henge_vm_balloon(-1)
@@ -222,7 +226,18 @@ final class MemoryWatch {
             let most = Int(Self.guestRAMMB / Self.balloonShare)
             let want = min(most, have + Self.balloonStep)
             guard want > have else { return }
+            if balloonWarnedUnsupported { return }
             _ = henge_vm_balloon(want)
+            if have == 0 {
+                balloonRetries += 1
+                if balloonRetries >= 3 {
+                    balloonWarnedUnsupported = true
+                    HengeLog.log("memory", "iPadOS is decompressing \(Int(rate * 16 / 1024)) MB/s! macOS guest does not support VirtIO balloon; it cannot hand back memory. Reduce Mac RAM in Settings to 4 GB or less to eliminate freezing.")
+                    return
+                }
+            } else {
+                balloonRetries = 0
+            }
             HengeLog.log("memory", "iPadOS is decompressing \(Int(rate * 16 / 1024)) MB a second of memory the Mac waits for: "
                          + "asked the Mac for \(want) MB of its spare memory (it has given \(have) MB; at most \(most) MB)")
         } else {

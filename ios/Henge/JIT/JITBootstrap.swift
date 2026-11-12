@@ -65,10 +65,25 @@ enum JITBootstrap {
     /// where 1 GB and its records left a 2 GB Mac too little room in Setup, #70). A bigger cache fills and empties less
     /// often (macOS 27 filled 1 GB about once a minute) and costs more memory (its blocks' records come to about 0.75 of
     /// its size). Fixed for the launch: the region is claimed once.
-    static let defaultCodeCacheMB: Int = Entitlements.memoryLimitAtLaunch >= 5_500 << 20 ? 1536
-        : Entitlements.memoryLimitAtLaunch >= 3_500 << 20 ? 1024 : 512
+    static let defaultCodeCacheMB: Int = {
+        let physicalMB = ProcessInfo.processInfo.physicalMemory >> 20
+        // On devices with <= 8 GB physical RAM (e.g. 6 GB or 8 GB iPads), 1536 MB JIT cache combined with
+        // guest RAM leaves too little physical memory for iPadOS, causing memory compressor thrashing.
+        // Default to 1024 MB unless the device has >= 10 GB physical RAM (e.g. 16 GB M1/M2/M4 models).
+        if physicalMB < 10_000 {
+            return physicalMB < 5_000 ? 512 : 1024
+        }
+        return Entitlements.memoryLimitAtLaunch >= 5_500 << 20 ? 1536
+            : Entitlements.memoryLimitAtLaunch >= 3_500 << 20 ? 1024 : 512
+    }()
     static let jitBytes: Int = {
-        switch (UserDefaults.standard.object(forKey: codeCacheKey) as? Int) ?? defaultCodeCacheMB {
+        let physicalMB = ProcessInfo.processInfo.physicalMemory >> 20
+        var mb = (UserDefaults.standard.object(forKey: codeCacheKey) as? Int) ?? defaultCodeCacheMB
+        // Safety clamp: on <= 8 GB physical RAM devices, clamp 1536 MB to 1024 MB to prevent kernel thrashing
+        if physicalMB < 10_000 && mb > 1024 {
+            mb = 1024
+        }
+        switch mb {
         case 1536: return 1536 << 20
         case 512: return 512 << 20
         default: return 1024 << 20

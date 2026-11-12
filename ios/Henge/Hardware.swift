@@ -49,8 +49,8 @@ enum Device {
     static func memoryNote(_ gb: Int) -> String? {
         if gb < 4 { return "macOS has little room under 4 GB, so it can be very slow." }
         if memoryTooHigh(gb) {
-            return "Too much for this \(name). Henge needs memory of its own beside the Mac's, and when the \(name) runs short, "
-                + "iPadOS closes Henge without asking: anything not saved on the Mac is lost. \(suggestedRAMGB) GB or less is safer."
+            let totalMB = ProcessInfo.processInfo.physicalMemory >> 20
+            return "Too much for this \(name) (\(totalMB) MiB physical RAM). Allocating \(gb) GB guest RAM plus JIT cache exceeds physical memory, causing severe iPadOS compression thrashing and 10–25s freezes. \(suggestedRAMGB) GB or less is strongly recommended."
         }
         return nil
     }
