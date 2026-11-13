@@ -3210,23 +3210,26 @@ static void test_surface_standin_view_and_writeback(void) {
     id<MTLCommandQueue> saved_queue = r->queue;
     StandinQueue *sq = [StandinQueue new];
     r->queue = (id<MTLCommandQueue>)sq;
-    uint32_t saved_e20[3], saved_e21[3], saved_e22[3];
-    memcpy(saved_e20, table[20], 12);
-    memcpy(saved_e21, table[21], 12);
-    memcpy(saved_e22, table[22], 12);
-    table[20][0] = 1, table[20][1] = 0x1111, table[20][2] = 0;
-    table[21][0] = 1, table[21][1] = 0x2222, table[21][2] = 0;
-    table[22][0] = 1, table[22][1] = 0x3333, table[22][2] = 0;
-    memcpy(standin->entry, table[20], 12);
-    memcpy(view->entry, table[21], 12);
-    memcpy(sibling->entry, table[22], 12);
+    uint32_t saved_e13[3], saved_e14[3], saved_e15[3];
+    memcpy(saved_e13, table[13], 12);
+    memcpy(saved_e14, table[14], 12);
+    memcpy(saved_e15, table[15], 12);
+    table[13][0] = 1, table[13][1] = 0x1111, table[13][2] = 0;
+    table[14][0] = 1, table[14][1] = 0x2222, table[14][2] = 0;
+    table[15][0] = 1, table[15][1] = 0x3333, table[15][2] = 0;
+    memcpy(standin->entry, table[13], 12);
+    memcpy(view->entry, table[14], 12);
+    memcpy(sibling->entry, table[15], 12);
     if (!r->tasks[1]) r->tasks[1] = [HvTaskObjects new];
-    objs_set(r->tasks[1], 20, standin);
-    objs_set(r->tasks[1], 21, view);
-    objs_set(r->tasks[1], 22, sibling);
+    HvObject *saved_o13 = objs_get(r->tasks[1], 13);
+    HvObject *saved_o14 = objs_get(r->tasks[1], 14);
+    HvObject *saved_o15 = objs_get(r->tasks[1], 15);
+    objs_set(r->tasks[1], 13, standin);
+    objs_set(r->tasks[1], 14, view);
+    objs_set(r->tasks[1], 15, sibling);
 
     /* flags = 1 on view: refreshes stand-in via blit copyFromBuffer:toTexture: and clears sibling host_valid */
-    uint32_t exec_up[5] = {1, 1, 0, 21, 1};
+    uint32_t exec_up[5] = {1, 1, 0, 14, 1};
     [r exec:exec_up length:sizeof exec_up channel:1 stamp:900];
     CHECK(sq.lastCB && sq.lastCB.blit && sq.lastCB.blit.uploadCalls == 1 &&
           sq.lastCB.blit.srcOff == 16 && sq.lastCB.blit.srcRow == 80 && sq.lastCB.blit.copyCalls == 0 &&
@@ -3239,7 +3242,7 @@ static void test_surface_standin_view_and_writeback(void) {
     /* flags = 2 on view: writes stand-in back via blit and clears sibling host_valid + guest_stale */
     sibling->host_valid = YES;
     sibling->guest_stale = YES;
-    uint32_t exec_wr[5] = {1, 1, 0, 21, 2};
+    uint32_t exec_wr[5] = {1, 1, 0, 14, 2};
     [r exec:exec_wr length:sizeof exec_wr channel:1 stamp:901];
     CHECK(sq.lastCB && sq.lastCB.blit && sq.lastCB.blit.copyCalls == 1 &&
           sq.lastCB.blit.dstOff == 16 && sq.lastCB.blit.dstRow == 80 &&
@@ -3249,7 +3252,7 @@ static void test_surface_standin_view_and_writeback(void) {
     settle();
 
     /* Next use of sibling (flags = 0): re-uploads updated surface pixels via blit */
-    uint32_t exec_sib[5] = {1, 1, 0, 22, 0};
+    uint32_t exec_sib[5] = {1, 1, 0, 15, 0};
     [r exec:exec_sib length:sizeof exec_sib channel:1 stamp:902];
     CHECK(sq.lastCB && sq.lastCB.blit && sq.lastCB.blit.uploadCalls == 1 && sibling->host_valid,
           "sibling stand-in re-uploads updated surface pixels after peer flags=2 write");
@@ -3258,7 +3261,7 @@ static void test_surface_standin_view_and_writeback(void) {
 
     /* read-only flags = 4 without guest_stale: does not blit stand-in back */
     standin->guest_stale = NO;
-    uint32_t exec_ro[5] = {1, 1, 0, 21, 4};
+    uint32_t exec_ro[5] = {1, 1, 0, 14, 4};
     [r exec:exec_ro length:sizeof exec_ro channel:1 stamp:903];
     CHECK(sq.lastCB && (!sq.lastCB.blit || sq.lastCB.blit.copyCalls == 0),
           "exec read-only flags=4 without guest_stale skips stand-in writeback");
@@ -3267,7 +3270,7 @@ static void test_surface_standin_view_and_writeback(void) {
 
     /* synchronize: on view writes stand-in back; invalidate: propagates host_valid=NO across view and sibling */
     standin->guest_stale = YES;
-    uint32_t sync_cmd[3] = {1, 1, 21};
+    uint32_t sync_cmd[3] = {1, 1, 14};
     [r synchronize:sync_cmd length:sizeof sync_cmd];
     CHECK(sq.lastCB && sq.lastCB.blit && sq.lastCB.blit.copyCalls == 1 && !standin->guest_stale,
           "synchronize: on view blits stand-in back and clears guest_stale");
@@ -3275,7 +3278,7 @@ static void test_surface_standin_view_and_writeback(void) {
     settle();
 
     sibling->host_valid = YES;
-    uint32_t inv_cmd[4] = {1, 1, 21, 0x00000001u}; /* host_invalid=1 at byte 4 */
+    uint32_t inv_cmd[4] = {1, 1, 14, 0x00000001u}; /* host_invalid=1 at byte 4 */
     [r invalidate:inv_cmd length:sizeof inv_cmd];
     CHECK(!standin->host_valid && !sibling->host_valid,
           "invalidate: propagates host_valid=NO to stand-in root and sibling");
@@ -3314,6 +3317,10 @@ static void test_surface_standin_view_and_writeback(void) {
     memcpy(d2 + 19, &mips1, 2);
     memcpy(d2 + 21, &samp1, 2);
     memcpy(d2 + 23, &arr1, 2);
+    d2[0x23] = MTLTextureSwizzleRed;
+    d2[0x24] = MTLTextureSwizzleGreen;
+    d2[0x25] = MTLTextureSwizzleBlue;
+    d2[0x26] = MTLTextureSwizzleAlpha;
     HvObject *mapped_si = [HvObject new];
     [r makeMappedTexture:mapped_si at:0x8000 task:1];
     CHECK(mapped_si->surface_standin && dev.made &&
@@ -3325,12 +3332,12 @@ static void test_surface_standin_view_and_writeback(void) {
     [r->surfaces removeObjectForKey:@77];
     r->device = saved_dev;
 
-    objs_set(r->tasks[1], 20, nil);
-    objs_set(r->tasks[1], 21, nil);
-    objs_set(r->tasks[1], 22, nil);
-    memcpy(table[20], saved_e20, 12);
-    memcpy(table[21], saved_e21, 12);
-    memcpy(table[22], saved_e22, 12);
+    objs_set(r->tasks[1], 13, saved_o13);
+    objs_set(r->tasks[1], 14, saved_o14);
+    objs_set(r->tasks[1], 15, saved_o15);
+    memcpy(table[13], saved_e13, 12);
+    memcpy(table[14], saved_e14, 12);
+    memcpy(table[15], saved_e15, 12);
     r->queue = saved_queue;
 }
 
