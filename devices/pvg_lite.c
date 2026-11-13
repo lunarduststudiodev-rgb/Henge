@@ -328,7 +328,7 @@ static void root_walk(HvPvgLite *p) {
            is made (by the first channel command, which the barrier's drain may be): the work it names, handed over
            after a delete that went first, would make objects for a task already deleted. Only with none to be had
            (ensure_metal tried and failed) is there no worker to keep in order. */
-        int blocked = 0, ordered = p->metal || !p->metal_tried;
+        int blocked = 0, ordered = hv_pvg_lite_metal(p) || !__atomic_load_n(&p->metal_tried, __ATOMIC_ACQUIRE);
         for (uint32_t k = 0; ordered && k < hdr[0] >> 16 && !blocked; k++) {
             const uint32_t *b0 = guest32(p, buf + off + (at + 12 + 8 * k) % ring), *b1 = guest32(p, buf + off + (at + 16 + 8 * k) % ring);
             blocked = !barrier_met(p, 0, b0 ? *b0 : 0, b1 ? *b1 : 0);
@@ -1010,9 +1010,9 @@ int hv_pvg_lite_command(HvPvgLite *p, const uint32_t *cmd, uint32_t len) {
 
 /* The Metal side, made the first time the guest gives the GPU work (or a snapshot is restored). */
 static void ensure_metal(HvPvgLite *p) {
+    if (__builtin_expect(__atomic_load_n(&p->metal_tried, __ATOMIC_ACQUIRE), 1)) return;
     os_unfair_lock_lock(&p->layer_lock);
-    if (!p->metal_tried) {
-        p->metal_tried = 1;
+    if (!__atomic_load_n(&p->metal_tried, __ATOMIC_RELAXED)) {
         p->worker_tasks = p->tasks; /* a worker with nothing queued: every command read so far is its own */
         /* No Metal side with either switch (gpu_switch.h): HV_NO_GPU keeps the GPU off on a host (the MacBook) */
         HvPvgMetal *metal = hv_gpu_switched_off() ? NULL : hv_pvg_metal_create(p);
@@ -1023,6 +1023,7 @@ static void ensure_metal(HvPvgLite *p) {
         if (metal && p->layer_set) hv_pvg_metal_set_layer(metal, (void *)p->layer);
         if (metal && p->pointer_hidden) hv_pvg_metal_hide_pointer(metal, 1);
         atomic_store_explicit(&p->metal, metal, memory_order_release);
+        __atomic_store_n(&p->metal_tried, 1, __ATOMIC_RELEASE);
     }
     os_unfair_lock_unlock(&p->layer_lock);
 }
@@ -1050,10 +1051,17 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
     int any = 0;
     while (rd != wr) {
         uint32_t hdr[3];
-        for (int i = 0; i < 3; i++) {
-            uint32_t at = (rd + 4u * i) % size;
-            const uint32_t *w = guest32(p, ((uint64_t)table[at >> 14] << 14) + (at & 0x3fff));
-            hdr[i] = w ? *w : 0;
+        uint32_t at0 = rd % size;
+        if ((at0 & 0x3fff) <= 0x4000 - 12) {
+            const uint32_t *hw = hv_phys_ptr_r(p->m, ((uint64_t)table[at0 >> 14] << 14) + (at0 & 0x3fff), 12);
+            if (hw) memcpy(hdr, hw, sizeof hdr);
+            else memset(hdr, 0, sizeof hdr);
+        } else {
+            for (int i = 0; i < 3; i++) {
+                uint32_t at = (rd + 4u * i) % size;
+                const uint32_t *w = guest32(p, ((uint64_t)table[at >> 14] << 14) + (at & 0x3fff));
+                hdr[i] = w ? *w : 0;
+            }
         }
         /* No shorter than its header and barriers, no longer than what was written: the rest is the guest's next work */
         if (wr - rd > size || !command_length_ok(hdr, wr - rd)) {
@@ -1282,7 +1290,8 @@ static void vblank(HvPvgLite *p) {
     if (!d || !(__atomic_load_n((uint32_t *)(d + 0x104), __ATOMIC_ACQUIRE) & 8)) return;
     uint64_t now = mach_absolute_time();
     if (now < next) return;
-    next = now + period;
+    if (!next || now - next >= period) next = now + period;
+    else next += period;
     __atomic_fetch_or((uint32_t *)(d + 0x100), 8, __ATOMIC_RELEASE);
     p->vblanks++;
     hv_gicv3_pend(p->gic, p->gfx_irq);
@@ -1593,7 +1602,7 @@ int hv_pvg_lite_check(const uint8_t *data, size_t len, const uint8_t *metal, siz
 int hv_pvg_lite_load(HvPvgLite *p, const uint8_t *data, size_t len, HvPvgBytes *metal) {
     HvPvgBytes ext = {0};
     if (metal) ext = *metal, memset(metal, 0, sizeof *metal); /* taken, whatever happens */
-    if (hv_pvg_lite_metal(p) || p->metal_tried) {
+    if (hv_pvg_lite_metal(p) || __atomic_load_n(&p->metal_tried, __ATOMIC_ACQUIRE)) {
         fprintf(stderr, "hengevm: snapshot: the screen device is already in use\n");
         hv_pvg_bytes_release(&ext);
         return -1;

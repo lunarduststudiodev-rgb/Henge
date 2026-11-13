@@ -36,6 +36,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 
 static HvMachine m;
@@ -103,15 +104,29 @@ int hv_vm_boot_display(HvBootDisplay *d, uint8_t *to, size_t cap) {
             last_scan = now;
             if (pass && found) found = 0;
             uint64_t limit = size < (1ull << 30) ? size : 1ull << 30;
-            for (uint64_t off = 0; off + 0x1000 <= limit && !found; off += 0x4000) {
-                const uint64_t *q = (const uint64_t *)(ram + off);
-                const uint16_t *h = (const uint16_t *)(ram + off);
-                if (h[0] < 2 || h[0] > 3 || h[1] < 1 || h[1] > 3) continue; /* boot_args: revision, version */
-                if (q[1] >> 40 != 0xfffffe || q[2] < VMAPPLE_MEM || q[2] >= VMAPPLE_MEM + size || q[3] == 0 || q[3] > size) continue;
-                uint64_t base = q[5], row = q[7], w = q[8], hh = q[9], depth = q[10];
-                if (w < 320 || w > 8192 || hh < 200 || hh > 8192 || row < w * 4 || (depth & 0xff) != 32) continue;
-                if (base < VMAPPLE_MEM || base - VMAPPLE_MEM + row * hh > size) continue;
-                found = off;
+            /* Query residency before reading guest RAM so untouched pages aren't faulted in on the caller thread. */
+            long ps = sysconf(_SC_PAGESIZE);
+            size_t host_page = ps > 0 ? (size_t)ps : 0x4000;
+            char vec[1024];
+            uint64_t chunk_bytes = host_page <= 0x4000 ? (uint64_t)sizeof vec * host_page : 0;
+            for (uint64_t chunk = 0; chunk + 0x1000 <= limit && !found;) {
+                uint64_t chunk_end = chunk_bytes && chunk + chunk_bytes < limit ? chunk + chunk_bytes : limit;
+                int have_vec = chunk_bytes && mincore(ram + chunk, (size_t)(chunk_end - chunk), vec) == 0;
+                for (uint64_t off = chunk; off + 0x1000 <= chunk_end && !found; off += 0x4000) {
+                    if (have_vec) {
+                        size_t idx = (size_t)((off - chunk) / host_page);
+                        if (!(vec[idx] & (MINCORE_INCORE | MINCORE_PAGED_OUT))) continue;
+                    }
+                    const uint64_t *q = (const uint64_t *)(ram + off);
+                    const uint16_t *h = (const uint16_t *)(ram + off);
+                    if (h[0] < 2 || h[0] > 3 || h[1] < 1 || h[1] > 3) continue; /* boot_args: revision, version */
+                    if (q[1] >> 40 != 0xfffffe || q[2] < VMAPPLE_MEM || q[2] >= VMAPPLE_MEM + size || q[3] == 0 || q[3] > size) continue;
+                    uint64_t base = q[5], row = q[7], w = q[8], hh = q[9], depth = q[10];
+                    if (w < 320 || w > 8192 || hh < 200 || hh > 8192 || row < w * 4 || (depth & 0xff) != 32) continue;
+                    if (base < VMAPPLE_MEM || base - VMAPPLE_MEM + row * hh > size) continue;
+                    found = off;
+                }
+                chunk = chunk_end;
             }
         }
         if (!found) return -1;
@@ -493,13 +508,29 @@ static int kicker_stop;
 
 static void *kicker_thread(void *unused) {
     (void)unused;
+    useconds_t idle_us = 1000;
     while (!__atomic_load_n(&kicker_stop, __ATOMIC_ACQUIRE)) {
         if (__atomic_load_n(&vm_paused, __ATOMIC_ACQUIRE)) { /* nothing runs: no need to wake every millisecond */
+            idle_us = 1000;
             usleep(20000);
             continue;
         }
-        usleep(1000);
-        hv_machine_kick_all(&m);
+        usleep(idle_us);
+        int any_active = 0;
+        for (int i = 0; i < m.ncpus; i++) {
+            if (!m.cpus[i]) continue;
+            HvPerCpu *p = m.cpus[i]->pc_state;
+            if (p && !__atomic_load_n(&p->active, __ATOMIC_RELAXED)) continue;
+            any_active = 1;
+            __atomic_store_n(&m.cpus[i]->exit_req, 1, __ATOMIC_SEQ_CST);
+        }
+        if (any_active) {
+            if (m.stats_interval) HV_STAT_ADD(&m, kick_src[2], 1);
+            __asm__ volatile("sev" ::: "memory");
+            idle_us = 1000;
+        } else if (idle_us < 4000) {
+            idle_us *= 2;
+        }
     }
     return NULL;
 }

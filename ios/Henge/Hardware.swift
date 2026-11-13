@@ -180,7 +180,12 @@ final class HardwareMouse {
     private var scrollsLogged = 0 // the first few, to see what a device's raw values look like
     private var lastScrollFirst: Float = 0, lastScrollSecond: Float = 0
     private let scroller = MacScroller()
-    private var scrollEnd: DispatchWorkItem?
+    private var scrollDeadline: CFTimeInterval = 0
+    private var scrollLastTime: CFTimeInterval = 0
+    private var scrollTimerActive = false
+    private var scrollGeneration = 0
+    private var cachedScrollScale: CGFloat = 0
+    private var cachedScrollScaleAt: CFTimeInterval = 0
 
     func start() {
         lastScrollFirst = 0
@@ -303,28 +308,44 @@ final class HardwareMouse {
         let mostlyHorizontal = abs(second) > 2 * abs(first)
         let vertical = verticalChanged && !mostlyHorizontal && first.isFinite ? CGFloat(-first) : 0
         let horizontal = horizontalChanged && !mostlyVertical && second.isFinite ? CGFloat(-second) : 0
-        let way: CGFloat = UserDefaults.standard.bool(forKey: Self.reverseKey) ? -1 : 1
-        let scale = pointsPerUnit * ScrollSpeed.factor * 0.6 * way
-        let d = CGPoint(x: horizontal * scale, y: vertical * scale)
+        let now = CACurrentMediaTime()
+        if !scrollTimerActive || now - cachedScrollScaleAt >= 0.5 {
+            let way: CGFloat = UserDefaults.standard.bool(forKey: Self.reverseKey) ? -1 : 1
+            cachedScrollScale = pointsPerUnit * ScrollSpeed.factor * 0.6 * way
+            cachedScrollScaleAt = now
+        }
+        let d = CGPoint(x: horizontal * cachedScrollScale, y: vertical * cachedScrollScale)
         if scrollsLogged < 24 {
             scrollsLogged += 1
             HengeLog.log("input", "scroll raw: \(first), \(second); Mac points: \(Int(d.x.rounded())), \(Int(d.y.rounded()))")
         }
         guard d != .zero else { return }
-        let now = CACurrentMediaTime()
         scroller.scroll(by: d, at: now) // a page still gliding stops as it begins, as under a trackpad
-        scrollEnd?.cancel()
-        let end = DispatchWorkItem { [weak self] in
-            // A trackpad's stream of moves flings the page on; a wheel's notch never does.
-            self?.scroller.end(gliding: true, at: now, fling: 3)
+        scrollLastTime = now
+        scrollDeadline = now + Self.scrollPause
+        if !scrollTimerActive {
+            scrollTimerActive = true
+            scheduleScrollEnd(after: Self.scrollPause, generation: scrollGeneration)
         }
-        scrollEnd = end
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.scrollPause, execute: end)
+    }
+
+    private func scheduleScrollEnd(after delay: CFTimeInterval, generation: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(delay, 0)) { [weak self] in
+            guard let self, self.scrollGeneration == generation, self.scrollTimerActive else { return }
+            let remaining = self.scrollDeadline - CACurrentMediaTime()
+            if remaining > 0.002 {
+                self.scheduleScrollEnd(after: remaining, generation: generation)
+                return
+            }
+            self.scrollTimerActive = false
+            // A trackpad's stream of moves flings the page on; a wheel's notch never does.
+            self.scroller.end(gliding: true, at: self.scrollLastTime, fling: 3)
+        }
     }
 
     private func stopScrolling() {
-        scrollEnd?.cancel()
-        scrollEnd = nil
+        scrollGeneration &+= 1
+        scrollTimerActive = false
         scroller.end(gliding: false, at: CACurrentMediaTime())
     }
 }

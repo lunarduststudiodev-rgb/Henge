@@ -8,6 +8,7 @@
 #include <mach/mach_error.h>
 #include <mach/vm_map.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -466,29 +467,38 @@ void hv_ramfile_hold_stats(uint64_t *max_ns, uint64_t *n) {
 int hv_ramfile_discard(HvRamFile *f, uint64_t off, uint64_t len) {
     uint64_t first = (off + f->page - 1) / f->page, end = (off + len) / f->page;
     if (off > f->size || len > f->size - off) return -1;
+    if (end <= first) return 0;
     int rc = 0;
+    /* Split large give-backs into bounded chunks (~4 MB) so open_lock is dropped frequently
+       and GPU worker / Metal deallocator threads do not stall waiting for it. */
+    uint64_t chunk_pages = (4ull << 20) / f->page;
+    if (!chunk_pages) chunk_pages = 1;
     /* Under the lock a GPU mapping pins under, before it remaps (hv_ramfile_gpu_map): a page pinned after its check
        here would be one the GPU then maps while it is swapped for new memory, the GPU keeping the old (the guest's
        later writes never reaching it). With the lock, a pin is either seen (the page zeroed in place) or comes after
        (the remap takes the new memory). Nothing under it waits for the vCPUs. */
-    pthread_mutex_lock(&open_lock);
-    uint64_t t0 = now_ns();
     for (uint64_t i = first; i < end;) {
-        /* Under a GPU mapping (never, for pages the guest gave back): its pages stay where the GPU has them */
-        if (atomic_load_explicit(&f->pins[i], memory_order_acquire)) {
-            memset(f->base + i * f->page, 0, f->page);
-            i++;
-            continue;
+        uint64_t stop = i + chunk_pages < end ? i + chunk_pages : end;
+        pthread_mutex_lock(&open_lock);
+        uint64_t t0 = now_ns();
+        while (i < stop) {
+            /* Under a GPU mapping (never, for pages the guest gave back): its pages stay where the GPU has them */
+            if (atomic_load_explicit(&f->pins[i], memory_order_acquire)) {
+                memset(f->base + i * f->page, 0, f->page);
+                i++;
+                continue;
+            }
+            uint64_t e = i + 1;
+            while (e < stop && !atomic_load_explicit(&f->pins[e], memory_order_acquire)) e++;
+            if (fresh(f, i * f->page, (e - i) * f->page) != 0) rc = -1;
+            i = e;
         }
-        uint64_t e = i + 1;
-        while (e < end && !atomic_load_explicit(&f->pins[e], memory_order_acquire)) e++;
-        if (fresh(f, i * f->page, (e - i) * f->page) != 0) rc = -1;
-        i = e;
+        pthread_mutex_unlock(&open_lock);
+        note_hold(t0); /* its line outside the lock */
+        if (i < end) sched_yield();
     }
-    pthread_mutex_unlock(&open_lock);
-    note_hold(t0); /* its line outside the lock */
     /* After: whatever the files held there, the page is zeros now (the writer makes it a hole) */
-    if (end > first) hv_ramfile_mark_dirty(f, first * f->page, (end - first) * f->page);
+    hv_ramfile_mark_dirty(f, first * f->page, (end - first) * f->page);
     return rc;
 }
 
@@ -799,7 +809,7 @@ uint64_t hv_ramfile_writer_pass(HvRamFile *f) {
             if (f->wwork) {
                 wrote = write_some(f, 0, f->npages, want < limit ? want : limit, 1, f->wwork, &err);
                 /* The copy room's pages given back between passes (they're rewritten whole each batch) */
-                (void)madvise(f->wwork->buf, SLICE, MADV_FREE_REUSABLE);
+                if (wrote) (void)madvise(f->wwork->buf, SLICE, MADV_FREE_REUSABLE);
             }
             f->tokens -= (double)wrote;
             if (wrote) atomic_fetch_add(&f->flushes, 1);
