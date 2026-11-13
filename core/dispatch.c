@@ -2521,7 +2521,8 @@ static int run_loop(HvCpu *cpu, int one) {
             continue;
         }
         /* Someone asked the CPU to leave (the 1 ms kicker, a device, an invalidation): service devices now. */
-        int kicked = __atomic_exchange_n(&cpu->exit_req, 0, __ATOMIC_ACQUIRE) != 0;
+        int kicked = __atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED) &&
+                     __atomic_exchange_n(&cpu->exit_req, 0, __ATOMIC_ACQUIRE) != 0;
         if (kicked && m->nzones > 1) sample_zone(cpu);
         /* A request posted after the check above set exit_req once more, and clearing it
            just now would leave the request waiting for some later kick (a TLBI's sender

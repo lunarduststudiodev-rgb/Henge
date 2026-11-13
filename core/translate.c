@@ -1136,27 +1136,42 @@ static void translate_mem_inner(Emit *e, uint32_t insn, uint64_t pc) {
     } else if (literal) {
         put_lit(e, A, pc + op.imm);
     } else {
-        if (base_stolen) {
-            put(e, sp_base ? ADD_SP_TO(A) : LDR_X(A, 28, slot_of(op.rn)));
-            base = A;
-        }
-        switch (op.mode) {
-        case HV_ADDR_OFFSET:
-        case HV_ADDR_PRE:
-            if (!direct) put_add_imm(e, A, base, op.imm);
-            break;
-        case HV_ADDR_REG: {
-            int rm = op.rm;
-            if (is_stolen(rm)) {
-                put(e, LDR_X(T, 28, slot_of(rm)));
-                rm = T;
+        if (sp_base) {
+            if ((op.mode == HV_ADDR_OFFSET || op.mode == HV_ADDR_PRE) && op.imm) {
+                put_add_imm(e, A, 31, op.imm);
+            } else if (op.mode == HV_ADDR_REG) {
+                int rm = op.rm;
+                if (is_stolen(rm)) {
+                    put(e, LDR_X(T, 28, slot_of(rm)));
+                    rm = T;
+                }
+                put(e, ADD_EXT(A, 31, rm, op.ext, op.shift));
+            } else {
+                put(e, ADD_SP_TO(A));
             }
-            put(e, ADD_EXT(A, base, rm, op.ext, op.shift));
-            break;
-        }
-        default:
-            if (!direct && base != A) put(e, MOV_X(A, base));
-            break;
+        } else {
+            if (base_stolen) {
+                put(e, LDR_X(A, 28, slot_of(op.rn)));
+                base = A;
+            }
+            switch (op.mode) {
+            case HV_ADDR_OFFSET:
+            case HV_ADDR_PRE:
+                if (!direct) put_add_imm(e, A, base, op.imm);
+                break;
+            case HV_ADDR_REG: {
+                int rm = op.rm;
+                if (is_stolen(rm)) {
+                    put(e, LDR_X(T, 28, slot_of(rm)));
+                    rm = T;
+                }
+                put(e, ADD_EXT(A, base, rm, op.ext, op.shift));
+                break;
+            }
+            default:
+                if (!direct && base != A) put(e, MOV_X(A, base));
+                break;
+            }
         }
     }
 
@@ -1789,7 +1804,19 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
         if (!read || !el1) return 0;
         put_const_to(e, rt, CLIDR);
         return 1;
+    case SR(3, 1, 0, 0, 7): /* AIDR_EL1 */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, (e->m->software_tso || e->m->rosetta ? 1ull << 9 : 0) | (e->m->rosetta ? 1ull << 19 : 0));
+        return 1;
+    case SR(3, 0, 1, 0, 1): /* ACTLR_EL1 */
+        if (!read || !el1) return 0;
+        put_load_field(e, rt, HV_CPU_ACTLR);
+        return 1;
     default:
+        if (read && el1 && (reg >> 14) == 3 && ((reg >> 11) & 7) == 0 && ((reg >> 7) & 15) == 0 && ((reg >> 3) & 15) >= 1) {
+            put_const_to(e, rt, 0);
+            return 1;
+        }
         return 0;
     }
 }
