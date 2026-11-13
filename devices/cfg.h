@@ -18,6 +18,9 @@ typedef struct HvCfgParams {
     uint64_t seed;  /* nonzero: `rnd` gives a reproducible sequence (for debugging) */
 } HvCfgParams;
 
+/* Sets the fallback model and SoC name used when HvCfgParams leaves them NULL (call before hv_vm_create). */
+void hv_cfg_set_device_info(const char *model, const char *soc_name);
+
 /* Returns the host copy of the region (64 KB). */
 uint8_t *hv_cfg_create(HvMachine *m, uint64_t pa, const HvCfgParams *p);
 

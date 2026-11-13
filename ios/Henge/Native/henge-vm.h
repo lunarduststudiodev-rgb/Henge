@@ -401,6 +401,8 @@ int henge_vm_boot_display(uint8_t *to, size_t cap, int *width, int *height, int 
    host_key: a volume button (1 up, -1 down, 0 mute), macOS steps its volume and shows its own display.
    volume: the speaker's volume now, 0 or -1 (no Mac). */
 void henge_vm_speaker_name(const char *name);
+/* Sets the host device model name and SoC string exposed via VMAppleCfg (before henge_vm_boot / henge_vm_install). */
+void henge_vm_set_device_info(const char *model, const char *soc_name);
 void henge_vm_speaker_listen(void (*cb)(void *opaque, double level, int mute), void *opaque);
 void henge_vm_speaker_host_volume(double level);
 void henge_vm_speaker_host_key(int key);

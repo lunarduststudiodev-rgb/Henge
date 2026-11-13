@@ -77,9 +77,17 @@ static void cfg_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     memcpy((uint8_t *)opaque + off, &v, size);
 }
 
+static char default_model[32];
+static char default_soc_name[32];
+
 static void put_str(char *dst, const char *src) {
     strncpy(dst, src, 31);
     dst[31] = 0;
+}
+
+void hv_cfg_set_device_info(const char *model, const char *soc_name) {
+    put_str(default_model, model ? model : "");
+    put_str(default_soc_name, soc_name ? soc_name : "");
 }
 
 uint8_t *hv_cfg_create(HvMachine *m, uint64_t pa, const HvCfgParams *p) {
@@ -106,11 +114,13 @@ uint8_t *hv_cfg_create(HvMachine *m, uint64_t pa, const HvCfgParams *p) {
     memcpy(c->mac_wifi0, p->mac_wifi0, 6);
     memcpy(c->mac_bt0, p->mac_bt0, 6);
     for (uint32_t i = 0; i < c->nr_cpus && i < 0x80; i++) c->cpu_ids[i] = i;
+    const char *model = p->model ? p->model : (default_model[0] ? default_model : "VM0001");
+    const char *soc_name = p->soc_name ? p->soc_name : (default_soc_name[0] ? default_soc_name : "Apple M1 (Virtual)");
     put_str(c->serial, p->serial ? p->serial : "1234");
     put_str(c->unk8, "D/A");
-    put_str(c->model, p->model ? p->model : "VM0001");
+    put_str(c->model, model);
     c->unk10 = 1;
-    put_str(c->soc_name, p->soc_name ? p->soc_name : "Apple M1 (Virtual)");
+    put_str(c->soc_name, soc_name);
     /* Experiment (HV_CFG_POKE="0x8=0,0x2c=0"): override 32-bit words, to find
        what the unknown fields mean. */
     for (const char *e = getenv("HV_CFG_POKE"); e && *e;) {

@@ -1662,6 +1662,7 @@ struct SessionView: View {
         JITBootstrap.releaseLingeringDebugger()
         Sharing.prepare(mac)
         MacSpeaker.shared.prepare()
+        Device.applyHostIdentity()
         EngineTuning.apply()
         henge_vm_set_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
         henge_vm_set_display(UInt32(mac.screen.width), UInt32(mac.screen.height))

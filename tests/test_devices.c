@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include "sysreg.h"
+#include "cfg.h"
 #include "vmapple.h"
 #include "timer.h"
 
@@ -962,6 +963,19 @@ int main(void) {
     }
     test_guest_programs();
     test_pause();
+    {
+        static HvMachine cfg_m;
+        check("cfg override machine init", hv_machine_init(&cfg_m, 4 << 20), 0);
+        HvCfgParams p = {.nr_cpus = 1, .ecid = 0x1234};
+        hv_cfg_set_device_info("iPad Pro (12.9-inch, M1)", "Apple M1");
+        uint8_t *raw = hv_cfg_create(&cfg_m, VMAPPLE_CONFIG, &p);
+        check("cfg custom model", strcmp((char *)(raw + 0x540), "iPad Pro (12.9-inch, M1)"), 0);
+        check("cfg custom soc_name", strcmp((char *)(raw + 0x584), "Apple M1"), 0);
+        hv_cfg_set_device_info(NULL, NULL);
+        uint8_t *raw_def = hv_cfg_create(&cfg_m, VMAPPLE_CONFIG + 0x100000, &p);
+        check("cfg reset model", strcmp((char *)(raw_def + 0x540), "VM0001"), 0);
+        check("cfg reset soc_name", strcmp((char *)(raw_def + 0x584), "Apple M1 (Virtual)"), 0);
+    }
 
     hv_disk_close(&root);
     hv_disk_close(&aux);

@@ -18,6 +18,7 @@
 #include "henge-ios-jit.h"
 #include "net_slirp.h"
 #include "vm.h"
+#include "cfg.h"
 #include "audio_mac.h"
 #include "snapshot.h"
 #include "rosetta.h"
@@ -411,6 +412,7 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
 void henge_vm_system_pin(const char *path) { hv_share_system_pin(path); }
 void henge_vm_folders(const char *shared_name, const char *shared, const char *tools) { hv_vm_set_folders(shared_name, shared, tools); }
 void henge_vm_speaker_name(const char *name) { hv_vm_set_speaker_name(name); }
+void henge_vm_set_device_info(const char *model, const char *soc_name) { hv_cfg_set_device_info(model, soc_name); }
 void henge_vm_speaker_listen(void (*cb)(void *opaque, double level, int mute), void *opaque) { hv_vm_set_speaker_listener(cb, opaque); }
 void henge_vm_speaker_host_volume(double level) { if (state == 1) hv_vm_speaker_host_volume(level); }
 void henge_vm_speaker_host_key(int key) { if (state == 1) hv_vm_speaker_host_key(key); }
