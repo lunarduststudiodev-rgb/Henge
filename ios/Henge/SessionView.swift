@@ -438,7 +438,17 @@ struct SessionView: View {
             if phase == .background { dictation.cancel() }
         }
         .onChange(of: showDetails) { showing in
-            if showing { HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll(); log = HengeLog.recentLines(30) }
+            if showing {
+                HardwareKeys.releaseAll()
+                StickyKeys.shared.releaseAll()
+                framesOut = henge_vm_net_frames(1)
+                framesIn = henge_vm_net_frames(0)
+                log = HengeLog.recentLines(30)
+                Self.statsQueue.async {
+                    let ports = MacPorts.now()
+                    DispatchQueue.main.async { if ports != macPorts { macPorts = ports } }
+                }
+            }
         }
         .onChange(of: showDisks) { showing in
             if showing { HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll() }
@@ -1371,6 +1381,8 @@ struct SessionView: View {
     private func followPointer() async {
         var tick = 0
         var was: (Int32, Int32)?
+        let mapQueue = DispatchQueue(label: "henge.session.map", qos: .userInitiated)
+        let aspect = mac.aspect
         while !Task.isCancelled {
             var x: Int32 = 0, y: Int32 = 0
             /* The pointer is in the pixels of the size macOS shows now, which its Displays settings can change. */
@@ -1383,7 +1395,14 @@ struct SessionView: View {
                     moveZoom(toward: CGPoint(x: CGFloat(x) / CGFloat(w), y: CGFloat(y) / CGFloat(h)))
                 }
             }
-            if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / mac.aspect)) { map = UIImage(cgImage: image) }
+            if tick % 60 == 0 {
+                let height = Int(224 / aspect)
+                mapQueue.async {
+                    guard let image = MacPreview.capture(width: 224, height: height) else { return }
+                    let ui = UIImage(cgImage: image)
+                    DispatchQueue.main.async { map = ui }
+                }
+            }
             tick += 1
             try? await Task.sleep(nanoseconds: 33_000_000)
         }
@@ -1638,6 +1657,7 @@ struct SessionView: View {
 
     /// What Quicker wake was last set to for the heat (-1: not yet), for the log.
     private static var idleSpinSet: Int32 = -1
+    private static let statsQueue = DispatchQueue(label: "henge.session.stats", qos: .utility)
 
     private static func thermalLabel(_ state: ProcessInfo.ThermalState) -> String {
         switch state {
@@ -1721,22 +1741,30 @@ struct SessionView: View {
         var loginSaidAt: Date? // when it started saying the login window is up
         var loginSaidFrames: UInt64 = 0 // and how many frames the Mac's GPU had drawn by then
         while !Task.isCancelled {
-            state = henge_vm_state()
-            cpusOn = henge_vm_cpus_on()
-            userCode = userCode || henge_vm_guest_el0() != 0
+            let nextState = henge_vm_state()
+            if state != nextState { state = nextState }
+            let nextCpus = henge_vm_cpus_on()
+            if cpusOn != nextCpus { cpusOn = nextCpus }
+            if !userCode, henge_vm_guest_el0() != 0 { userCode = true }
             if userCode && !countedAsUsed, var used = Machines.shared.all.first(where: { $0.id == mac.id }) {
                 countedAsUsed = true
                 used.lastUsed = started
                 Machines.shared.update(used)
             }
             let now = Date(), blocks = henge_vm_blocks()
-            blocksPerSecond = Double(blocks &- lastBlocks) / max(now.timeIntervalSince(lastTime), 0.001)
+            let blocksRate = Double(blocks &- lastBlocks) / max(now.timeIntervalSince(lastTime), 0.001)
             lastBlocks = blocks
             lastTime = now
-            framesOut = henge_vm_net_frames(1)
-            framesIn = henge_vm_net_frames(0)
-            let ports = MacPorts.now()
-            if ports != macPorts { macPorts = ports }
+            let tx = henge_vm_net_frames(1), rx = henge_vm_net_frames(0)
+            if showDetails {
+                blocksPerSecond = blocksRate
+                if framesOut != tx { framesOut = tx }
+                if framesIn != rx { framesIn = rx }
+                Self.statsQueue.async {
+                    let ports = MacPorts.now()
+                    DispatchQueue.main.async { if showDetails, ports != macPorts { macPorts = ports } }
+                }
+            }
             var lostToMac: UInt64 = 0, lostFromMac: UInt64 = 0, tooLong: UInt64 = 0, resets: UInt64 = 0
             henge_vm_net_losses(&lostToMac, &lostFromMac, &tooLong, &resets)
             let lost = lostToMac &+ lostFromMac &+ tooLong
@@ -1850,19 +1878,20 @@ struct SessionView: View {
             }
             tick += 1
             if tick % 10 == 0 {
-                JITBootstrap.releaseLingeringDebugger()
                 let gpuFrames = henge_vm_gpu_frames()
                 let lostText = lost > 0 ? ", dropped \(lost)" : ""
-                HengeLog.log("perf", "\(Self.perfClock.string(from: now)) blocks/s \(String(format: "%.0f", blocksPerSecond)), "
-                             + "GPU frames/10s \(gpuFrames &- lastGPUFrames), network tx \(framesOut), rx \(framesIn), "
+                HengeLog.log("perf", "\(Self.perfClock.string(from: now)) blocks/s \(String(format: "%.0f", blocksRate)), "
+                             + "GPU frames/10s \(gpuFrames &- lastGPUFrames), network tx \(tx), rx \(rx), "
                              + "resets to the Mac \(resets)\(lostText), "
                              + "thermal \(Self.thermalLabel(heat))")
                 lastGPUFrames = gpuFrames
-                // The network over the same 10 s, while anything moves: speed each way, how quickly macOS
-                // acknowledges, and frames waiting or lost (a slow network shows here before anywhere else).
-                var line = [CChar](repeating: 0, count: 512)
-                if henge_vm_net_report(&line, line.count) != 0 {
-                    HengeLog.log("net", String(cString: line))
+                // Keep sysctl (releaseLingeringDebugger) and network report off the main thread.
+                Self.statsQueue.async {
+                    JITBootstrap.releaseLingeringDebugger()
+                    var line = [CChar](repeating: 0, count: 512)
+                    if henge_vm_net_report(&line, line.count) != 0 {
+                        HengeLog.log("net", String(cString: line))
+                    }
                 }
             }
             // About when the desktop is up after a login; not while the Mac is still at its login window or paused.

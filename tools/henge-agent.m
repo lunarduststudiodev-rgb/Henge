@@ -2550,7 +2550,19 @@ static void applyLightweightUIFlags(void) {
         CFPreferencesSetAppValue(CFSTR("NSAutomaticDashSubstitutionEnabled"), kCFBooleanFalse, kCFPreferencesAnyApplication);
         CFPreferencesSetAppValue(CFSTR("AppleEnableSwipeNavigateWithScrolls"), kCFBooleanFalse, kCFPreferencesAnyApplication);
         CFPreferencesSetAppValue(CFSTR("AppleMiniaturizeOnDoubleClick"), kCFBooleanFalse, kCFPreferencesAnyApplication);
+        // Keep Electron/Chromium IDEs (e.g. Antigravity, VS Code) and helper workers unthrottled by App Nap
+        CFPreferencesSetAppValue(CFSTR("NSAppSleepDisabled"), kCFBooleanTrue, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("NSDisableAutomaticTermination"), kCFBooleanTrue, kCFPreferencesAnyApplication);
         CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
+
+        // Avoid .DS_Store metadata writes over VirtIOFS shared folders and USB drives, and skip Time Machine disk prompts
+        CFStringRef ds = CFSTR("com.apple.desktopservices");
+        CFPreferencesSetAppValue(CFSTR("DSDontWriteNetworkStores"), kCFBooleanTrue, ds);
+        CFPreferencesSetAppValue(CFSTR("DSDontWriteUSBStores"), kCFBooleanTrue, ds);
+        CFPreferencesAppSynchronize(ds);
+        CFStringRef tm = CFSTR("com.apple.TimeMachine");
+        CFPreferencesSetAppValue(CFSTR("DoNotOfferNewDisksForBackup"), kCFBooleanTrue, tm);
+        CFPreferencesAppSynchronize(tm);
 
         // Dock: expose animation, autohide delays, launch animations, swoosh
         CFStringRef dock = CFSTR("com.apple.dock");
@@ -2596,7 +2608,24 @@ static void applyLightweightUIFlags(void) {
             CFNotificationCenterPostNotification(dist, CFSTR("com.apple.controlcenter.prefschanged"), NULL, NULL, YES);
             CFNotificationCenterPostNotification(dist, CFSTR("AppleNoRedisplayAppearancePreferenceChanged"), NULL, NULL, YES);
         }
-        note(@"applied lightweight macOS UI preferences (reduced motion/transparency, zero-delay animations)");
+        note(@"applied lightweight macOS UI preferences (reduced motion/transparency, zero-delay animations, App Nap disabled)");
+    }
+}
+
+// Restarts Dock once per boot/agent-version so snapshot-resumed Macs flush cached notification badge
+// textures and pick up updated Dock preferences without crash-looping.
+static void refreshDockCacheOnce(void) {
+    char marker[64];
+    snprintf(marker, sizeof marker, "/tmp/.henge-agent-dock-v%d-%u", HV_AGENT_VERSION, (unsigned)getuid());
+    int fd = open(marker, O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if (fd < 0) return;
+    close(fd);
+    char *args[] = {"/usr/bin/killall", "Dock", NULL};
+    pid_t pid = 0;
+    if (posix_spawn(&pid, args[0], NULL, NULL, args, environ) == 0) {
+        int st = 0;
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+        note(@"refreshed Dock badge cache (one-time restart for v42)");
     }
 }
 
@@ -4201,6 +4230,9 @@ static void applySystemLightweightFlags(void) {
         CFPreferencesSetValue(CFSTR("reduceTransparency"), kCFBooleanTrue, ua, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
         CFPreferencesSynchronize(ua, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
 
+        CFPreferencesSetValue(CFSTR("NSAppSleepDisabled"), kCFBooleanTrue, kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
+        CFPreferencesSynchronize(kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
+
         // Control Center: show Battery in Menu Bar
         CFStringRef cc = CFSTR("com.apple.controlcenter");
         CFPreferencesSetValue(CFSTR("NSStatusItem Visible Battery"), kCFBooleanTrue, cc, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
@@ -4502,6 +4534,7 @@ int main(int argc, char **argv) {
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                 applyHostModelName();
                 if (!getenv("HENGE_NO_LIGHTEN")) applyLightweightUIFlags();
+                refreshDockCacheOnce();
             });
         }
         if (!test || getenv("HENGE_AGENT_TEST_TOOLS")) watchToolsDisk();

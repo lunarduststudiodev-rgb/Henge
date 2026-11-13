@@ -26,6 +26,7 @@
 #include "stallmon.h"
 #include "bench.h"
 
+#include <dispatch/dispatch.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
@@ -45,6 +46,29 @@ static void on_exit(int reason) {
 static volatile int built_not_started; /* henge_vm_boot_saved's -1: a machine to start afresh */
 static _Atomic int autosaving; /* henge_vm_autosave is under way: input waits for the Mac (live) */
 static volatile int resumed; /* the running machine went on from a snapshot, not a fresh start */
+
+/* Keep main-thread UI/touch/pointer callers off input_fence, xhci, virtio-input, share, and display locks
+   while preserving exact FIFO ordering with pause/stop/suspend flushes. */
+static dispatch_queue_t input_q(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_queue_attr_t a = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+        q = dispatch_queue_create("henge.input", a);
+    });
+    return q;
+}
+
+static void send_fence(HvFenceEvent e) {
+    dispatch_async(input_q(), ^{
+        HvFenceEvent ev = e;
+        hv_fence_send(&ev);
+    });
+}
+
+static void flush_fence(const char *why) {
+    dispatch_sync(input_q(), ^{ hv_fence_flush(why); });
+}
 
 /* The freeze recorder (host/stallmon.h): henge-freezes.jsonl in Documents, beside henge-native.log. */
 static int stall_running(void) { return state == 1; }
@@ -110,7 +134,7 @@ int henge_vm_suspend(const char *path, unsigned timeout_ms, uint64_t ticket, cha
         snprintf(why, why_len, "The Mac isn't running.");
         return -2;
     }
-    hv_fence_flush("the Mac is suspended");
+    flush_fence("the Mac is suspended");
     return hv_vm_suspend_ticketed(path, timeout_ms, ticket, why, why_len);
 }
 
@@ -304,11 +328,11 @@ int henge_vm_state(void) { return state; }
 const char *henge_vm_exit_reason(void) { return hv_vm_reason_name(exit_reason); }
 int henge_vm_halted_by(void) { return state == 2 ? hv_vm_halted_by() : 0; }
 void henge_vm_stop(void) {
-    hv_fence_flush("the Mac stops");
+    flush_fence("the Mac stops");
     if (state == 1) hv_vm_stop();
 }
 int henge_vm_pause(unsigned timeout_ms) {
-    hv_fence_flush("the Mac pauses"); /* what the person let go of reaches it first, or a button stays down */
+    flush_fence("the Mac pauses"); /* what the person let go of reaches it first, or a button stays down */
     return state == 1 ? hv_vm_pause(timeout_ms) : -2;
 }
 void henge_vm_resume(void) { if (state == 1) hv_vm_resume(); }
@@ -468,12 +492,12 @@ unsigned henge_share_touch_hit(double x, double y) { return hv_share_touch_hit(x
 int henge_share_touch_answer(unsigned id) { return hv_share_touch_answer(id); }
 static void deliver_scroll(const HvFenceEvent *e) { hv_share_touch_scroll(e->a, e->x, e->y, e->dx, e->dy); }
 void henge_share_touch_scroll(int phase, double x, double y, double dx, double dy) {
-    hv_fence_send(&(HvFenceEvent){.deliver = deliver_scroll, .a = phase, .x = x, .y = y, .dx = dx, .dy = dy});
+    send_fence((HvFenceEvent){.deliver = deliver_scroll, .a = phase, .x = x, .y = y, .dx = dx, .dy = dy});
 }
 /* In order with the rest: a stop that overtook scroll lines held behind a click would stop nothing (share.c sends
    it after every line it got before it). */
 static void deliver_stop(const HvFenceEvent *e) { (void)e, hv_share_touch_stop(); }
-void henge_share_touch_stop(void) { hv_fence_send(&(HvFenceEvent){.deliver = deliver_stop}); }
+void henge_share_touch_stop(void) { send_fence((HvFenceEvent){.deliver = deliver_stop}); }
 int henge_share_touch_press(unsigned id, float *x, float *y, float *w, float *h) {
     float f[4];
     if (!hv_share_touch_press(id, f)) return 0;
@@ -503,7 +527,7 @@ int henge_share_tap_answer(unsigned id, float *x, float *y, float *width, float 
 static void deliver_look(const HvFenceEvent *e) { hv_share_look_send((unsigned)e->a); }
 unsigned henge_share_look(void) {
     unsigned id = hv_share_look();
-    if (id) hv_fence_send(&(HvFenceEvent){.deliver = deliver_look, .a = (int)id});
+    if (id) send_fence((HvFenceEvent){.deliver = deliver_look, .a = (int)id});
     return id;
 }
 int henge_share_look_answer(unsigned id, int *sure) { return hv_share_look_answer(id, sure); }
@@ -568,7 +592,7 @@ static void deliver_key(const HvFenceEvent *e) { if (live_for(e->b)) hv_vm_key((
 void henge_vm_key(uint16_t code, int down) {
     if (!(down ? input() : let_go())) return;
     if (down) keys_pressed++, pressed();
-    hv_fence_send(&(HvFenceEvent){.deliver = deliver_key, .a = code, .b = down});
+    send_fence((HvFenceEvent){.deliver = deliver_key, .a = code, .b = down});
 }
 static void deliver_key_hid(const HvFenceEvent *e) { if (live_for(e->b)) hv_vm_key_hid((uint8_t)e->a, e->b); }
 /* Henge's own typing (TypingQueue: dictation, the password, a paste's ⌘V) goes through the fence too, so it never
@@ -576,23 +600,23 @@ static void deliver_key_hid(const HvFenceEvent *e) { if (live_for(e->b)) hv_vm_k
 void henge_vm_key_typed(uint16_t code, int down) {
     if (!(down ? input() : let_go())) return;
     if (down) keys_pressed++;
-    hv_fence_send(&(HvFenceEvent){.deliver = deliver_key, .a = code, .b = down});
+    send_fence((HvFenceEvent){.deliver = deliver_key, .a = code, .b = down});
 }
 static void deliver_modifiers_up(const HvFenceEvent *e) {
     (void)e;
     if (state == 1) hv_vm_modifiers_up();
 }
 void henge_vm_modifiers_up(void) {
-    if (let_go()) hv_fence_send(&(HvFenceEvent){.deliver = deliver_modifiers_up});
+    if (let_go()) send_fence((HvFenceEvent){.deliver = deliver_modifiers_up});
 }
 void henge_vm_key_hid(uint8_t usage, int down) {
     if (!(down ? input() : let_go())) return;
     if (down) keys_pressed++, pressed();
-    hv_fence_send(&(HvFenceEvent){.deliver = deliver_key_hid, .a = usage, .b = down});
+    send_fence((HvFenceEvent){.deliver = deliver_key_hid, .a = usage, .b = down});
 }
 static void deliver_move(const HvFenceEvent *e) { if (live()) hv_vm_mouse_move(e->a, e->b); }
 void henge_vm_mouse_move(int dx, int dy) {
-    if (input()) hv_fence_send(&(HvFenceEvent){.deliver = deliver_move, .a = dx, .b = dy});
+    if (input()) send_fence((HvFenceEvent){.deliver = deliver_move, .a = dx, .b = dy});
 }
 static _Atomic unsigned clicks;
 unsigned henge_vm_clicks(void) { return clicks; }
@@ -600,7 +624,7 @@ static void deliver_button(const HvFenceEvent *e) { if (live_for(e->b)) hv_vm_mo
 void henge_vm_mouse_button(int button, int down) {
     if (!(down ? input() : let_go())) return;
     if (down) clicks++, pressed();
-    hv_fence_send(&(HvFenceEvent){.deliver = deliver_button, .press = down, .a = button, .b = down});
+    send_fence((HvFenceEvent){.deliver = deliver_button, .press = down, .a = button, .b = down});
 }
 static void deliver_wheel(const HvFenceEvent *e) {
     if (!live()) return;
@@ -608,7 +632,7 @@ static void deliver_wheel(const HvFenceEvent *e) {
     if (e->a) hv_vm_mouse_hwheel(e->a);
 }
 void henge_vm_mouse_scroll(int dx, int dy) {
-    if (input()) hv_fence_send(&(HvFenceEvent){.deliver = deliver_wheel, .a = dx, .b = dy});
+    if (input()) send_fence((HvFenceEvent){.deliver = deliver_wheel, .a = dx, .b = dy});
 }
 int henge_vm_pointer(int *x, int *y) { return state == 1 ? hv_vm_pointer(x, y) : -1; }
 int henge_vm_screen_size(int *w, int *h) { return state == 1 ? hv_vm_screen_size(w, h) : -1; }
@@ -616,21 +640,27 @@ int henge_vm_screen_points(int *w, int *h) { return state == 1 ? hv_vm_screen_po
 int henge_vm_touch_ready(void) { return state == 1 && hv_vm_touch_ready(); }
 static void deliver_touch(const HvFenceEvent *e) { if (live()) hv_vm_touch(e->x, e->y); }
 void henge_vm_touch(double x, double y) {
-    if (input()) hv_fence_send(&(HvFenceEvent){.deliver = deliver_touch, .x = x, .y = y});
+    if (input()) send_fence((HvFenceEvent){.deliver = deliver_touch, .x = x, .y = y});
 }
 static void deliver_touch_button(const HvFenceEvent *e) { if (live_for(e->b)) hv_vm_touch_button(e->x, e->y, e->a, e->b); }
 void henge_vm_touch_button(double x, double y, int button, int down) {
     if (!(down ? input() : let_go())) return;
     if (down) clicks++, pressed();
-    hv_fence_send(&(HvFenceEvent){.deliver = deliver_touch_button, .press = down, .a = button, .b = down, .x = x, .y = y});
+    send_fence((HvFenceEvent){.deliver = deliver_touch_button, .press = down, .a = button, .b = down, .x = x, .y = y});
 }
-void henge_vm_hide_pointer(int hide) { if (state == 1) hv_vm_hide_pointer(hide); }
+void henge_vm_hide_pointer(int hide) {
+    if (state != 1) return;
+    dispatch_async(input_q(), ^{ if (state == 1) hv_vm_hide_pointer(hide); });
+}
 void henge_vm_park_pointer(double x, double y) { if (state == 1) hv_vm_park_pointer(x, y); }
 void henge_vm_set_mic_hook(void (*hook)(int on)) { hv_audio_set_mic_hook(hook); }
 void henge_vm_touchscreen_config(int enabled, int w_mm, int h_mm) { hv_vm_touchscreen_config(enabled, w_mm, h_mm); }
 void henge_vm_touchscreen_always(int always) { hv_vm_touchscreen_always(always); }
 int henge_vm_touchscreen_usable(void) { return live() && hv_vm_touchscreen_usable(); }
-void henge_vm_touchscreen_watch(void) { if (state == 1) hv_vm_touchscreen_watch(); }
+void henge_vm_touchscreen_watch(void) {
+    if (state != 1) return;
+    dispatch_async(input_q(), ^{ if (state == 1) hv_vm_touchscreen_watch(); });
+}
 int henge_vm_touchscreen_status(void) { return state == 1 ? hv_vm_touchscreen_status() : 0; }
 static void deliver_frame(const HvFenceEvent *e) {
     if (state != 1) return;
@@ -657,7 +687,7 @@ int henge_vm_touchscreen_frame(int n, const int *ids, const int *down, const int
         if (down[i]) fingers_down |= bit;
         else fingers_down &= ~bit;
     }
-    hv_fence_send(&e);
+    send_fence(e);
     return 0;
 }
 int henge_vm_snapshot(uint8_t *bgra, int width, int height) { return state == 1 ? hv_vm_snapshot(bgra, width, height) : -1; }
@@ -712,7 +742,6 @@ uint64_t henge_largest_mapping_mb(void) {
 /* ---- Suspend lab (Phase 0): measurements for the Suspend plan, written to henge-native.log as "lab:" lines.
    They change nothing the Mac sees. ---- */
 
-#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
 #include <sys/mount.h>

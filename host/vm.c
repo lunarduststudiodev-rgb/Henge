@@ -48,6 +48,8 @@ static os_unfair_lock display_lock = OS_UNFAIR_LOCK_INIT;
 static CFTypeRef display_layer;
 static int display_layer_set;
 static _Atomic(HvPvgLite *) display_pvg; /* published only when the board is ready */
+static _Atomic int pointer_hidden;
+static _Atomic(HvPvgLite *) pointer_hidden_pvg;
 static HvDisk disk, aux;
 static int net_on;
 /* The host's own network (hv_vm_host_network), kept for a machine built later: bit 63 up, the rest when it changed
@@ -497,6 +499,10 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     // never overwrite a monitor change made while the board was being built.
     os_unfair_lock_lock(&display_lock);
     if (display_layer_set && board.pvg) hv_pvg_lite_set_layer(board.pvg, (void *)display_layer);
+    if (board.pvg && atomic_load_explicit(&pointer_hidden, memory_order_acquire)) {
+        atomic_store_explicit(&pointer_hidden_pvg, board.pvg, memory_order_release);
+        hv_pvg_lite_hide_pointer(board.pvg, 1);
+    }
     atomic_store_explicit(&display_pvg, board.pvg, memory_order_release);
     os_unfair_lock_unlock(&display_lock);
     return 0;
@@ -1291,13 +1297,17 @@ int hv_vm_speaker_volume(double *level, int *mute) {
     return 0;
 }
 
-static _Atomic int pointer_hidden;
 static _Atomic int park_wanted; /* below: where the pointer starts */
 
 void hv_vm_hide_pointer(int hide) {
+    int want = hide != 0;
     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
-    atomic_store(&pointer_hidden, hide != 0);
-    hv_pvg_lite_hide_pointer(pvg, hide);
+    int was = atomic_exchange_explicit(&pointer_hidden, want, memory_order_acq_rel);
+    HvPvgLite *applied = atomic_load_explicit(&pointer_hidden_pvg, memory_order_acquire);
+    if (pvg && (was != want || applied != pvg)) {
+        atomic_store_explicit(&pointer_hidden_pvg, pvg, memory_order_release);
+        hv_pvg_lite_hide_pointer(pvg, want);
+    }
 }
 
 /* A mouse or trackpad that moves brings the pointer back. */
@@ -1594,8 +1604,8 @@ static void touchscreen_tick(void) {
 
 int hv_vm_touchscreen_state(void) { return board.usb ? hv_xhci_touch_state(board.usb) : HV_XHCI_TOUCH_ABSENT; }
 
-int hv_vm_touchscreen_usable(void) {
-    if (hv_vm_touchscreen_state() != HV_XHCI_TOUCH_READY) return 0;
+static int touchscreen_usable_for(int st) {
+    if (st != HV_XHCI_TOUCH_READY) return 0;
     /* Locked, asleep or the screen saver, in Native (Always) too: macOS does nothing with touches then, and only the
        pointer wakes the display and reaches the password field. With touches, the Mac stayed locked and Henge looked
        frozen (8 Nov 2026). */
@@ -1605,6 +1615,10 @@ int hv_vm_touchscreen_usable(void) {
     return hv_share_touchscreen() == 1 && ts_verdict() != 0;
 }
 
+int hv_vm_touchscreen_usable(void) {
+    return touchscreen_usable_for(hv_vm_touchscreen_state());
+}
+
 /* Asked in Native (Always) too, though its answer changes nothing there: the helper says what macOS made of the touch. */
 void hv_vm_touchscreen_watch(void) { hv_share_touchscreen_watch(); }
 
@@ -1612,8 +1626,9 @@ int hv_vm_touchscreen_status(void) {
     if (!__atomic_load_n(&ts_enabled, __ATOMIC_RELAXED)) return HV_VM_TS_OFF;
     int verdict = ts_verdict();
     if (verdict == 0) return HV_VM_TS_IGNORED;
-    if (hv_vm_touchscreen_usable()) return verdict == 1 ? HV_VM_TS_WORKS : HV_VM_TS_TRYING;
-    if (hv_share_touchscreen_ready() == 1 && hv_vm_touchscreen_state() != HV_XHCI_TOUCH_UNAVAILABLE) return HV_VM_TS_WAITING;
+    int st = hv_vm_touchscreen_state();
+    if (touchscreen_usable_for(st)) return verdict == 1 ? HV_VM_TS_WORKS : HV_VM_TS_TRYING;
+    if (hv_share_touchscreen_ready() == 1 && st != HV_XHCI_TOUCH_UNAVAILABLE) return HV_VM_TS_WAITING;
     return HV_VM_TS_NONE;
 }
 
