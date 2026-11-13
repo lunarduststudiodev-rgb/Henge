@@ -157,6 +157,11 @@ static inline const char *hv_pvg_view_problem(const HvTexDesc *parent, uint32_t 
     return 0;
 }
 
+/* Linear pixel formats with sRGB encoding: Metal forbids MTLTextureUsageShaderWrite on sRGB formats. */
+static inline int hv_pvg_srgb_format(uint32_t f) {
+    return f == 11 || f == 31 || f == 71 || f == 81 || f == 553 || f == 555;
+}
+
 /* A texture over a buffer of buffer_len bytes, its first row at offset, row bytes apart. align is
    the device's minimumLinearTextureAlignmentForPixelFormat. */
 static inline const char *hv_pvg_linear_problem(const HvTexDesc *d, HvTexCaps caps, uint64_t buffer_len, uint64_t offset, uint64_t row,
@@ -164,7 +169,8 @@ static inline const char *hv_pvg_linear_problem(const HvTexDesc *d, HvTexCaps ca
     const char *why = hv_pvg_texture_problem(d, caps);
     if (why) return why;
     uint32_t bpp = hv_pvg_linear_bpp(d->format);
-    if (!bpp || (d->type != HV_TEX_2D && d->type != HV_TEX_BUFFER) || d->mips != 1) return "linear layout";
+    if (!bpp || (d->type != HV_TEX_2D && d->type != HV_TEX_BUFFER) || d->mips != 1 || d->samples != 1 || d->array != 1 || d->depth != 1)
+        return "linear layout";
     uint64_t last_row = (uint64_t)d->width * bpp;
     if (row < last_row || (align && (row % align || offset % align))) return "bytes per row";
     if (offset > buffer_len) return "past the end of the buffer";
