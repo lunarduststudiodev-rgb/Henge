@@ -2268,6 +2268,33 @@ static void upload_surface_standin(HvObject *o) {
     }
 }
 
+/* Upload guest surface bytes into a surface stand-in on the command buffer's blit encoder to avoid CPU/GPU races. */
+static void upload_surface_standin_blit(HvObject *o, id<MTLCommandBuffer> cb, id<MTLBlitCommandEncoder> *blit) {
+    HvObject *surface = o ? o->surface : nil;
+    id<MTLTexture> tex = o ? o->object : nil;
+    id<MTLBuffer> buf = surface ? surface->object : nil;
+    if (!surface || surface->gone || !tex || tex.textureType != MTLTextureType2D) return;
+    NSUInteger bpp = pixel_bytes(tex.pixelFormat);
+    NSUInteger src_row = (NSUInteger)surface->row;
+    uint64_t needed = tex.height ? (tex.height - 1) * surface->row + (uint64_t)tex.width * bpp : 0;
+    if (!bpp || src_row < tex.width * bpp) return;
+    if (buf && !tex.isFramebufferOnly && src_row % bpp == 0 && surface->first % bpp == 0 &&
+        surface->first <= buf.length && needed <= buf.length - surface->first) {
+        if (!*blit) *blit = [cb blitCommandEncoder];
+        [*blit copyFromBuffer:buf
+                 sourceOffset:surface->first
+            sourceBytesPerRow:src_row
+          sourceBytesPerImage:0
+                   sourceSize:MTLSizeMake(tex.width, tex.height, 1)
+                    toTexture:tex
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+    } else {
+        upload_surface_standin(o);
+    }
+}
+
 /* Copy GPU-written surface stand-in pixels back into the surface's guest-backed buffer. */
 static void download_surface_standin(HvObject *o, id<MTLCommandBuffer> cb, id<MTLBlitCommandEncoder> *blit) {
     HvObject *surface = o ? o->surface : nil;
@@ -2364,6 +2391,7 @@ static void download_surface_standin(HvObject *o, id<MTLCommandBuffer> cb, id<MT
     }
     if (!o->object && surface->object) {
         id<MTLBuffer> buf = surface->object;
+        MTLTextureUsage saved_usage = t.usage;
         t.allowGPUOptimizedContents = NO;
         /* Only alias the guest buffer directly when surface->row already satisfies hardware alignment and bounds,
            otherwise rows would be read/written with the wrong stride. */
@@ -2383,6 +2411,7 @@ static void download_surface_standin(HvObject *o, id<MTLCommandBuffer> cb, id<MT
                 o->object = [buf newTextureWithDescriptor:t offset:surface->first bytesPerRow:(NSUInteger)surface->row];
             }
         }
+        if (!o->object) t.usage = saved_usage;
     }
     if (!o->object) {
         [self complain:[NSString stringWithFormat:@"surface %llu: format %lu row %llu not possible", h.mapping, (unsigned long)t.pixelFormat, surface->row]];
@@ -2605,6 +2634,12 @@ static BOOL has_guest_pages(HvObject *o) { return o->pages && o->pages_in_ram; }
             if (!cb) cb = [queue commandBuffer];
             back_once(writeback, o->surface);
         }
+        HvObject *standin = surface_standin_root(o);
+        if (standin && standin->host_valid) {
+            if (!cb) cb = [queue commandBuffer];
+            download_surface_standin(standin, cb, &blit);
+            if (!(standin->surface && standin->surface->copied_pages)) standin->guest_stale = NO;
+        }
         if (!o || !o->guest_backed || !o->host_valid) continue;
         if (!cb) cb = [queue commandBuffer];
         [self page:o toGuest:YES task:task blit:&blit commandBuffer:cb];
@@ -2629,6 +2664,24 @@ static BOOL has_guest_pages(HvObject *o) { return o->pages && o->pages_in_ram; }
         if (e[7]) o->guest_stale = NO;
         if (e[4]) o->host_valid = NO;
         if (e[5]) o->host_valid = YES;
+        HvObject *standin = surface_standin_root(o);
+        if (standin && standin != o) {
+            if (e[6]) standin->guest_stale = YES;
+            if (e[7]) standin->guest_stale = NO;
+            if (e[4]) standin->host_valid = NO;
+            if (e[5]) standin->host_valid = YES;
+        }
+        if (o->surface) {
+            if (e[6]) o->surface->guest_stale = YES;
+            if (e[7]) o->surface->guest_stale = NO;
+            for (HvObject *ov in o->surface->over.allObjects) {
+                if (!ov->surface_standin) continue;
+                if (e[6]) ov->guest_stale = YES;
+                if (e[7]) ov->guest_stale = NO;
+                if (e[4]) ov->host_valid = NO;
+                if (e[5]) ov->host_valid = YES;
+            }
+        }
     }
 }
 
@@ -4476,10 +4529,22 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
         }
         if (flags & 1) {
             o->guest_stale = NO, o->host_valid = NO; /* the guest wrote it */
-            if (o->surface) o->surface->guest_stale = NO;
+            if (o->surface) {
+                o->surface->guest_stale = NO;
+                for (HvObject *ov in o->surface->over.allObjects)
+                    if (ov->surface_standin) ov->guest_stale = NO, ov->host_valid = NO;
+            }
             for (HvObject *p = o->parent; p; p = p->parent)
                 if (p->surface_standin) p->guest_stale = NO, p->host_valid = NO;
         }
+        if (flags & 4) sync_after = YES;
+        if ((flags & 2) && !redraw && current_shown) redraw = [self isObject:o matchShown:current_shown];
+    }
+    /* Sync copied surface pages and upload stand-in / guest-backed textures after all flags & 1 invalidations
+       have run, so an earlier entry over the same surface doesn't miss a later entry's flags & 1. */
+    for (uint32_t i = 0; i < nres; i++) {
+        HvObject *o = found[i];
+        if (!o) continue;
         if (!o->guest_stale && o->surface && o->surface->copied_pages && !o->surface->guest_stale &&
             o->surface->copied_sync_tick != sync_tick) {
             o->surface->copied_sync_tick = sync_tick;
@@ -4487,15 +4552,13 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
         }
         HvObject *standin = surface_standin_root(o);
         if (standin && !standin->host_valid && !standin->guest_stale && standin->surface && !standin->surface->gone && standin->surface->mapped) {
-            upload_surface_standin(standin);
+            upload_surface_standin_blit(standin, cb, &blit);
             standin->host_valid = YES;
         }
         if (o->guest_backed && !o->host_valid) {
             if (!o->guest_stale) [self page:o toGuest:NO task:task blit:&blit commandBuffer:cb];
             o->host_valid = YES;
         }
-        if (flags & 4) sync_after = YES;
-        if ((flags & 2) && !redraw && current_shown) redraw = [self isObject:o matchShown:current_shown];
     }
     /* Each video surface once, whatever mappings of it the exec names with what: the guest's writing up, and only then
        is the GPU's drawing the newer (a mapping written by the guest after one drawn into would otherwise have the
@@ -4654,9 +4717,13 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
         HvObject *o = found[i];
         if (!o) continue;
         HvObject *standin = surface_standin_root(o);
-        if (standin && (rflags & (2 | 4))) {
+        if (standin && standin->host_valid && ((rflags & 2) || ((rflags & 4) && standin->guest_stale))) {
             download_surface_standin(standin, cb, &back);
-            if (rflags & 4) standin->guest_stale = NO;
+            if ((rflags & 4) && !(standin->surface && standin->surface->copied_pages)) standin->guest_stale = NO;
+        }
+        if ((rflags & 2) && o->surface) {
+            for (HvObject *ov in o->surface->over.allObjects)
+                if (ov->surface_standin && ov != standin) ov->host_valid = NO;
         }
         if (sync_after && (rflags & 4)) { /* the guest wants these back as soon as this is done */
             HvObject *s = o->surface;

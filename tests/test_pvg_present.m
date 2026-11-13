@@ -3102,7 +3102,7 @@ static void test_dock_badge_metal_fixes(void) {
 @end
 
 @interface StandinBlit : NSObject
-@property(nonatomic) NSUInteger copyCalls, dstOff, dstRow;
+@property(nonatomic) NSUInteger copyCalls, dstOff, dstRow, uploadCalls, srcOff, srcRow;
 @end
 @implementation StandinBlit
 - (void)copyFromTexture:(id)t sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)sz
@@ -3112,15 +3112,33 @@ static void test_dock_badge_metal_fixes(void) {
     _dstOff = off;
     _dstRow = row;
 }
+- (void)copyFromBuffer:(id)b sourceOffset:(NSUInteger)off sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)img
+            sourceSize:(MTLSize)sz toTexture:(id)t destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl
+     destinationOrigin:(MTLOrigin)orig {
+    _uploadCalls++;
+    _srcOff = off;
+    _srcRow = row;
+}
+- (void)endEncoding {}
 @end
 
-@interface StandinCB : NSObject
+@interface StandinCB : TestCB
 @property(nonatomic, strong) StandinBlit *blit;
 @end
 @implementation StandinCB
 - (id)blitCommandEncoder {
     if (!_blit) _blit = [StandinBlit new];
     return _blit;
+}
+@end
+
+@interface StandinQueue : NSObject
+@property(nonatomic, strong) StandinCB *lastCB;
+@end
+@implementation StandinQueue
+- (id)commandBuffer {
+    _lastCB = [StandinCB new];
+    return _lastCB;
 }
 @end
 
@@ -3135,6 +3153,7 @@ static void test_surface_standin_view_and_writeback(void) {
     surface->row = 80; /* 20x20 BGRA8: 16-byte aligned, not 64-byte aligned */
     surface->first = 16;
     surface->object = buf;
+    surface->over = [NSHashTable weakObjectsHashTable];
 
     StandinTex *tex = [StandinTex new];
     tex.textureType = MTLTextureType2D;
@@ -3143,11 +3162,23 @@ static void test_surface_standin_view_and_writeback(void) {
     tex.height = 20;
 
     HvObject *standin = [HvObject new];
+    standin->kind = KIND_TEXTURE;
     standin->surface = surface;
     standin->surface_standin = YES;
+    standin->host_valid = YES;
     standin->object = tex;
+    [surface->over addObject:standin];
+
+    HvObject *sibling = [HvObject new];
+    sibling->kind = KIND_TEXTURE;
+    sibling->surface = surface;
+    sibling->surface_standin = YES;
+    sibling->host_valid = YES;
+    sibling->object = tex;
+    [surface->over addObject:sibling];
 
     HvObject *view = [HvObject new];
+    view->kind = KIND_TEXTURE;
     view->parent = standin;
     view->surface = surface;
     view->object = tex;
@@ -3165,6 +3196,72 @@ static void test_surface_standin_view_and_writeback(void) {
     CHECK(cb.blit && cb.blit.copyCalls == 1 && cb.blit.dstOff == 16 && cb.blit.dstRow == 80,
           "download_surface_standin blits stand-in back at surface->first (%lu) with surface->row (%lu)",
           (unsigned long)cb.blit.dstOff, (unsigned long)cb.blit.dstRow);
+
+    /* Exec-level: view-over-stand-in flags & 1 uploads via blit, flags & 2 writes back and invalidates sibling,
+       read-only flags == 4 does not write back, and synchronize:/invalidate: propagate through views & over. */
+    id<MTLCommandQueue> saved_queue = r->queue;
+    StandinQueue *sq = [StandinQueue new];
+    r->queue = (id<MTLCommandQueue>)sq;
+    uint32_t saved_e20[3], saved_e21[3];
+    memcpy(saved_e20, table[20], 12);
+    memcpy(saved_e21, table[21], 12);
+    table[20][0] = 1, table[20][1] = 0x1111, table[20][2] = 0;
+    table[21][0] = 1, table[21][1] = 0x2222, table[21][2] = 0;
+    memcpy(standin->entry, table[20], 12);
+    memcpy(view->entry, table[21], 12);
+    if (!r->tasks[1]) r->tasks[1] = [HvTaskObjects new];
+    objs_set(r->tasks[1], 20, standin);
+    objs_set(r->tasks[1], 21, view);
+
+    /* flags = 1 on view: refreshes stand-in via blit copyFromBuffer:toTexture: and clears sibling host_valid */
+    uint32_t exec_up[14] = {1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 21, 1};
+    [r exec:exec_up length:sizeof exec_up channel:1 stamp:900];
+    CHECK(sq.lastCB && sq.lastCB.blit && sq.lastCB.blit.uploadCalls == 1 &&
+          sq.lastCB.blit.srcOff == 16 && sq.lastCB.blit.srcRow == 80 && sq.lastCB.blit.copyCalls == 0,
+          "exec flags=1 on view uploads stand-in via blit (uploads=%lu copies=%lu)",
+          (unsigned long)sq.lastCB.blit.uploadCalls, (unsigned long)sq.lastCB.blit.copyCalls);
+    [sq.lastCB finish:YES];
+    settle();
+
+    /* flags = 2 on view: writes stand-in back via blit and invalidates sibling->host_valid */
+    sibling->host_valid = YES;
+    uint32_t exec_wr[14] = {1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 21, 2};
+    [r exec:exec_wr length:sizeof exec_wr channel:1 stamp:901];
+    CHECK(sq.lastCB && sq.lastCB.blit && sq.lastCB.blit.copyCalls == 1 &&
+          sq.lastCB.blit.dstOff == 16 && sq.lastCB.blit.dstRow == 80 && !sibling->host_valid,
+          "exec flags=2 on view writes stand-in back and invalidates sibling");
+    [sq.lastCB finish:YES];
+    settle();
+
+    /* read-only flags = 4 without guest_stale: does not blit stand-in back */
+    standin->guest_stale = NO;
+    uint32_t exec_ro[14] = {1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 21, 4};
+    [r exec:exec_ro length:sizeof exec_ro channel:1 stamp:902];
+    CHECK(sq.lastCB && (!sq.lastCB.blit || sq.lastCB.blit.copyCalls == 0),
+          "exec read-only flags=4 without guest_stale skips stand-in writeback");
+    [sq.lastCB finish:YES];
+    settle();
+
+    /* synchronize: on view writes stand-in back; invalidate: propagates host_valid=NO across view and sibling */
+    standin->guest_stale = YES;
+    uint32_t sync_cmd[3] = {1, 1, 21};
+    [r synchronize:sync_cmd length:sizeof sync_cmd];
+    CHECK(sq.lastCB && sq.lastCB.blit && sq.lastCB.blit.copyCalls == 1 && !standin->guest_stale,
+          "synchronize: on view blits stand-in back and clears guest_stale");
+    [sq.lastCB finish:YES];
+    settle();
+
+    sibling->host_valid = YES;
+    uint32_t inv_cmd[4] = {1, 1, 21, 0x00000001u}; /* host_invalid=1 at byte 4 */
+    [r invalidate:inv_cmd length:sizeof inv_cmd];
+    CHECK(!standin->host_valid && !sibling->host_valid,
+          "invalidate: propagates host_valid=NO to stand-in root and sibling");
+
+    objs_set(r->tasks[1], 20, nil);
+    objs_set(r->tasks[1], 21, nil);
+    memcpy(table[20], saved_e20, 12);
+    memcpy(table[21], saved_e21, 12);
+    r->queue = saved_queue;
 }
 
 @interface StaleTex : NSObject
