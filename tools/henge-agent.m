@@ -2735,19 +2735,12 @@ static void applyLightweightUIFlags(void) {
         CFPreferencesAppSynchronize(ua);
 
         // Broadcast notifications so running processes immediately pick up changes
-        // Control Center: show Battery in Menu Bar
-        CFStringRef cc = CFSTR("com.apple.controlcenter");
-        CFPreferencesSetAppValue(CFSTR("NSStatusItem Visible Battery"), kCFBooleanTrue, cc);
-        CFPreferencesSetAppValue(CFSTR("Battery"), (__bridge CFPropertyListRef)@18, cc);
-        CFPreferencesAppSynchronize(cc);
-
         CFNotificationCenterRef dist = CFNotificationCenterGetDistributedCenter();
         if (dist) {
             CFNotificationCenterPostNotification(dist, CFSTR("com.apple.dock.prefschanged"), NULL, NULL, YES);
             CFNotificationCenterPostNotification(dist, CFSTR("com.apple.keyboard.prefschanged"), NULL, NULL, YES);
             CFNotificationCenterPostNotification(dist, CFSTR("com.apple.universalaccess.reduceMotionChanged"), NULL, NULL, YES);
             CFNotificationCenterPostNotification(dist, CFSTR("com.apple.universalaccess.reduceTransparencyChanged"), NULL, NULL, YES);
-            CFNotificationCenterPostNotification(dist, CFSTR("com.apple.controlcenter.prefschanged"), NULL, NULL, YES);
             CFNotificationCenterPostNotification(dist, CFSTR("AppleNoRedisplayAppearancePreferenceChanged"), NULL, NULL, YES);
         }
         note(@"applied lightweight macOS UI preferences (reduced motion/transparency, zero-delay animations, App Nap restored)");
@@ -2823,176 +2816,10 @@ static void applyHostModelName(void) {
     }
 }
 
-// MARK: - Native battery reporting (helper 39)
-// On macOS 14 Sonoma and macOS 15 Sequoia, AppleVirtualPlatform.kext carries
-// AppleVirtualPlatformPowerSource which attaches to virtual PCI 0x106b:0x1a07.
-// On macOS 13 Ventura and earlier, that kernel driver does not exist.
-// We make battery percentage and charging state show natively in macOS Ventura by:
-// 1. Publishing an IOPMPowerSource via IOPSCreatePowerSource & IOPSSetPowerSourceDetails
-//    into powerd/IOKit so the entire system recognises the internal battery.
-// 2. Displaying a native NSStatusItem in the menu bar with dynamic SF Symbols, percentage,
-//    and dropdown status menu.
-// 3. Enabling Control Center battery menu bar preferences.
-
-typedef struct OpaqueIOPSPowerSourceID *IOPSPowerSourceID;
-static IOPSPowerSourceID hengePowerSourceID = NULL;
-static IOReturn (*fn_IOPSCreatePowerSource)(IOPSPowerSourceID *outPS) = NULL;
-static IOReturn (*fn_IOPSSetPowerSourceDetails)(IOPSPowerSourceID whichPS, CFDictionaryRef details) = NULL;
-
-static void ensurePowerSourceSymbols(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
-        if (h) {
-            fn_IOPSCreatePowerSource = (IOReturn (*)(IOPSPowerSourceID *))dlsym(h, "IOPSCreatePowerSource");
-            fn_IOPSSetPowerSourceDetails = (IOReturn (*)(IOPSPowerSourceID, CFDictionaryRef))dlsym(h, "IOPSSetPowerSourceDetails");
-        }
-    });
-}
-
-static void updatePowerSource(double pct, int ext, int chg, int fl) {
-    ensurePowerSourceSymbols();
-    if (fn_IOPSCreatePowerSource && !hengePowerSourceID) {
-        IOReturn kr = fn_IOPSCreatePowerSource(&hengePowerSourceID);
-        if (kr != kIOReturnSuccess) hengePowerSourceID = NULL;
-    }
-    if (hengePowerSourceID && fn_IOPSSetPowerSourceDetails) {
-        int cap = (int)round(pct);
-        if (cap < 0) cap = 0;
-        if (cap > 100) cap = 100;
-        NSDictionary *details = @{
-            @"Name": @"InternalBattery-0",
-            @"Type": @"InternalBattery",
-            @"Current Capacity": @(cap),
-            @"Max Capacity": @100,
-            @"DesignCapacity": @100,
-            @"Is Charging": @(chg != 0),
-            @"Is Charged": @(fl != 0),
-            @"Power Source State": ext ? @"AC Power" : @"Battery Power",
-            @"Is Present": @YES,
-            @"BatteryHealth": @"Good",
-            @"ExternalConnected": @(ext != 0),
-        };
-        fn_IOPSSetPowerSourceDetails(hengePowerSourceID, (__bridge CFDictionaryRef)details);
-    }
-}
-
-@interface HengeBatteryAction : NSObject
-+ (HengeBatteryAction *)shared;
-- (void)openBatterySettings:(id)sender;
-@end
-
-@implementation HengeBatteryAction
-+ (HengeBatteryAction *)shared {
-    static HengeBatteryAction *act;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ act = [[HengeBatteryAction alloc] init]; });
-    return act;
-}
-- (void)openBatterySettings:(id)sender {
-    (void)sender;
-    NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.Battery-Settings.extension"];
-    if (![NSWorkspace.sharedWorkspace openURL:url]) {
-        [NSWorkspace.sharedWorkspace openFile:@"/System/Applications/System Settings.app"];
-    }
-}
-@end
-
-static NSStatusItem *batteryStatusItem = nil;
-
-static BOOL hasKernelBatteryDriver(void) {
-    if (NSProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 14) {
-        io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleVirtualPlatformPowerSource"));
-        if (s) {
-            IOObjectRelease(s);
-            return YES;
-        }
-    }
-    return NO;
-}
-
-static void updateStatusItem(double pct, int ext, int chg, int fl) {
-    if (hasKernelBatteryDriver()) {
-        if (batteryStatusItem) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (batteryStatusItem) {
-                    [NSStatusBar.systemStatusBar removeStatusItem:batteryStatusItem];
-                    batteryStatusItem = nil;
-                }
-            });
-        }
-        return;
-    }
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        int cap = (int)round(pct);
-        if (cap < 0) cap = 0;
-        if (cap > 100) cap = 100;
-
-        if (!batteryStatusItem) {
-            batteryStatusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
-            batteryStatusItem.visible = YES;
-        }
-
-        NSStatusBarButton *button = batteryStatusItem.button;
-        if (button) {
-            NSString *sym;
-            if (chg) {
-                if (cap >= 90) sym = @"battery.100.bolt";
-                else if (cap >= 65) sym = @"battery.75.bolt";
-                else if (cap >= 35) sym = @"battery.50.bolt";
-                else if (cap >= 15) sym = @"battery.25.bolt";
-                else sym = @"battery.0.bolt";
-            } else {
-                if (cap >= 90) sym = @"battery.100";
-                else if (cap >= 65) sym = @"battery.75";
-                else if (cap >= 35) sym = @"battery.50";
-                else if (cap >= 15) sym = @"battery.25";
-                else sym = @"battery.0";
-            }
-
-            NSImage *img = [NSImage imageWithSystemSymbolName:sym accessibilityDescription:@"Battery"];
-            if (img) {
-                img.template = YES;
-                button.image = img;
-                button.imagePosition = NSImageLeft;
-            }
-            button.title = [NSString stringWithFormat:@"%d%%", cap];
-            button.toolTip = [NSString stringWithFormat:@"Battery: %d%%%s",
-                              cap,
-                              ext ? (fl ? ", Full on AC Power" : chg ? ", Charging" : ", On AC Power") : ", On Battery"];
-        }
-
-        NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Battery"];
-
-        NSMenuItem *headerItem = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"Battery: %d%%", cap] action:nil keyEquivalent:@""];
-        headerItem.enabled = NO;
-        [menu addItem:headerItem];
-
-        NSString *srcStr = ext ? @"Power Source: Power Adapter" : @"Power Source: Battery";
-        NSMenuItem *srcItem = [[NSMenuItem alloc] initWithTitle:srcStr action:nil keyEquivalent:@""];
-        srcItem.enabled = NO;
-        [menu addItem:srcItem];
-
-        NSString *stateStr = fl ? @"Fully Charged" : chg ? [NSString stringWithFormat:@"Charging (%d%%)", cap] : (ext ? @"Not Charging" : @"On Battery");
-        NSMenuItem *stateItem = [[NSMenuItem alloc] initWithTitle:stateStr action:nil keyEquivalent:@""];
-        stateItem.enabled = NO;
-        [menu addItem:stateItem];
-
-        [menu addItem:[NSMenuItem separatorItem]];
-
-        NSMenuItem *prefItem = [[NSMenuItem alloc] initWithTitle:@"Battery Settings..." action:@selector(openBatterySettings:) keyEquivalent:@""];
-        prefItem.target = [HengeBatteryAction shared];
-        [menu addItem:prefItem];
-
-        batteryStatusItem.menu = menu;
-    });
-}
-
-static void updateBattery(double pct, int ext, int chg, int fl) {
-    updatePowerSource(pct, ext, chg, fl);
-    updateStatusItem(pct, ext, chg, fl);
-}
+// MARK: - Battery reporting (retired in helper 44)
+// The guest already has a real Apple virtual power source (devices/power_source.c,
+// AppleVirtualPlatformPowerSource), so macOS's native Control Center battery item works on its own.
+// Keep "battery" lines harmless no-ops so older hosts do not break.
 
 #ifndef NX_KEYTYPE_SOUND_UP
 #define NX_KEYTYPE_SOUND_UP 0
@@ -3285,9 +3112,7 @@ static void processPendingVolume(void) {
                     }
                 }
 
-                dispatch_sync(dispatch_get_main_queue(), ^{
-                    postMediaKey(dir > 0 ? NX_KEYTYPE_SOUND_UP : NX_KEYTYPE_SOUND_DOWN);
-                });
+                postMediaKey(dir > 0 ? NX_KEYTYPE_SOUND_UP : NX_KEYTYPE_SOUND_DOWN);
                 lastAppliedVolume = target;
 
                 usleep(60000);
@@ -3366,9 +3191,7 @@ static void handleLine(const char *line) {
                 pthread_mutex_lock(&volumeLock);
                 agentChangingVolume = YES;
                 pthread_mutex_unlock(&volumeLock);
-                dispatch_sync(dispatch_get_main_queue(), ^{
-                    postMediaKey(vol > 0 ? NX_KEYTYPE_SOUND_UP : vol < 0 ? NX_KEYTYPE_SOUND_DOWN : NX_KEYTYPE_MUTE);
-                });
+                postMediaKey(vol > 0 ? NX_KEYTYPE_SOUND_UP : vol < 0 ? NX_KEYTYPE_SOUND_DOWN : NX_KEYTYPE_MUTE);
                 pthread_mutex_lock(&volumeLock);
                 agentChangingVolume = NO;
                 agentVolumeIgnoreUntilNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 200 * NSEC_PER_MSEC;
@@ -3378,7 +3201,7 @@ static void handleLine(const char *line) {
     }
     else if (enqueueVolumeLevel(line)) {}
     else if (sscanf(line, "battery %lf %d %d %d", &bpct, &bext, &bchg, &bfl) == 4) {
-        updateBattery(bpct, bext, bchg, bfl);
+        // Native AppleVirtualPlatformPowerSource handles battery; keep line harmless for older hosts.
     }
     else if (sscanf(line, "menuclose %u", &id) == 1) answerMenuClose(id);
     else if (sscanf(line, "menu %u", &id) == 1) answerMenu(id);
@@ -4363,13 +4186,7 @@ static void applySystemLightweightFlags(void) {
         CFPreferencesSetValue(CFSTR("NSDisableAutomaticTermination"), NULL, kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
         CFPreferencesSynchronize(kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
 
-        // Control Center: show Battery in Menu Bar
-        CFStringRef cc = CFSTR("com.apple.controlcenter");
-        CFPreferencesSetValue(CFSTR("NSStatusItem Visible Battery"), kCFBooleanTrue, cc, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
-        CFPreferencesSetValue(CFSTR("Battery"), (__bridge CFPropertyListRef)@18, cc, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
-        CFPreferencesSynchronize(cc, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
-
-        note(@"system: applied system-wide accessibility lightweight flags and battery menu bar visibility");
+        note(@"system: applied system-wide accessibility lightweight flags");
     }
 }
 
@@ -4428,7 +4245,7 @@ static void keepSystemLinked(void) {
                     double bpct;
                     int bext, bchg, bfl;
                     if (sscanf(line, "battery %lf %d %d %d", &bpct, &bext, &bchg, &bfl) == 4) {
-                        updatePowerSource(bpct, bext, bchg, bfl);
+                        // Native AppleVirtualPlatformPowerSource handles battery; keep line harmless for older hosts.
                     }
                 }
             }
@@ -4660,6 +4477,9 @@ int main(int argc, char **argv) {
         watchTouchscreen();
         watchScreen();
         keepAwake();
+        static id<NSObject> agentActivity;
+        agentActivity = [NSProcessInfo.processInfo beginActivityWithOptions:(NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical)
+                                                                     reason:@"Henge agent link and volume responsiveness"];
         if (!test) {
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                 applyHostModelName();
