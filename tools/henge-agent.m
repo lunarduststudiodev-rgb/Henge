@@ -2777,6 +2777,23 @@ static void updateBattery(double pct, int ext, int chg, int fl) {
 #define NX_KEYTYPE_MUTE 7
 #endif
 
+static dispatch_queue_t volumeQueue;
+static dispatch_queue_t volumeListenQueue;
+static pthread_mutex_t volumeLock = PTHREAD_MUTEX_INITIALIZER;
+static double pendingVolumeTarget = -1.0;
+static int pendingVolumeHud = 0;
+static uint64_t pendingVolumeSeq = 0;
+static BOOL volumeWorkerRunning = NO;
+
+static double lastAppliedVolume = -1.0; // volumeQueue only
+static AudioDeviceID watchedOutputDevice = kAudioObjectUnknown;
+static AudioObjectPropertyListenerBlock volumeScalarBlock;
+static Float32 trackedCurVolume = -1.0f;
+static Float32 trackedPrevVolume = -1.0f;
+static uint64_t trackedChangeTimeNs = 0;
+static BOOL agentChangingVolume = NO;
+static uint64_t agentVolumeIgnoreUntilNs = 0;
+
 static void postMediaKey(int key) {
     for (int down = 1; down >= 0; down--) {
         NSEvent *ev = [NSEvent otherEventWithType:NSEventTypeSystemDefined
@@ -2793,11 +2810,7 @@ static void postMediaKey(int key) {
     }
 }
 
-static void setMasterVolume(double level) {
-    Float32 vol = (Float32)level;
-    if (vol < 0.0f) vol = 0.0f;
-    if (vol > 1.0f) vol = 1.0f;
-
+static AudioDeviceID defaultOutputDevice(void) {
     AudioDeviceID deviceID = kAudioObjectUnknown;
     UInt32 propSize = sizeof(deviceID);
     AudioObjectPropertyAddress devAddr = {
@@ -2805,9 +2818,69 @@ static void setMasterVolume(double level) {
         .mScope = kAudioObjectPropertyScopeGlobal,
         .mElement = kAudioObjectPropertyElementMaster
     };
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &devAddr, 0, NULL, &propSize, &deviceID) != noErr)
+        return kAudioObjectUnknown;
+    return deviceID;
+}
 
-    OSStatus err = AudioObjectGetPropertyData(kAudioObjectSystemObject, &devAddr, 0, NULL, &propSize, &deviceID);
-    if (err != noErr || deviceID == kAudioObjectUnknown) return;
+static BOOL getMasterVolume(Float32 *outVol) {
+    AudioDeviceID deviceID = defaultOutputDevice();
+    if (deviceID == kAudioObjectUnknown) return NO;
+
+    Float32 vol = 0.0f;
+    UInt32 volSize = sizeof(vol);
+    AudioObjectPropertyAddress volAddr = {
+        .mSelector = kAudioHardwareServiceDeviceProperty_VirtualMasterVolume,
+        .mScope = kAudioDevicePropertyScopeOutput,
+        .mElement = kAudioObjectPropertyElementMaster
+    };
+    if (AudioHardwareServiceGetPropertyData(deviceID, &volAddr, 0, NULL, &volSize, &vol) == noErr ||
+        AudioObjectGetPropertyData(deviceID, &volAddr, 0, NULL, &volSize, &vol) == noErr) {
+        if (outVol) *outVol = vol;
+        return YES;
+    }
+
+    AudioObjectPropertyAddress scalarAddr = {
+        .mSelector = kAudioDevicePropertyVolumeScalar,
+        .mScope = kAudioDevicePropertyScopeOutput,
+        .mElement = kAudioObjectPropertyElementMaster
+    };
+    if (AudioObjectGetPropertyData(deviceID, &scalarAddr, 0, NULL, &volSize, &vol) == noErr) {
+        if (outVol) *outVol = vol;
+        return YES;
+    }
+    scalarAddr.mElement = 1;
+    if (AudioObjectGetPropertyData(deviceID, &scalarAddr, 0, NULL, &volSize, &vol) == noErr) {
+        if (outVol) *outVol = vol;
+        return YES;
+    }
+    return NO;
+}
+
+static void setMasterVolume(double level) {
+    Float32 vol = (Float32)level;
+    if (vol < 0.0f) vol = 0.0f;
+    if (vol > 1.0f) vol = 1.0f;
+
+    AudioDeviceID deviceID = defaultOutputDevice();
+    if (deviceID == kAudioObjectUnknown) return;
+
+    if (vol > 0.001f) {
+        AudioObjectPropertyAddress muteAddr = {
+            .mSelector = kAudioDevicePropertyMute,
+            .mScope = kAudioDevicePropertyScopeOutput,
+            .mElement = kAudioObjectPropertyElementMaster
+        };
+        UInt32 muted = 0;
+        UInt32 muteSize = sizeof(muted);
+        if (AudioObjectGetPropertyData(deviceID, &muteAddr, 0, NULL, &muteSize, &muted) == noErr && muted != 0) {
+            Boolean settable = false;
+            if (AudioObjectIsPropertySettable(deviceID, &muteAddr, &settable) == noErr && settable) {
+                muted = 0;
+                AudioObjectSetPropertyData(deviceID, &muteAddr, 0, NULL, muteSize, &muted);
+            }
+        }
+    }
 
     AudioObjectPropertyAddress volAddr = {
         .mSelector = kAudioHardwareServiceDeviceProperty_VirtualMasterVolume,
@@ -2816,7 +2889,7 @@ static void setMasterVolume(double level) {
     };
     UInt32 volSize = sizeof(vol);
 
-    err = AudioHardwareServiceSetPropertyData(deviceID, &volAddr, 0, NULL, volSize, &vol);
+    OSStatus err = AudioHardwareServiceSetPropertyData(deviceID, &volAddr, 0, NULL, volSize, &vol);
     if (err == noErr) return;
 
     err = AudioObjectSetPropertyData(deviceID, &volAddr, 0, NULL, volSize, &vol);
@@ -2839,10 +2912,223 @@ static void setMasterVolume(double level) {
     }
 }
 
+static void attachVolumeDeviceListener(void) {
+    AudioDeviceID next = defaultOutputDevice();
+    if (watchedOutputDevice == next) return;
+    if (watchedOutputDevice != kAudioObjectUnknown && volumeScalarBlock) {
+        for (UInt32 elem = 0; elem <= 1; elem++) {
+            AudioObjectPropertyAddress addr = {
+                .mSelector = kAudioDevicePropertyVolumeScalar,
+                .mScope = kAudioDevicePropertyScopeOutput,
+                .mElement = elem
+            };
+            AudioObjectRemovePropertyListenerBlock(watchedOutputDevice, &addr, volumeListenQueue, volumeScalarBlock);
+        }
+    }
+    watchedOutputDevice = next;
+    if (next != kAudioObjectUnknown && volumeScalarBlock) {
+        for (UInt32 elem = 0; elem <= 1; elem++) {
+            AudioObjectPropertyAddress addr = {
+                .mSelector = kAudioDevicePropertyVolumeScalar,
+                .mScope = kAudioDevicePropertyScopeOutput,
+                .mElement = elem
+            };
+            AudioObjectAddPropertyListenerBlock(next, &addr, volumeListenQueue, volumeScalarBlock);
+        }
+    }
+    Float32 v = -1.0f;
+    if (getMasterVolume(&v)) {
+        pthread_mutex_lock(&volumeLock);
+        trackedCurVolume = v;
+        trackedPrevVolume = v;
+        pthread_mutex_unlock(&volumeLock);
+    }
+}
+
+static void watchVolume(void) {
+    volumeListenQueue = dispatch_queue_create("henge.volume-listen", DISPATCH_QUEUE_SERIAL);
+    volumeScalarBlock = ^(UInt32 inNumberAddresses, const AudioObjectPropertyAddress *inAddresses) {
+        (void)inNumberAddresses;
+        (void)inAddresses;
+        Float32 v = -1.0f;
+        if (!getMasterVolume(&v)) return;
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        pthread_mutex_lock(&volumeLock);
+        if (!agentChangingVolume && now >= agentVolumeIgnoreUntilNs && fabsf(v - trackedCurVolume) > 0.002f) {
+            trackedPrevVolume = trackedCurVolume;
+            trackedCurVolume = v;
+            trackedChangeTimeNs = now;
+        }
+        pthread_mutex_unlock(&volumeLock);
+    };
+    attachVolumeDeviceListener();
+    AudioObjectPropertyAddress devAddr = {
+        .mSelector = kAudioHardwarePropertyDefaultOutputDevice,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMaster
+    };
+    AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &devAddr, volumeListenQueue,
+                                        ^(UInt32 inNumberAddresses, const AudioObjectPropertyAddress *inAddresses) {
+        (void)inNumberAddresses;
+        (void)inAddresses;
+        attachVolumeDeviceListener();
+    });
+}
+
+static void processPendingVolume(void) {
+    for (;;) {
+        pthread_mutex_lock(&volumeLock);
+        double target = pendingVolumeTarget;
+        int hud = pendingVolumeHud;
+        uint64_t seq = pendingVolumeSeq;
+        pendingVolumeHud = 0;
+        pthread_mutex_unlock(&volumeLock);
+
+        if (target < 0.0) break;
+
+        if (hud) {
+            // Brief settle window so AppleUSBAudio's UAC2 interrupt and any KVO burst coalesce.
+            usleep(15000);
+            pthread_mutex_lock(&volumeLock);
+            uint64_t latestSeq = pendingVolumeSeq;
+            pthread_mutex_unlock(&volumeLock);
+            if (latestSeq != seq) continue;
+        }
+
+        if (!hud) {
+            pthread_mutex_lock(&volumeLock);
+            agentChangingVolume = YES;
+            pthread_mutex_unlock(&volumeLock);
+            setMasterVolume(target);
+            pthread_mutex_lock(&volumeLock);
+            agentChangingVolume = NO;
+            agentVolumeIgnoreUntilNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 200 * NSEC_PER_MSEC;
+            trackedCurVolume = (Float32)target;
+            pthread_mutex_unlock(&volumeLock);
+            lastAppliedVolume = target;
+        } else {
+            Float32 cur = (Float32)target;
+            BOOL haveCur = getMasterVolume(&cur);
+            double ref = haveCur ? (double)cur : (lastAppliedVolume >= 0.0 ? lastAppliedVolume : target);
+
+            uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            pthread_mutex_lock(&volumeLock);
+            Float32 extPrev = trackedPrevVolume;
+            uint64_t extAge = trackedChangeTimeNs ? (now - trackedChangeTimeNs) : UINT64_MAX;
+            pthread_mutex_unlock(&volumeLock);
+
+            // If AppleUSBAudio already applied this target via UAC2 just moments ago, use the level before it.
+            if (haveCur && fabs((double)cur - target) < 0.005 && extPrev >= 0.0f && extAge < 500 * NSEC_PER_MSEC) {
+                ref = (double)extPrev;
+            } else if (haveCur && fabs((double)cur - target) < 0.005 && lastAppliedVolume >= 0.0 &&
+                       fabs(lastAppliedVolume - target) >= 0.005) {
+                ref = lastAppliedVolume;
+            }
+
+            int dir = (target > ref + 0.002) ? 1 : (target < ref - 0.002) ? -1 : 0;
+            if (dir == 0) {
+                pthread_mutex_lock(&volumeLock);
+                agentChangingVolume = YES;
+                pthread_mutex_unlock(&volumeLock);
+                setMasterVolume(target);
+                pthread_mutex_lock(&volumeLock);
+                agentChangingVolume = NO;
+                agentVolumeIgnoreUntilNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 200 * NSEC_PER_MSEC;
+                trackedCurVolume = (Float32)target;
+                pthread_mutex_unlock(&volumeLock);
+                lastAppliedVolume = target;
+            } else {
+                // Pre-position CoreAudio one macOS step (1/16) before target so posting a single
+                // NX_KEYTYPE_SOUND_UP/DOWN lands directly on target and renders a smooth native HUD.
+                const double step = 1.0 / 16.0;
+                double pre = (dir > 0) ? MAX(0.0, target - step) : MIN(1.0, target + step);
+
+                pthread_mutex_lock(&volumeLock);
+                agentChangingVolume = YES;
+                pthread_mutex_unlock(&volumeLock);
+
+                if (!haveCur || fabs((double)cur - pre) > 0.005) {
+                    setMasterVolume(pre);
+                    usleep(15000);
+                    pthread_mutex_lock(&volumeLock);
+                    uint64_t latestSeq = pendingVolumeSeq;
+                    pthread_mutex_unlock(&volumeLock);
+                    if (latestSeq != seq) {
+                        pthread_mutex_lock(&volumeLock);
+                        agentChangingVolume = NO;
+                        agentVolumeIgnoreUntilNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 200 * NSEC_PER_MSEC;
+                        pthread_mutex_unlock(&volumeLock);
+                        continue;
+                    }
+                }
+
+                dispatch_sync(dispatch_get_main_queue(), ^{
+                    postMediaKey(dir > 0 ? NX_KEYTYPE_SOUND_UP : NX_KEYTYPE_SOUND_DOWN);
+                });
+                lastAppliedVolume = target;
+
+                usleep(60000);
+                pthread_mutex_lock(&volumeLock);
+                uint64_t latestSeq = pendingVolumeSeq;
+                pthread_mutex_unlock(&volumeLock);
+                if (latestSeq != seq) {
+                    pthread_mutex_lock(&volumeLock);
+                    agentChangingVolume = NO;
+                    agentVolumeIgnoreUntilNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 200 * NSEC_PER_MSEC;
+                    pthread_mutex_unlock(&volumeLock);
+                    continue;
+                }
+
+                Float32 after = (Float32)target;
+                if (getMasterVolume(&after) && fabs((double)after - target) > 0.005) {
+                    setMasterVolume(target);
+                }
+
+                pthread_mutex_lock(&volumeLock);
+                agentChangingVolume = NO;
+                agentVolumeIgnoreUntilNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 200 * NSEC_PER_MSEC;
+                trackedCurVolume = (Float32)target;
+                pthread_mutex_unlock(&volumeLock);
+            }
+        }
+
+        pthread_mutex_lock(&volumeLock);
+        if (pendingVolumeSeq == seq) {
+            volumeWorkerRunning = NO;
+            pthread_mutex_unlock(&volumeLock);
+            break;
+        }
+        pthread_mutex_unlock(&volumeLock);
+    }
+}
+
+static BOOL enqueueVolumeLevel(const char *line) {
+    double volLevel = 0.0;
+    int volHud = 0;
+    int parsed = sscanf(line, "vollevel %lf %d", &volLevel, &volHud);
+    if (parsed < 1) parsed = sscanf(line, "volume_level %lf %d", &volLevel, &volHud);
+    if (parsed < 1) return NO;
+
+    if (volLevel < 0.0) volLevel = 0.0;
+    if (volLevel > 1.0) volLevel = 1.0;
+
+    pthread_mutex_lock(&volumeLock);
+    pendingVolumeTarget = volLevel;
+    if (parsed >= 2 && volHud != 0) pendingVolumeHud = 1;
+    pendingVolumeSeq++;
+    BOOL needStart = !volumeWorkerRunning;
+    volumeWorkerRunning = YES;
+    pthread_mutex_unlock(&volumeLock);
+
+    if (needStart && volumeQueue) {
+        dispatch_async(volumeQueue, ^{ processPendingVolume(); });
+    }
+    return YES;
+}
+
 static void handleLine(const char *line) {
     unsigned id;
     int vol;
-    double volLevel;
     double x, y, dx, dy;
     char phase;
     double bpct;
@@ -2852,15 +3138,22 @@ static void handleLine(const char *line) {
     else if (sscanf(line, "look %u", &id) == 1) answerLook(id);
     else if (sscanf(line, "touchwatch %u", &id) == 1) answerTouchWatch(id);
     else if (sscanf(line, "volume %d", &vol) == 1) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            postMediaKey(vol > 0 ? NX_KEYTYPE_SOUND_UP : vol < 0 ? NX_KEYTYPE_SOUND_DOWN : NX_KEYTYPE_MUTE);
-        });
+        if (volumeQueue) {
+            dispatch_async(volumeQueue, ^{
+                pthread_mutex_lock(&volumeLock);
+                agentChangingVolume = YES;
+                pthread_mutex_unlock(&volumeLock);
+                dispatch_sync(dispatch_get_main_queue(), ^{
+                    postMediaKey(vol > 0 ? NX_KEYTYPE_SOUND_UP : vol < 0 ? NX_KEYTYPE_SOUND_DOWN : NX_KEYTYPE_MUTE);
+                });
+                pthread_mutex_lock(&volumeLock);
+                agentChangingVolume = NO;
+                agentVolumeIgnoreUntilNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 200 * NSEC_PER_MSEC;
+                pthread_mutex_unlock(&volumeLock);
+            });
+        }
     }
-    else if (sscanf(line, "vollevel %lf", &volLevel) == 1 || sscanf(line, "volume_level %lf", &volLevel) == 1) {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
-            setMasterVolume(volLevel);
-        });
-    }
+    else if (enqueueVolumeLevel(line)) {}
     else if (sscanf(line, "battery %lf %d %d %d", &bpct, &bext, &bchg, &bfl) == 4) {
         updateBattery(bpct, bext, bchg, bfl);
     }
@@ -4117,6 +4410,8 @@ int main(int argc, char **argv) {
         scrollQueue = dispatch_queue_create("henge.scroll", quick);
         menuQueue = dispatch_queue_create("henge.menu", quick);
         glideWatchQueue = dispatch_queue_create("henge.glide-watch", quick);
+        volumeQueue = dispatch_queue_create("henge.volume", quick);
+        watchVolume();
         // The link first: until it is up the device can't tell a login from the login window, nor scroll smoothly.
         // The rest (the clipboard, the shared folder, the tools disk) can wait the moment macOS is busiest.
         pthread_attr_t linkAttr;

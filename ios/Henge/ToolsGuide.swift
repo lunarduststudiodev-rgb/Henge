@@ -53,8 +53,7 @@ struct ToolsGuide: View {
             .buttonStyle(.plain)
 
             Button {
-                dismissed = true
-                stage = .none
+                neverAsk()
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 11, weight: .bold))

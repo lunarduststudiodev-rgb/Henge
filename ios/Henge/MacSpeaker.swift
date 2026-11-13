@@ -20,10 +20,11 @@ final class MacSpeaker {
     private var volumeView: MPVolumeView?
     /// The volume this side set last, and when: its change coming back is not the person's.
     private var setByMac: (level: Float, at: Date)?
+    /// The volume this side sent to the Mac last, and when: ignore echoes while macOS settles to it.
+    private var setByIPad: (level: Float, at: Date)?
+    private var pendingVolumeTask: Task<Void, Never>?
+    private var pendingVolumeTarget: Float?
     private var running = false
-
-    /// One press of an iPad volume button moves the volume this much (16 steps).
-    private static let buttonStep: Float = 1.0 / 16
 
     /// Before the Mac is built: what macOS calls the speaker.
     func prepare() {
@@ -50,6 +51,7 @@ final class MacSpeaker {
             DispatchQueue.main.async { MacSpeaker.shared.macVolumeChanged(level: level, mute: mute != 0) }
         }, nil)
         // The Mac takes the iPad's volume: a Mac going on from where it was suspended moves its slider to it.
+        setByIPad = (session.outputVolume, Date())
         henge_vm_speaker_host_volume(Double(session.outputVolume))
         HengeLog.log("speaker", "the Mac's speaker follows the iPad's volume (now \(Int(session.outputVolume * 100))%)")
     }
@@ -58,6 +60,9 @@ final class MacSpeaker {
     func stop() {
         guard running else { return }
         running = false
+        pendingVolumeTask?.cancel()
+        pendingVolumeTask = nil
+        pendingVolumeTarget = nil
         henge_vm_speaker_listen(nil, nil)
         observation?.invalidate()
         observation = nil
@@ -66,6 +71,7 @@ final class MacSpeaker {
         volumeView?.removeFromSuperview()
         volumeView = nil
         setByMac = nil
+        setByIPad = nil
     }
 
     /// The system volume slider, out of sight. In a window, it also keeps iOS's own volume display away while the Mac
@@ -92,11 +98,21 @@ final class MacSpeaker {
     private func macVolumeChanged(level: Double, mute: Bool) {
         guard running, !mute else { return }
         let target = Float(min(max(level, 0), 1))
+        if let sent = setByIPad {
+            let age = Date().timeIntervalSince(sent.at)
+            if age < 0.6 || (age < 1.5 && abs(target - sent.level) < 0.015) {
+                return // echo from an iPad-initiated volume change while macOS settles
+            }
+            setByIPad = nil
+        }
         if abs(AVAudioSession.sharedInstance().outputVolume - target) < 0.005 { return }
         guard let slider else {
             HengeLog.log("speaker", "no volume slider: the iPad's volume can't follow the Mac's")
             return
         }
+        pendingVolumeTask?.cancel()
+        pendingVolumeTask = nil
+        pendingVolumeTarget = nil
         setByMac = (target, Date())
         slider.setValue(target, animated: false)
         slider.sendActions(for: .valueChanged)
@@ -109,21 +125,22 @@ final class MacSpeaker {
             setByMac = nil // the Mac's own change, coming back
             return
         }
-        let delta = new - old
-        let absDelta = abs(delta)
-        // A physical button press moves volume in ~1/16 (0.0625) increments.
-        // It can also hit the min/max boundary (0.0 or 1.0) with a smaller fractional step,
-        // or deliver multiple steps if pressed rapidly.
-        let isBoundary = (new >= 0.99 && old > 0.9) || (new <= 0.01 && old < 0.1)
-        let isButtonStep = abs(absDelta - Self.buttonStep) < 0.02 || isBoundary
-        let isMultiButton = absDelta > 0.04 && absDelta <= Self.buttonStep * 3.5 && abs(absDelta.remainder(dividingBy: Self.buttonStep)) < 0.025
-
-        if isButtonStep || isMultiButton {
-            let steps = max(1, Int(round(absDelta / Self.buttonStep)))
-            for _ in 0..<steps {
-                henge_vm_speaker_host_key(delta > 0 ? 1 : -1) // a button: macOS steps its volume and shows it
+        pendingVolumeTarget = new
+        pendingVolumeTask?.cancel()
+        pendingVolumeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 30_000_000) // coalesce rapid/intermediate KVO updates
+            guard let self, !Task.isCancelled, self.running, let target = self.pendingVolumeTarget else { return }
+            self.pendingVolumeTarget = nil
+            self.pendingVolumeTask = nil
+            if let set = self.setByMac, Date().timeIntervalSince(set.at) < 1.5, abs(target - set.level) < 0.01 {
+                self.setByMac = nil
+                return
             }
+            self.setByIPad = (target, Date())
+            // Send only the absolute volume level rather than pairing HID volume keys with host_volume
+            // (which double-steps and fights with CoreAudio). When henge-agent is linked, it coordinates
+            // the native macOS Volume HUD and 1:1 CoreAudio level smoothly.
+            henge_vm_speaker_host_volume(Double(target))
         }
-        henge_vm_speaker_host_volume(Double(new))
     }
 }
