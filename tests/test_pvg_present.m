@@ -1056,10 +1056,10 @@ static int no_room_left(void *ctx, uint64_t bytes, char *why, size_t why_len) {
     snprintf(why, why_len, "the test's: no room");
     return -1;
 }
-/* (gate r1, S3-2) A surface page not on a 16 KB boundary: zeros and counted, never the 16 KB page below it (vm_remap
-   truncates the source), whose bytes would show shifted by 8 KB */
+/* (gate r1, S3-2) A surface page not on a 16 KB boundary: copied into the surface mapping and counted, never the 16 KB
+   page below it (vm_remap truncates the source), whose bytes would show shifted by 8 KB, and never left as zeros. */
 static void test_surface_misaligned(void) {
-    printf("a surface page not on a 16 KB boundary: zeros, counted\n");
+    printf("a surface page not on a 16 KB boundary: copied, counted\n");
     vm_address_t ram = 0;
     if (vm_allocate(mach_task_self(), &ram, 0x8000, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) { CHECK(0, "no guest memory"); return; }
     guest_ram = (uint8_t *)ram;
@@ -1069,14 +1069,24 @@ static void test_surface_misaligned(void) {
     const uint32_t tag = 0xc, size = 0x30;
     memcpy(surface_record + 8, &tag, 4), memcpy(surface_record + 12, &size, 4);
     guest_ram[0x4000 + 0x100 + 64 * 3] = 0x41; /* the 16 KB page below: what a truncated remap would show */
-    guest_ram[0x6000 + 0x100 + 64 * 3] = 0x52; /* the guest's own page, which can't be remapped where it is */
+    guest_ram[0x6000 + 0x100 + 64 * 3] = 0x52; /* the guest's own page, copied instead of zeroed */
     r->planar = [NSMapTable strongToWeakObjectsMapTable], r->planar_kept = [NSMutableArray new], r->surfaces = [NSMutableDictionary new], r->max_buffer = 1ull << 30;
     uint64_t misaligned0 = r->pages_misaligned;
     @autoreleasepool {
         HvObject *s = map_surface(11, 5);
-        CHECK(s && s->mapped && s->mapped[0x100 + 64 * 3] == 0 && r->pages_misaligned == misaligned0 + 1,
-              "mapped as zeros, not the page below (%02x), and counted (%llu)", s && s->mapped ? s->mapped[0x100 + 64 * 3] : 0xff,
+        CHECK(s && s->mapped && s->mapped[0x100 + 64 * 3] == 0x52 && r->pages_misaligned == misaligned0 + 1,
+              "copied from guest RAM (%02x, not page below 0x41), and counted (%llu)",
+              s && s->mapped ? s->mapped[0x100 + 64 * 3] : 0xff,
               r->pages_misaligned - misaligned0);
+        guest_ram[0x6000 + 0x100 + 64 * 3] = 0x79;
+        sync_copied_surface(s);
+        CHECK(s && s->mapped && s->mapped[0x100 + 64 * 3] == 0x79, "guest write refreshed copied misaligned page (%02x)",
+              s && s->mapped ? s->mapped[0x100 + 64 * 3] : 0xff);
+        s->guest_stale = YES;
+        guest_ram[0x6000 + 0x100 + 64 * 3] = 0x99;
+        sync_copied_surface(s);
+        CHECK(s && s->mapped && s->mapped[0x100 + 64 * 3] == 0x79, "stale surface not overwritten by guest RAM (%02x)",
+              s && s->mapped ? s->mapped[0x100 + 64 * 3] : 0xff);
         s = nil;
         hv_pvg_metal_unmap((__bridge HvPvgMetal *)r, 5);
         [r->tasks[1] removeObjectForKey:@11];
@@ -3076,6 +3086,183 @@ static void test_dock_badge_metal_fixes(void) {
     r->device = saved_dev;
 }
 
+@interface StaleTex : NSObject
+@property(nonatomic) NSUInteger textureType, pixelFormat, width, height, depth, mipmapLevelCount, sampleCount, arrayLength, usage;
+@property(nonatomic) NSUInteger cpuCacheMode, storageMode, hazardTrackingMode, parentRelativeLevel, parentRelativeSlice;
+@property(nonatomic) BOOL isFramebufferOnly;
+@property(nonatomic, strong) id parentTexture;
+@end
+@implementation StaleTex
+- (instancetype)init {
+    if ((self = [super init])) {
+        _textureType = MTLTextureType2D, _pixelFormat = MTLPixelFormatBGRA8Unorm;
+        _width = 64, _height = 64, _depth = 1, _mipmapLevelCount = 4, _sampleCount = 1, _arrayLength = 1;
+        _usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        _storageMode = MTLStorageModePrivate;
+    }
+    return self;
+}
+@end
+@interface StaleBlit : NSObject
+@end
+@implementation StaleBlit
+- (void)copyFromBuffer:(id)b sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)r sourceBytesPerImage:(NSUInteger)i
+            sourceSize:(MTLSize)s toTexture:(id)t destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl
+     destinationOrigin:(MTLOrigin)orig options:(MTLBlitOption)opt {}
+- (void)copyFromTexture:(id)a sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)sz
+              toTexture:(id)b destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)orig {}
+- (void)generateMipmapsForTexture:(id)t {}
+@end
+@interface StaleCompute : NSObject
+@end
+@implementation StaleCompute
+- (void)setTextures:(const id __unsafe_unretained *)textures withRange:(NSRange)range {}
+@end
+@interface StaleRender : NSObject
+@end
+@implementation StaleRender
+- (void)useResources:(const id __unsafe_unretained *)resources count:(NSUInteger)count usage:(MTLResourceUsage)usage {}
+- (void)useResources:(const id __unsafe_unretained *)resources count:(NSUInteger)count usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages {}
+@end
+
+static void test_guest_stale_writes(void) {
+    printf("GPU writes via blit/compute/useResources mark targets and parents guest_stale\n");
+    HvObject *heap = object(10), *tex = object(11), *view = object(12), *buf = object(13), *ro = object(14);
+    heap->kind = KIND_HEAP, heap->object = [NSObject new];
+    tex->kind = KIND_TEXTURE, tex->object = [StaleTex new], tex->parent = heap;
+    view->kind = KIND_TEXTURE, view->object = [StaleTex new], view->parent = tex;
+    buf->kind = KIND_BUFFER, buf->object = [FakeBuffer new];
+    ro->kind = KIND_TEXTURE, ro->object = [StaleTex new];
+
+    /* blit 300: buffer to view marks view, parent texture, and heap guest_stale */
+    uint8_t b300[0x58] = {0};
+    uint32_t bref = 13, tref = 12;
+    uint64_t row = 64, img = 16 * 64;
+    MTLSize sz = {16, 16, 1};
+    MTLOrigin orig = {0, 0, 0};
+    memcpy(b300 + 0, &bref, 4); memcpy(b300 + 4, &tref, 4);
+    memcpy(b300 + 0x10, &row, 8); memcpy(b300 + 0x18, &img, 8);
+    memcpy(b300 + 0x20, &sz, sizeof sz); memcpy(b300 + 0x38, &orig, sizeof orig);
+    StaleBlit *be = [StaleBlit new];
+    dispatch_sync(r->worker, ^{ [r blit:(id<MTLBlitCommandEncoder>)be tag:300 rec:(Rec){b300, sizeof b300} task:1]; });
+    CHECK(view->guest_stale && tex->guest_stale && heap->guest_stale, "blit 300: view, base texture, and heap marked guest_stale");
+
+    /* blit 303: texture to texture marks destination guest_stale (and not source) */
+    heap->guest_stale = NO, tex->guest_stale = NO, view->guest_stale = NO, ro->guest_stale = NO;
+    uint8_t b303[0x58] = {0};
+    uint32_t sref = 14, dref = 12;
+    memcpy(b303 + 0, &sref, 4); memcpy(b303 + 4, &dref, 4);
+    memcpy(b303 + 0x20, &sz, sizeof sz);
+    dispatch_sync(r->worker, ^{ [r blit:(id<MTLBlitCommandEncoder>)be tag:303 rec:(Rec){b303, sizeof b303} task:1]; });
+    CHECK(view->guest_stale && tex->guest_stale && heap->guest_stale && !ro->guest_stale,
+          "blit 303: destination chain marked guest_stale, source unchanged");
+
+    /* blit 307: generateMipmaps marks texture and parent guest_stale */
+    heap->guest_stale = NO, tex->guest_stale = NO, view->guest_stale = NO;
+    uint32_t b307[2] = {12, 0};
+    dispatch_sync(r->worker, ^{ [r blit:(id<MTLBlitCommandEncoder>)be tag:307 rec:(Rec){(const uint8_t *)b307, sizeof b307} task:1]; });
+    CHECK(view->guest_stale && tex->guest_stale && heap->guest_stale, "blit 307: mipmap target and parents marked guest_stale");
+
+    /* compute 206: ShaderWrite marks guest_stale; ShaderRead-only does not */
+    heap->guest_stale = NO, tex->guest_stale = NO, view->guest_stale = NO, ro->guest_stale = NO;
+    ((StaleTex *)view->object).usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    ((StaleTex *)ro->object).usage = MTLTextureUsageShaderRead;
+    uint32_t c206[4] = {0, 2, 12, 14};
+    StaleCompute *ce = [StaleCompute new];
+    dispatch_sync(r->worker, ^{ [r compute:(id<MTLComputeCommandEncoder>)ce tag:206 rec:(Rec){(const uint8_t *)c206, sizeof c206} task:1]; });
+    CHECK(view->guest_stale && tex->guest_stale && heap->guest_stale && !ro->guest_stale,
+          "compute 206: ShaderWrite texture marked guest_stale, read-only not");
+
+    /* render 135: useResources with write marks guest_stale; read-only does not */
+    heap->guest_stale = NO, tex->guest_stale = NO, view->guest_stale = NO, ro->guest_stale = NO;
+    StaleRender *re = [StaleRender new];
+    uint32_t r135_w[3] = {1, MTLResourceUsageWrite, 12};
+    uint32_t r135_r[3] = {1, MTLResourceUsageRead, 14};
+    dispatch_sync(r->worker, ^{
+        [r render:(id<MTLRenderCommandEncoder>)re tag:135 rec:(Rec){(const uint8_t *)r135_w, sizeof r135_w} task:1];
+        [r render:(id<MTLRenderCommandEncoder>)re tag:135 rec:(Rec){(const uint8_t *)r135_r, sizeof r135_r} task:1];
+    });
+    CHECK(view->guest_stale && tex->guest_stale && heap->guest_stale && !ro->guest_stale,
+          "render 135: write resource marked guest_stale, read-only not");
+
+    /* HV_PVG_SURFACE_LOG gates per-surface logging in env */
+    unsetenv("HV_PVG_SURFACE_LOG");
+    read_env(r);
+    CHECK(!r->env.surface_log, "surface_log defaults NO when HV_PVG_SURFACE_LOG is unset");
+    setenv("HV_PVG_SURFACE_LOG", "1", 1);
+    read_env(r);
+    CHECK(r->env.surface_log, "surface_log enabled when HV_PVG_SURFACE_LOG is set");
+    unsetenv("HV_PVG_SURFACE_LOG");
+    read_env(r);
+
+    [r->tasks[1] removeObjectForKey:@10];
+    [r->tasks[1] removeObjectForKey:@11];
+    [r->tasks[1] removeObjectForKey:@12];
+    [r->tasks[1] removeObjectForKey:@13];
+    [r->tasks[1] removeObjectForKey:@14];
+}
+
+#ifndef HV_PVG_TEST_NO_METAL
+@interface StaleCB : NSObject
+@end
+@implementation StaleCB
+- (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d { (void)d; return [StaleRender new]; }
+@end
+
+static void test_guest_stale_render_pass(void) {
+    printf("render pass attachments and resolve views mark targets and parents guest_stale\n");
+    HvTexCaps saved_caps = r->caps;
+    r->caps.samples |= (1u << 1) | (1u << 4);
+    r->caps.color_bytes = 128, r->caps.implicit_bytes = 256 << 10;
+
+    HvObject *heap = object(10), *tex = object(11), *view = object(12), *res = object(13), *dc = object(14);
+    heap->kind = KIND_HEAP, heap->object = [NSObject new];
+    tex->kind = KIND_TEXTURE, tex->object = [StaleTex new], tex->parent = heap;
+    view->kind = KIND_TEXTURE, view->object = [StaleTex new], view->parent = tex;
+    ((StaleTex *)view->object).sampleCount = 4;
+    ((StaleTex *)view->object).textureType = MTLTextureType2DMultisample;
+    ((StaleTex *)view->object).mipmapLevelCount = 1;
+    res->kind = KIND_TEXTURE, res->object = [StaleTex new];
+    ((StaleTex *)res->object).mipmapLevelCount = 1;
+    dc->kind = KIND_TEXTURE, dc->object = [StaleTex new];
+    ((StaleTex *)dc->object).mipmapLevelCount = 1;
+
+    uint8_t pass[0x248] = {0};
+    uint32_t c0_tex = 12, c0_res = 13, c0_dc = 14;
+    uint16_t load_clear = MTLLoadActionClear, store_resolve = MTLStoreActionMultisampleResolve;
+    uint16_t load_load = MTLLoadActionLoad, store_dc = MTLStoreActionDontCare;
+    memcpy(pass + 0x4c + 0, &c0_tex, 4);
+    memcpy(pass + 0x4c + 4, &c0_res, 4);
+    memcpy(pass + 0x4c + 20, &load_clear, 2);
+    memcpy(pass + 0x4c + 22, &store_resolve, 2);
+    uint64_t layers = 1, pw = 64, ph = 64;
+    memcpy(pass + 0x230, &layers, 8); memcpy(pass + 0x238, &pw, 8); memcpy(pass + 0x240, &ph, 8);
+
+    StaleCB *cb = [StaleCB new];
+    __block id<MTLRenderCommandEncoder> enc = nil;
+    dispatch_sync(r->worker, ^{ enc = [r beginPass:(Rec){pass, sizeof pass} task:1 commandBuffer:(id<MTLCommandBuffer>)cb]; });
+    CHECK(enc != nil, "MSAA render pass begun");
+    CHECK(view->guest_stale && tex->guest_stale && heap->guest_stale && res->guest_stale,
+          "beginPass: stored/resolved attachments and parents marked guest_stale");
+
+    uint8_t pass_dc[0x248] = {0};
+    memcpy(pass_dc + 0x4c + 0, &c0_dc, 4);
+    memcpy(pass_dc + 0x4c + 20, &load_load, 2);
+    memcpy(pass_dc + 0x4c + 22, &store_dc, 2);
+    memcpy(pass_dc + 0x230, &layers, 8); memcpy(pass_dc + 0x238, &pw, 8); memcpy(pass_dc + 0x240, &ph, 8);
+    __block id<MTLRenderCommandEncoder> enc_dc = nil;
+    dispatch_sync(r->worker, ^{ enc_dc = [r beginPass:(Rec){pass_dc, sizeof pass_dc} task:1 commandBuffer:(id<MTLCommandBuffer>)cb]; });
+    CHECK(enc_dc != nil && !dc->guest_stale, "beginPass: load+DontCare pass leaves attachment guest_stale NO");
+
+    r->caps = saved_caps;
+    [r->tasks[1] removeObjectForKey:@10];
+    [r->tasks[1] removeObjectForKey:@11];
+    [r->tasks[1] removeObjectForKey:@12];
+    [r->tasks[1] removeObjectForKey:@13];
+    [r->tasks[1] removeObjectForKey:@14];
+}
+#endif
+
 #ifdef HV_PVG_TEST_NO_METAL /* test_pvg_present_nometal: these check pvg_metal.m against Metal's own descriptor objects,
                                which that build hasn't got (tests/pvg_nometal_stubs.m); test_pvg_present_nogpu runs them */
 #define METAL_OBJECTS(test) printf("%s: skipped, it needs Metal's own descriptors (run in test_pvg_present_nogpu)\n", #test)
@@ -3161,6 +3348,8 @@ int main(int argc, char **argv) {
         test_view_chains();
         test_texture_type12();
         test_dock_badge_metal_fixes();
+        test_guest_stale_writes();
+        METAL_OBJECTS(test_guest_stale_render_pass);
         METAL_OBJECTS(test_pipeline_checks);
         METAL_OBJECTS(test_building_note);
 #endif

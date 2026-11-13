@@ -197,7 +197,9 @@ static PresenterPick presenter_pick(HvReplay *r, uint64_t generation, CAMetalLay
     uint64_t tex_base, tex_stride;
     uint8_t tex_block_h;
     uint8_t *tex_layout; /* the mip table, 36 bytes each */
-    BOOL guest_backed;
+    BOOL guest_backed, surface_standin;
+    void **copied_srcs; /* surface pages not on a 16 KB boundary: copied here instead of zero-copy vm_remap */
+    uint64_t copied_n;
     uint32_t retries; /* a mapped texture made before its surface was described: tried again on later uses */
     uint8_t described[0x30]; /* a surface: the older driver's compact description it was made from */
     uint64_t on_mapping; /* a mapped texture: the surface id it is over */
@@ -268,6 +270,7 @@ static PresenterPick presenter_pick(HvReplay *r, uint64_t generation, CAMetalLay
     }
     if (heap_total) atomic_fetch_sub(heap_total, heap_size);
     free(pages);
+    free(copied_srcs);
     free(tex_layout);
 }
 @end
@@ -456,7 +459,7 @@ static void over_surface(HvObject *o) {
        read for each resource of each exec, each function, pipeline, heap, video sync and frame (gfx-cost 7) */
     struct {
         const char *trace_file, *host_dump, *surface_dump;
-        BOOL fail_libs, shader_dump, heap_log, tally, cursor_log, gpu_test, color_probe;
+        BOOL fail_libs, shader_dump, heap_log, tally, cursor_log, gpu_test, color_probe, surface_log;
     } env;
     _Atomic uint64_t gpu_waits_given_up; /* cb_wait past its bound: what wanted the buffer went without */
     id<MTLCommandBuffer> stuck_cb; /* the last buffer cb_wait gave up on, while it is still not done (worker only) */
@@ -2143,12 +2146,20 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
     uint64_t misaligned = 0;
     for (uint64_t i = 0; i < n; i++) {
         void *src = (pages[i] & 1) ? hv_pvg_lite_phys(lite, (uint64_t)(pages[i] & ~1u) << 12, 0x4000) : NULL;
-        if ((uintptr_t)src & 0x3fff) src = NULL, misaligned++;
+        if ((uintptr_t)src & 0x3fff) {
+            /* vm_remap requires 16 KB alignment; copy valid guest RAM instead of leaving zeros. */
+            memcpy(surface->mapped + (i << 14), src, 0x4000);
+            if (!surface->copied_srcs) surface->copied_srcs = calloc(n, sizeof(void *));
+            if (surface->copied_srcs) surface->copied_srcs[i] = src;
+            src = NULL;
+            misaligned++;
+        }
         srcs[i] = src;
     }
     if (misaligned) {
+        surface->copied_n = surface->copied_srcs ? n : 0;
         pages_misaligned += misaligned;
-        [self complain:[NSString stringWithFormat:@"surface pages not on a 16 KB boundary: shown as zeros (fourcc %08x)", surface->fourcc]];
+        [self complain:[NSString stringWithFormat:@"surface pages not on a 16 KB boundary: copied instead of zero-copy (fourcc %08x)", surface->fourcc]];
     }
     hv_ramfile_gpu_map((void *)region, srcs, n);
     if (remap_runs(region, srcs, n)) {
@@ -2198,8 +2209,9 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
     }
     free(pages);
     surfaces_made++;
-    fprintf(stderr, "hengevm: pvg-metal: surface %llu: %llux%llu, row %llu, %llu KB, fourcc %c%c%c%c planes %u\n",
-            mapping, (unsigned long long)sw, (unsigned long long)sh, row, alloc >> 10, desc[7], desc[6], desc[5], desc[4], planes);
+    if (env.surface_log)
+        fprintf(stderr, "hengevm: pvg-metal: surface %llu: %llux%llu, row %llu, %llu KB, fourcc %c%c%c%c planes %u\n",
+                mapping, (unsigned long long)sw, (unsigned long long)sh, row, alloc >> 10, desc[7], desc[6], desc[5], desc[4], planes);
     return surface;
 }
 
@@ -2213,6 +2225,29 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
         }
     }
     return surface ? surface : [self newSurface:mapping];
+}
+
+/* Refresh misaligned surface pages copied from guest RAM when the GPU hasn't dirtied the surface. */
+static void sync_copied_surface(HvObject *s) {
+    if (!s || s->gone || !s->mapped || !s->copied_srcs || s->guest_stale) return;
+    for (uint64_t i = 0; i < s->copied_n; i++)
+        if (s->copied_srcs[i]) memcpy(s->mapped + (i << 14), s->copied_srcs[i], 0x4000);
+}
+
+/* Upload guest surface bytes into a non-linear surface stand-in texture (MTLStorageModeShared). */
+static void upload_surface_standin(HvObject *o) {
+    HvObject *surface = o ? o->surface : nil;
+    id<MTLTexture> tex = o ? o->object : nil;
+    if (!surface || !surface->mapped || !tex || tex.textureType != MTLTextureType2D) return;
+    NSUInteger bpp = pixel_bytes(tex.pixelFormat);
+    NSUInteger src_row = (NSUInteger)surface->row;
+    uint64_t needed = tex.height ? (tex.height - 1) * surface->row + (uint64_t)tex.width * bpp : 0;
+    if (bpp && src_row >= tex.width * bpp && surface->first <= surface->length && needed <= surface->length - surface->first) {
+        [tex replaceRegion:MTLRegionMake2D(0, 0, tex.width, tex.height)
+               mipmapLevel:0
+                 withBytes:surface->mapped + surface->first
+               bytesPerRow:src_row];
+    }
 }
 
 /* A surface (IOSurface in the guest): a texture over its guest pages, so the
@@ -2312,16 +2347,10 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
         t.storageMode = MTLStorageModeShared;
         if (![self refuse:t what:@"surface stand-in"]) {
             o->object = [device newTextureWithDescriptor:t];
-            if (o->object && surface->mapped && t.textureType == MTLTextureType2D) {
-                NSUInteger bpp = pixel_bytes(t.pixelFormat);
-                NSUInteger src_row = (NSUInteger)surface->row;
-                uint64_t needed = t.height ? (t.height - 1) * surface->row + (uint64_t)t.width * bpp : 0;
-                if (bpp && src_row >= t.width * bpp && surface->first <= surface->length && needed <= surface->length - surface->first) {
-                    [o->object replaceRegion:MTLRegionMake2D(0, 0, t.width, t.height)
-                                 mipmapLevel:0
-                                   withBytes:surface->mapped + surface->first
-                                 bytesPerRow:src_row];
-                }
+            if (o->object) {
+                o->surface_standin = YES;
+                upload_surface_standin(o);
+                o->host_valid = YES;
             }
         }
     }
@@ -2579,11 +2608,23 @@ static void attach_root(HvPassAttach *a, id<MTLTexture> t) {
     a->root = (uint64_t)(uintptr_t)(__bridge void *)t, a->root_level = level, a->root_slice = slice;
 }
 
+/* Mark an object, its parent chain (views -> base texture, heap resources -> heap), and any aliased surface
+   guest_stale after GPU writes, so page:toGuest:NO cannot overwrite GPU output with stale guest RAM. */
+static void mark_guest_stale(HvObject *o) {
+    for (; o; o = o->parent) {
+        o->guest_stale = YES;
+        if (o->surface) o->surface->guest_stale = YES;
+    }
+}
+
 /* An attachment of the pass record at o: {texture, resolve texture, then 16 bits each: level, slice, depth plane,
    resolve level, slice, depth plane, load, store, store options} */
-- (void)attach:(HvPassAttach *)a texture:(id<MTLTexture> __strong *)tex resolve:(id<MTLTexture> __strong *)res rec:(Rec)r at:(uint32_t)o task:(uint32_t)task {
-    *tex = [self get:U32(o) task:task kind:KIND_TEXTURE];
-    *res = *tex ? [self get:U32(o + 4) task:task kind:KIND_TEXTURE] : nil;
+- (void)attach:(HvPassAttach *)a texture:(id<MTLTexture> __strong *)tex resolve:(id<MTLTexture> __strong *)res
+        texObj:(HvObject *__strong *)texObj resObj:(HvObject *__strong *)resObj rec:(Rec)r at:(uint32_t)o task:(uint32_t)task {
+    *texObj = [self object:U32(o) task:task kind:KIND_TEXTURE];
+    *resObj = *texObj ? [self object:U32(o + 4) task:task kind:KIND_TEXTURE] : nil;
+    *tex = *texObj ? (*texObj)->object : nil;
+    *res = *tex && *resObj ? (*resObj)->object : nil;
     a->present = *tex != nil, a->has_resolve = *res != nil;
     if (*tex) a->tex = made_desc(*tex), attach_root(a, *tex), a->texture = (uint64_t)(uintptr_t)(__bridge void *)*tex;
     if (*res) a->resolve = made_desc(*res), a->resolve_texture = (uint64_t)(uintptr_t)(__bridge void *)*res;
@@ -2607,10 +2648,11 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
     HvPass p;
     memset(&p, 0, sizeof p);
     id<MTLTexture> tex[10], res[10]; /* depth, stencil, colours */
-    [self attach:&p.depth texture:&tex[0] resolve:&res[0] rec:r at:0 task:task];
+    HvObject *tex_obj[10] = {nil}, *res_obj[10] = {nil};
+    [self attach:&p.depth texture:&tex[0] resolve:&res[0] texObj:&tex_obj[0] resObj:&res_obj[0] rec:r at:0 task:task];
     if (p.depth.present && p.depth.tex.format == 255) p.depth.tex.format = 260;
     memcpy(&p.clear_depth, r.p + 0x1c, 8);
-    [self attach:&p.stencil texture:&tex[1] resolve:&res[1] rec:r at:0x28 task:task];
+    [self attach:&p.stencil texture:&tex[1] resolve:&res[1] texObj:&tex_obj[1] resObj:&res_obj[1] rec:r at:0x28 task:task];
     if (p.stencil.present && p.stencil.tex.format == 255) p.stencil.tex.format = 260;
     else if (p.stencil.present && p.stencil.tex.format == 262) p.stencil.tex.format = 261;
     double clear[8][4];
@@ -2618,7 +2660,7 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
     for (int i = 0; i < 8; i++) {
         uint32_t o = 0x4c + (uint32_t)i * 0x3c;
         if (o + 0x3c > r.size) break;
-        [self attach:&p.color[i] texture:&tex[2 + i] resolve:&res[2 + i] rec:r at:o task:task];
+        [self attach:&p.color[i] texture:&tex[2 + i] resolve:&res[2 + i] texObj:&tex_obj[2 + i] resObj:&res_obj[2 + i] rec:r at:o task:task];
         memcpy(clear[i], r.p + o + 0x1c, sizeof clear[i]);
     }
     id<MTLBuffer> visibility = nil;
@@ -2718,6 +2760,14 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
         }
         [m appendFormat:@" depth ref %u stencil ref %u", U32(0), U32(0x28)];
         [self complain:m];
+    } else {
+        const HvPassAttach *all[10] = {&p.depth, &p.stencil, &p.color[0], &p.color[1], &p.color[2],
+                                       &p.color[3], &p.color[4], &p.color[5], &p.color[6], &p.color[7]};
+        for (int i = 0; i < 10; i++) {
+            if (tex_obj[i] && (all[i]->store != MTLStoreActionDontCare || all[i]->load == MTLLoadActionClear))
+                mark_guest_stale(tex_obj[i]);
+            if (res_obj[i]) mark_guest_stale(res_obj[i]);
+        }
     }
     return e;
 }
@@ -2915,13 +2965,12 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
         __unsafe_unretained id<MTLTexture> items[128];
         id strong[128];
         for (uint32_t i = 0; i < count; i++) {
-            strong[i] = [self get:U32(8 + i * 4) task:task kind:KIND_TEXTURE];
-            items[i] = strong[i];
-        }
-        if (tracing) for (uint32_t i = 0; i < count; i++) {
-            id<MTLTexture> x = strong[i];
-            HvObject *xo = [self object:U32(8 + i * 4) task:task];
-            fprintf(stderr, "trace:  tex %u ref %u %lux%lu fmt %lu type %u swz %d%d%d%d surface %s heap %d valid %d\n", index + i, U32(8 + i * 4), (unsigned long)x.width, (unsigned long)x.height, (unsigned long)x.pixelFormat, xo ? xo->entry[0] & 0xff : 0, x.swizzle.red, x.swizzle.green, x.swizzle.blue, x.swizzle.alpha, xo && xo->surface ? "yes" : "no", x.heap != nil, xo ? xo->host_valid : 0);
+            HvObject *xo = [self object:U32(8 + i * 4) task:task kind:KIND_TEXTURE];
+            id<MTLTexture> tx = xo ? xo->object : nil;
+            strong[i] = tx;
+            items[i] = tx;
+            if (tx && (tx.usage & MTLTextureUsageShaderWrite)) mark_guest_stale(xo);
+            if (tracing) fprintf(stderr, "trace:  tex %u ref %u %lux%lu fmt %lu type %u swz %d%d%d%d surface %s heap %d valid %d\n", index + i, U32(8 + i * 4), (unsigned long)tx.width, (unsigned long)tx.height, (unsigned long)tx.pixelFormat, xo ? xo->entry[0] & 0xff : 0, tx.swizzle.red, tx.swizzle.green, tx.swizzle.blue, tx.swizzle.alpha, xo && xo->surface ? "yes" : "no", tx.heap != nil, xo ? xo->host_valid : 0);
         }
         if (tag == 114) [e setFragmentTextures:items withRange:NSMakeRange(index, count)];
         else if (tag == 161) [e setTileTextures:items withRange:NSMakeRange(index, count)];
@@ -3015,17 +3064,22 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
         uint32_t count = U32(0);
         if (count > 256 || r.size < 8 + count * 4ull) break;
         __unsafe_unretained id<MTLResource> items[256];
+        HvObject *__strong objs[256];
         NSMutableArray *keep = [NSMutableArray new];
         uint32_t have = 0;
         for (uint32_t i = 0; i < count; i++) {
             HvObject *x = [self object:U32(8 + i * 4) task:task kinds:1u << KIND_BUFFER | 1u << KIND_TEXTURE];
             if (!x) continue;
             [keep addObject:x->object];
+            objs[have] = x;
             items[have++] = x->object;
         }
         if (!have) break;
-        if (tag == 135) [e useResources:items count:have usage:(MTLResourceUsage)U32(4)];
-        else [e useResources:items count:have usage:(MTLResourceUsage)U16(4) stages:(MTLRenderStages)U16(6)];
+        MTLResourceUsage usage = tag == 135 ? (MTLResourceUsage)U32(4) : (MTLResourceUsage)U16(4);
+        if (tag == 135) [e useResources:items count:have usage:usage];
+        else [e useResources:items count:have usage:usage stages:(MTLRenderStages)U16(6)];
+        if (usage & MTLResourceUsageWrite)
+            for (uint32_t i = 0; i < have; i++) mark_guest_stale(objs[i]);
         break;
     }
     case 101: {
@@ -3323,8 +3377,11 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
         __unsafe_unretained id<MTLTexture> items[128];
         id strong[128];
         for (uint32_t i = 0; i < count; i++) {
-            strong[i] = [self get:U32(8 + i * 4) task:task kind:KIND_TEXTURE];
-            items[i] = strong[i];
+            HvObject *to = [self object:U32(8 + i * 4) task:task kind:KIND_TEXTURE];
+            id<MTLTexture> tx = to ? to->object : nil;
+            strong[i] = tx;
+            items[i] = tx;
+            if (tx && (tx.usage & MTLTextureUsageShaderWrite)) mark_guest_stale(to);
         }
         [e setTextures:items withRange:NSMakeRange(index, count)];
         break;
@@ -3388,7 +3445,8 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
     }
     case 300: { /* buffer to texture */
         id<MTLBuffer> b = [self get:U32(0) task:task kind:KIND_BUFFER];
-        id<MTLTexture> t = [self get:U32(4) task:task kind:KIND_TEXTURE];
+        HvObject *to = [self object:U32(4) task:task kind:KIND_TEXTURE];
+        id<MTLTexture> t = to ? to->object : nil;
         if (!b || !t) break;
         MTLSize size;
         MTLOrigin origin;
@@ -3396,22 +3454,30 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
         HvTexDesc d = made_desc(t);
         uint64_t o[3] = {origin.x, origin.y, origin.z}, s[3] = {size.width, size.height, size.depth};
         why = hv_pvg_copy_buffer_texture_problem(&d, t.isFramebufferOnly, U16(0x50), U16(0x52), o, s, b.length, U64(8), U64(0x10), U64(0x18), U32(0x54));
-        if (!why)
+        if (!why) {
             [e copyFromBuffer:b sourceOffset:(NSUInteger)U64(8) sourceBytesPerRow:(NSUInteger)U64(0x10) sourceBytesPerImage:(NSUInteger)U64(0x18) sourceSize:size
                     toTexture:t destinationSlice:U16(0x50) destinationLevel:U16(0x52) destinationOrigin:origin options:(MTLBlitOption)U32(0x54)];
+            mark_guest_stale(to);
+        }
         break;
     }
     case 301: { /* buffer to buffer */
-        id<MTLBuffer> a = [self get:U32(0) task:task kind:KIND_BUFFER], b = [self get:U32(4) task:task kind:KIND_BUFFER];
+        id<MTLBuffer> a = [self get:U32(0) task:task kind:KIND_BUFFER];
+        HvObject *bo = [self object:U32(4) task:task kind:KIND_BUFFER];
+        id<MTLBuffer> b = bo ? bo->object : nil;
         if (!a || !b) break;
         uint64_t size = U64(0x18);
         if (!hv_pvg_range_ok(a.length, U64(8), size) || !hv_pvg_range_ok(b.length, U64(0x10), size)) why = "past the end of a buffer";
-        else [e copyFromBuffer:a sourceOffset:(NSUInteger)U64(8) toBuffer:b destinationOffset:(NSUInteger)U64(0x10) size:(NSUInteger)size];
+        else {
+            [e copyFromBuffer:a sourceOffset:(NSUInteger)U64(8) toBuffer:b destinationOffset:(NSUInteger)U64(0x10) size:(NSUInteger)size];
+            mark_guest_stale(bo);
+        }
         break;
     }
     case 302: { /* texture to buffer */
         id<MTLTexture> t = [self get:U32(0) task:task kind:KIND_TEXTURE];
-        id<MTLBuffer> b = [self get:U32(4) task:task kind:KIND_BUFFER];
+        HvObject *bo = [self object:U32(4) task:task kind:KIND_BUFFER];
+        id<MTLBuffer> b = bo ? bo->object : nil;
         if (!b || !t) break;
         MTLOrigin origin;
         MTLSize size;
@@ -3419,13 +3485,17 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
         HvTexDesc d = made_desc(t);
         uint64_t o[3] = {origin.x, origin.y, origin.z}, s[3] = {size.width, size.height, size.depth};
         why = hv_pvg_copy_buffer_texture_problem(&d, t.isFramebufferOnly, U16(0x50), U16(0x52), o, s, b.length, U64(0x38), U64(0x40), U64(0x48), U16(0x54));
-        if (!why)
+        if (!why) {
             [e copyFromTexture:t sourceSlice:U16(0x50) sourceLevel:U16(0x52) sourceOrigin:origin sourceSize:size toBuffer:b
                 destinationOffset:(NSUInteger)U64(0x38) destinationBytesPerRow:(NSUInteger)U64(0x40) destinationBytesPerImage:(NSUInteger)U64(0x48) options:(MTLBlitOption)U16(0x54)];
+            mark_guest_stale(bo);
+        }
         break;
     }
     case 303: { /* texture to texture */
-        id<MTLTexture> a = [self get:U32(0) task:task kind:KIND_TEXTURE], b = [self get:U32(4) task:task kind:KIND_TEXTURE];
+        id<MTLTexture> a = [self get:U32(0) task:task kind:KIND_TEXTURE];
+        HvObject *bo = [self object:U32(4) task:task kind:KIND_TEXTURE];
+        id<MTLTexture> b = bo ? bo->object : nil;
         if (!a || !b) break;
         MTLOrigin from, to;
         MTLSize size;
@@ -3433,26 +3503,35 @@ static void set_attachment(MTLRenderPassAttachmentDescriptor *d, const HvPassAtt
         HvTexDesc da = made_desc(a), db = made_desc(b);
         uint64_t f[3] = {from.x, from.y, from.z}, t[3] = {to.x, to.y, to.z}, s[3] = {size.width, size.height, size.depth};
         why = hv_pvg_copy_texture_problem(&da, a.isFramebufferOnly, U16(0x50), U16(0x52), f, &db, b.isFramebufferOnly, U16(0x54), U16(0x56), t, s, a == b);
-        if (!why)
+        if (!why) {
             [e copyFromTexture:a sourceSlice:U16(0x50) sourceLevel:U16(0x52) sourceOrigin:from sourceSize:size
                      toTexture:b destinationSlice:U16(0x54) destinationLevel:U16(0x56) destinationOrigin:to];
+            mark_guest_stale(bo);
+        }
         break;
     }
     case 306: { /* fill: {ref, location, length, value} */
-        id<MTLBuffer> b = [self get:U32(0) task:task kind:KIND_BUFFER];
+        HvObject *bo = [self object:U32(0) task:task kind:KIND_BUFFER];
+        id<MTLBuffer> b = bo ? bo->object : nil;
         if (!b) break;
         if (!hv_pvg_range_ok(b.length, U64(4), U64(12))) why = "past the end of the buffer";
-        else [e fillBuffer:b range:NSMakeRange((NSUInteger)U64(4), (NSUInteger)U64(12)) value:r.p[20]];
+        else {
+            [e fillBuffer:b range:NSMakeRange((NSUInteger)U64(4), (NSUInteger)U64(12)) value:r.p[20]];
+            mark_guest_stale(bo);
+        }
         break;
     }
     case 307: { /* mipmaps: of a colour texture the GPU can filter and render into */
-        id<MTLTexture> t = [self get:U32(0) task:task kind:KIND_TEXTURE];
+        HvObject *to = [self object:U32(0) task:task kind:KIND_TEXTURE];
+        id<MTLTexture> t = to ? to->object : nil;
         if (!t) break;
         HvTexDesc d = made_desc(t);
         if (d.mips < 2 || !hv_pvg_color_format(d.format) || !hv_pvg_filterable(d.format, caps) || d.samples != 1 || !hv_pvg_blittable(&d, t.isFramebufferOnly) || d.type == HV_TEX_BUFFER)
             why = "mipmaps of a texture that can't have them";
-        else if ([self charge:hv_pvg_sat_mul(hv_pvg_sat_mul((uint64_t)d.width * d.height, d.depth ? d.depth : 1), (d.array ? d.array : 1) * (d.type == 5 || d.type == 6 ? 12ull : 2ull))])
+        else if ([self charge:hv_pvg_sat_mul(hv_pvg_sat_mul((uint64_t)d.width * d.height, d.depth ? d.depth : 1), (d.array ? d.array : 1) * (d.type == 5 || d.type == 6 ? 12ull : 2ull))]) {
             [e generateMipmapsForTexture:t]; /* each level reads the last's pixels: all of them, at most twice the first's */
+            mark_guest_stale(to);
+        }
         break;
     }
     case 308: case 309: case 310: case 311: case 314: case 315: /* hints, and syncing memory Apple GPUs share */
@@ -4352,7 +4431,15 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
                 fprintf(stderr, "pvgres task %u ref %u mapped flags %x\n", task, res[i * 2], flags);
             }
         }
-        if (flags & 1) o->guest_stale = NO, o->host_valid = NO; /* the guest wrote it */
+        if (flags & 1) {
+            o->guest_stale = NO, o->host_valid = NO; /* the guest wrote it */
+            if (o->surface) o->surface->guest_stale = NO;
+        }
+        if (!o->guest_stale) sync_copied_surface(o->surface);
+        if (o->surface_standin && !o->host_valid && !o->guest_stale && o->surface && !o->surface->gone && o->surface->mapped) {
+            upload_surface_standin(o);
+            o->host_valid = YES;
+        }
         if (o->guest_backed && !o->host_valid) {
             if (!o->guest_stale) [self page:o toGuest:NO task:task blit:&blit commandBuffer:cb];
             o->host_valid = YES;
@@ -4383,9 +4470,8 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
     /* Bit 1: this exec writes it, so the guest's copy is out of date from here on. Never
        upload that over what the GPU drew: mostly zeros, which show as black boxes. */
     for (uint32_t i = 0; i < nres; i++)
-        if (res[i * 2 + 1] & 2) { /* and what it is made from: a texture in a heap is the heap's bytes */
-            for (HvObject *o = found[i]; o; o = o->parent) o->guest_stale = YES;
-        }
+        if (res[i * 2 + 1] & 2) /* and what it is made from: a texture in a heap is the heap's bytes */
+            mark_guest_stale(found[i]);
     /* Each command buffer read first, into segments: a pass's indirect draws are clamped before it (clampPass:). Each
        copy only as long as its segment says, the same range named again its first copy (the guest's bytes as read
        then), and at most HV_PVG_EXEC_COPY bytes of them all an exec: they are kept to its end, so an exec naming a
@@ -4817,6 +4903,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 - (void)showOnLayer:(uint64_t)mapping swappedAt:(uint64_t)swap_ns {
     HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]);
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
+    sync_copied_surface(surface);
     on_screen = mapping;
     BOOL half = surface->fourcc == 'RGhA';
     if (!screen_tex) fprintf(stderr, "hengevm: display scanout format %s (%ux%u)\n",
@@ -5128,6 +5215,7 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
     /* An unmapped id is not brought back to the screen (a late present below, or set_layer's): unmap let it go (5c) */
     HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]);
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
+    sync_copied_surface(surface);
     on_screen = mapping;
     if ([self hasDisplayLayer]) {
         late = NO;
@@ -5225,6 +5313,7 @@ static void read_env(HvReplay *r) {
     r->env.heap_log = getenv("HV_PVG_HEAP_LOG") != NULL, r->env.tally = getenv("HV_PVG_TALLY") != NULL;
     r->env.cursor_log = getenv("HV_PVG_CURSOR_LOG") != NULL, r->env.gpu_test = getenv("HV_PVG_GPU_TEST") != NULL;
     r->env.color_probe = getenv("HV_COLOR_PROBE") != NULL;
+    r->env.surface_log = getenv("HV_PVG_SURFACE_LOG") != NULL;
 }
 
 HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
@@ -5711,7 +5800,11 @@ void hv_pvg_metal_mapper_fence(HvPvgMetal *m, uint64_t index, uint64_t gen) {
 static void drop_surface(HvReplay *r, uint32_t mapping, BOOL stale) {
     HvObject *s = r->surfaces[@(mapping)];
     if (s && s->video) planar_keep(r, s->video); /* soon mapped again by another process, maybe: what was drawn is still there */
-    if (s) s->gone = YES; /* textures over it the guest still names are made anew (object:task:) */
+    if (s) {
+        s->gone = YES; /* textures over it the guest still names are made anew (object:task:) */
+        free(s->copied_srcs);
+        s->copied_srcs = NULL, s->copied_n = 0;
+    }
     /* and let go of now: kept until their refs were named again, they held the surface's pages and GPU mapping */
     for (HvObject *o in s ? s->over.allObjects : @[]) {
         HvTaskObjects *objs = task_objects(r, o->cache_task, NO);
