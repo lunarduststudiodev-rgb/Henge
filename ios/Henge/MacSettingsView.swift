@@ -29,18 +29,18 @@ struct MacSettingsView: View {
                     HStack(alignment: .firstTextBaseline) {
                         Text("\(mac.ramMB / 1024) GB").font(.system(size: 26, weight: .bold))
                         Spacer()
-                        Text("Up to \(Device.suggestedRAMGB) GB suggested on this \(Device.name)")
+                        Text("Up to \(Device.clampedSuggestedRAMGB) GB suggested on this \(Device.name)")
                             .font(.system(size: 13)).foregroundStyle(Desk.dim).multilineTextAlignment(.trailing)
                     }
                     Stepper("Memory", value: Binding(get: { mac.ramMB / 1024 }, set: { mac.ramMB = $0 * 1024; save() }), in: Device.selectableMemoryChoices)
                         .font(.system(size: 16))
                     MemoryNote(gb: mac.ramMB / 1024)
-                    if Device.memoryTooHigh(mac.ramMB / 1024) {
+                    if Device.memoryTooHigh(mac.ramMB / 1024) || mac.ramMB / 1024 > Device.maxSelectableRAMGB {
                         Button {
-                            mac.ramMB = Device.suggestedRAMGB * 1024
+                            mac.ramMB = Device.clampedSuggestedRAMGB * 1024
                             save()
                         } label: {
-                            Label("Set to suggested \(Device.suggestedRAMGB) GB", systemImage: "bolt.shield")
+                            Label("Set to suggested \(Device.clampedSuggestedRAMGB) GB", systemImage: "bolt.shield")
                                 .font(.system(size: 13, weight: .medium))
                         }
                         .buttonStyle(.bordered)

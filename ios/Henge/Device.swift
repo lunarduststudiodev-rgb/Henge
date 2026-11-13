@@ -64,12 +64,16 @@ extension Device {
 
     static func maxSelectableRAMGB(isPad: Bool, physicalMemoryMB: UInt64, suggestedRAMGB: Int,
                                    increasedMemory: Bool, extendedAddressing: Bool) -> Int {
-        guard increasedMemory else { return min(suggestedRAMGB, 3) }
-        guard extendedAddressing else { return min(suggestedRAMGB, 4) }
+        guard increasedMemory && extendedAddressing else { return min(suggestedRAMGB, 4) }
         if physicalMemoryMB >= 14_000 { return memoryChoices.upperBound }
         if physicalMemoryMB >= 10_000 { return isPad ? 8 : 6 }
         if isPad && physicalMemoryMB >= 7_000 { return 6 }
         return suggestedRAMGB
+    }
+
+    /// Suggested RAM clamped to what this device and its signed entitlements can actually select.
+    static var clampedSuggestedRAMGB: Int {
+        min(suggestedRAMGB, maxSelectableRAMGB)
     }
 
     /// Selectable guest RAM choices in GB for this device and its signed entitlements.

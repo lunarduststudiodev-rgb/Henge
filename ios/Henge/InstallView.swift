@@ -11,7 +11,7 @@ struct InstallView: View {
     @StateObject private var display = DisplayRouter()
     @State private var release = MacOSRelease.all.first(where: Installer.haveImage) ?? MacOSRelease.recommended
     @State private var name = "Mac"
-    @State private var ramGB = Device.suggestedRAMGB
+    @State private var ramGB = Device.clampedSuggestedRAMGB
     @State private var deleteAfter = false
     @State private var refresh = 0 // redraws the list when a download is deleted
     @State private var details = false
