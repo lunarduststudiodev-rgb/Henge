@@ -2600,6 +2600,71 @@ static void applyLightweightUIFlags(void) {
     }
 }
 
+// Populates System Profiler's "CPU Names" cache from IODeviceTree:/ model-number so About This Mac
+// displays the host device's model name instead of "Virtual Mac".
+static void applyHostModelName(void) {
+    @autoreleasepool {
+        io_registry_entry_t dt = IORegistryEntryFromPath(kIOMainPortDefault, "IODeviceTree:/");
+        if (!dt) return;
+        CFTypeRef prop = IORegistryEntryCreateCFProperty(dt, CFSTR("model-number"), kCFAllocatorDefault, 0);
+        IOObjectRelease(dt);
+        if (!prop) return;
+
+        NSString *modelName = nil;
+        if (CFGetTypeID(prop) == CFDataGetTypeID()) {
+            NSData *data = (__bridge NSData *)prop;
+            const char *bytes = data.bytes;
+            if (bytes && data.length) {
+                size_t len = strnlen(bytes, data.length);
+                if (len > 0) modelName = [[NSString alloc] initWithBytes:bytes length:len encoding:NSUTF8StringEncoding];
+            }
+        } else if (CFGetTypeID(prop) == CFStringGetTypeID()) {
+            modelName = [(__bridge NSString *)prop copy];
+        }
+        CFRelease(prop);
+
+        modelName = [modelName stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!modelName.length || [modelName isEqualToString:@"VM0001"]) return;
+
+        NSString *last4 = @"1234";
+        io_service_t pe = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPlatformExpertDevice"));
+        if (pe) {
+            CFTypeRef sn = IORegistryEntryCreateCFProperty(pe, CFSTR("IOPlatformSerialNumber"), kCFAllocatorDefault, 0);
+            IOObjectRelease(pe);
+            if (sn) {
+                if (CFGetTypeID(sn) == CFStringGetTypeID()) {
+                    NSString *serial = [(__bridge NSString *)sn stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+                    if (serial.length >= 4) last4 = [serial substringFromIndex:serial.length - 4];
+                    else if (serial.length > 0) last4 = serial;
+                }
+                CFRelease(sn);
+            }
+        }
+
+        CFStringRef sp = CFSTR("com.apple.SystemProfiler");
+        CFPropertyListRef existing = CFPreferencesCopyAppValue(CFSTR("CPU Names"), sp);
+        NSMutableDictionary *cpuNames = [NSMutableDictionary new];
+        if (existing) {
+            if (CFGetTypeID(existing) == CFDictionaryGetTypeID()) {
+                [cpuNames addEntriesFromDictionary:(__bridge NSDictionary *)existing];
+            }
+            CFRelease(existing);
+        }
+
+        NSMutableSet<NSString *> *locales = [NSMutableSet setWithObjects:@"en_US", @"en-US_US", nil];
+        NSString *autoLoc = NSLocale.autoupdatingCurrentLocale.localeIdentifier;
+        if (autoLoc.length) [locales addObject:autoLoc];
+        NSString *curLoc = NSLocale.currentLocale.localeIdentifier;
+        if (curLoc.length) [locales addObject:curLoc];
+
+        for (NSString *loc in locales) {
+            cpuNames[[NSString stringWithFormat:@"%@-%@", last4, loc]] = modelName;
+        }
+        CFPreferencesSetAppValue(CFSTR("CPU Names"), (__bridge CFDictionaryRef)cpuNames, sp);
+        CFPreferencesAppSynchronize(sp);
+    }
+}
+
 // MARK: - Native battery reporting (helper 39)
 // On macOS 14 Sonoma and macOS 15 Sequoia, AppleVirtualPlatform.kext carries
 // AppleVirtualPlatformPowerSource which attaches to virtual PCI 0x106b:0x1a07.
@@ -3165,7 +3230,10 @@ static void handleLine(const char *line) {
         linkSend([NSString stringWithFormat:@"stopped %u\n", id]); // a click Henge holds for it goes now
     });
     else if (!strcmp(line, "stop")) dispatch_async(scrollQueue, ^{ stopGlide(); });
-    else if (!strcmp(line, "lighten")) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ applyLightweightUIFlags(); });
+    else if (!strcmp(line, "lighten")) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        applyLightweightUIFlags();
+        applyHostModelName();
+    });
     else if (!strcmp(line, "ask")) dispatch_async(dispatch_get_main_queue(), ^{ showTrustSettings(); });
     else if (!strcmp(line, "tools")) {
         toolsWanted = YES; // now, before the device plugs the disk in: not ejected on sight
@@ -4430,9 +4498,10 @@ int main(int argc, char **argv) {
         watchTouchscreen();
         watchScreen();
         keepAwake();
-        if (!test && !getenv("HENGE_NO_LIGHTEN")) {
+        if (!test) {
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                applyLightweightUIFlags();
+                applyHostModelName();
+                if (!getenv("HENGE_NO_LIGHTEN")) applyLightweightUIFlags();
             });
         }
         if (!test || getenv("HENGE_AGENT_TEST_TOOLS")) watchToolsDisk();
