@@ -433,7 +433,7 @@ static void knobs_init(void) {
         hv_knob[i] = getenv(hv_knob_names[i]) ? atoi(getenv(hv_knob_names[i])) : 0;
     if (getenv("HV_NO_RAS") && !*getenv("HV_NO_RAS")) hv_knob[HV_K_NO_RAS] = 1;
     if (!getenv("HV_SYNC_WAIT")) hv_knob[HV_K_SYNCWAIT] = 1;
-    if (!getenv("HV_RANGE_DROP")) hv_knob[HV_K_RANGEDROP] = 1024;
+    if (!getenv("HV_RANGE_DROP")) hv_knob[HV_K_RANGEDROP] = 0;
     /* HV_SWITCH_FLUSH stays off unless asked (it was on by default from e540907): on the iPad (2026-11-09) its own
        checks found entries macOS had removed, a kernel page among them, still held when macOS asked for the flush
        it leaves out (tests/test_switch_flush.c). */

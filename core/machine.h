@@ -314,8 +314,8 @@ typedef struct HvTrace {
    names another address space) and put back when it comes back, as a TLB
    tagged by ASID keeps them. Any TLBI that could touch the address space
    (here or from another CPU) bumps gen; a stash whose gen moved is dropped. */
-#define HV_STASHES 16
-#define HV_STASH_CAP 2048
+#define HV_STASHES 8
+#define HV_STASH_CAP 1024
 typedef struct HvTlbStash {
     uint64_t ttbr0;      /* the address space (0: empty); read by other CPUs */
     uint64_t tcr0;       /* TCR_EL1's TTBR0 controls (low 16 bits) the entries were walked under; set before ttbr0 */

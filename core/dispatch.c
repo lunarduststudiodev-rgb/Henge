@@ -1299,6 +1299,22 @@ static inline uint64_t wfi_timer_now(void) {
 }
 
 static uint32_t wfe(HvCpu *cpu) {
+    HvMachine *m = cpu->m;
+    HvPerCpu *pcs = cpu->pc_state;
+    if (pcs && __atomic_load_n(&pcs->req_seq, __ATOMIC_ACQUIRE) != __atomic_load_n(&pcs->ack_seq, __ATOMIC_RELAXED)) {
+        hv_cpu_process_requests(cpu);
+        __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
+    }
+    if (__atomic_load_n(&m->stw_active, __ATOMIC_RELAXED) || __atomic_load_n(&m->pause_req, __ATOMIC_RELAXED) ||
+        __atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
+        return 1;
+    }
+    if (pcs && ((!(cpu->daif & HV_PSTATE_I) && __atomic_load_n(&pcs->irq_line, __ATOMIC_RELAXED)) ||
+                (!(cpu->daif & HV_PSTATE_F) && __atomic_load_n(&pcs->fiq_line, __ATOMIC_RELAXED)))) {
+        __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
+        return 1;
+    }
     static int spin = -1;
     if (spin < 0) spin = getenv("HV_WFE_SPIN") != NULL;
     uint64_t va = cpu->excl_addr;
@@ -1310,7 +1326,7 @@ static uint32_t wfe(HvCpu *cpu) {
     if (spin || va == ~0ull || (size != 1 && size != 2 && size != 4 && size != 8) || (va & (size - 1)) ||
         e->read_tag == HV_TLB_INVALID || e->read_tag + HV_TLB_ADJ != page) {
         __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED); /* let another CPU run: the dispatcher's way */
-        return 0;
+        return 1;
     }
     const void *host = (const void *)(uintptr_t)(va + (uint64_t)e->addend);
     uint64_t want = cpu->excl_val[0] & (size == 8 ? ~0ull : (1ull << (8 * size)) - 1);
@@ -1324,14 +1340,9 @@ static uint32_t wfe(HvCpu *cpu) {
         sleep_ok = wfi_timer_now() - t0 < 24 * 20;
     }
     uint64_t deadline = wfi_timer_now() + 24 * 50; /* 50 us at 24 MHz */
-    if (cpu->m->stats_interval) HV_CPU_COUNT(cpu, wfe_waits, 1);
-    HvPerCpu *pcs = cpu->pc_state;
+    if (m->stats_interval) HV_CPU_COUNT(cpu, wfe_waits, 1);
     int timed_out = 0;
     __atomic_store_n(&pcs->wfe_waiting, 1, __ATOMIC_RELAXED);
-    /* Not using the TLB while waiting on the already-resolved RAM address or sleeping below,
-       so peer hv_cpu_sync calls complete immediately instead of blocking on a spinning/depressed vCPU. */
-    __atomic_store_n(&pcs->tlb_live, 0, __ATOMIC_SEQ_CST);
-    hv_cpu_ack_wake(cpu);
     for (;;) {
         uint64_t v;
         switch (size) { /* LDAXR arms the host monitor too, so the WFE below wakes on a write */
@@ -1344,9 +1355,11 @@ static uint32_t wfe(HvCpu *cpu) {
             pcs->wfe_spin_rounds = 0; /* the word moved: whoever held it got to run */
             break;
         }
-        if (__atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED)) break; /* a request: neither progress nor a wasted round */
+        if (__atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED) ||
+            __atomic_load_n(&m->stw_active, __ATOMIC_RELAXED) ||
+            __atomic_load_n(&m->pause_req, __ATOMIC_RELAXED))
+            break; /* a request: neither progress nor a wasted round */
         if (wfi_timer_now() >= deadline) {
-            __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
             timed_out = 1;
             break;
         }
@@ -1354,23 +1367,34 @@ static uint32_t wfe(HvCpu *cpu) {
         else __asm__ volatile("yield" ::: "memory");
     }
     __asm__ volatile("clrex" ::: "memory");
+    if (pcs && __atomic_load_n(&pcs->req_seq, __ATOMIC_ACQUIRE) != __atomic_load_n(&pcs->ack_seq, __ATOMIC_RELAXED)) {
+        hv_cpu_process_requests(cpu);
+        __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
+    }
     if (timed_out) {
         /* A wait on another word, or on a new value of this one (it moved while the guest was between waits: its
            owner got to run), starts the count again. */
         if (pcs->wfe_spin_va != va || pcs->wfe_spin_val != want) pcs->wfe_spin_va = va, pcs->wfe_spin_val = want, pcs->wfe_spin_rounds = 0;
         if (++pcs->wfe_spin_rounds >= WFE_YIELD_ROUNDS) {
             pcs->wfe_spin_rounds = 0;
-            if (cpu->m->stats_interval) HV_CPU_COUNT(cpu, wfe_yields, 1);
+            if (m->stats_interval) HV_CPU_COUNT(cpu, wfe_yields, 1);
             /* Every other runnable thread here first, this one's priority lowered until it runs again (or 1 ms).
-               Skip sleeping if stop_the_world or a machine pause is waiting for this vCPU to reach the gate. */
-            if (!__atomic_load_n(&cpu->m->stw_active, __ATOMIC_RELAXED) &&
-                !__atomic_load_n(&cpu->m->pause_req, __ATOMIC_RELAXED))
+               Skip sleeping if stop_the_world, a machine pause, or an exit request is waiting for this vCPU. */
+            if (!__atomic_load_n(&m->stw_active, __ATOMIC_RELAXED) &&
+                !__atomic_load_n(&m->pause_req, __ATOMIC_RELAXED) &&
+                !__atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED))
                 thread_switch(MACH_PORT_NULL, SWITCH_OPTION_DEPRESS, 1);
         }
+        __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
     }
-    __atomic_store_n(&pcs->tlb_live, 1, __ATOMIC_SEQ_CST);
-    hv_cpu_process_requests(cpu);
+    if (pcs && __atomic_load_n(&pcs->req_seq, __ATOMIC_ACQUIRE) != __atomic_load_n(&pcs->ack_seq, __ATOMIC_RELAXED)) {
+        hv_cpu_process_requests(cpu);
+        __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
+    }
     __atomic_store_n(&pcs->wfe_waiting, 0, __ATOMIC_RELAXED); /* the core given up above is part of the spin */
+    if (__atomic_load_n(&m->stw_active, __ATOMIC_RELAXED) || __atomic_load_n(&m->pause_req, __ATOMIC_RELAXED) ||
+        __atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED))
+        return 1;
     return 0;
 }
 
@@ -1534,7 +1558,11 @@ static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in) {
         cpu->exit_reason = HV_EXIT_WFI;
         return 1;
     case HV_OP_WFE:
-        return wfe(cpu);
+        if (wfe(cpu)) {
+            cpu->pc = info->pc + 4;
+            return 1;
+        }
+        return 0;
     case HV_OP_UNDEF:
     default:
         hv_raise_undef(cpu, info->pc);
