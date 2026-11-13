@@ -111,7 +111,7 @@ int hv_vm_boot_display(HvBootDisplay *d, uint8_t *to, size_t cap) {
             uint64_t chunk_bytes = host_page <= 0x4000 ? (uint64_t)sizeof vec * host_page : 0;
             for (uint64_t chunk = 0; chunk + 0x1000 <= limit && !found;) {
                 uint64_t chunk_end = chunk_bytes && chunk + chunk_bytes < limit ? chunk + chunk_bytes : limit;
-                int have_vec = chunk_bytes && mincore(ram + chunk, (size_t)(chunk_end - chunk), vec) == 0;
+                int have_vec = board.ram_fd < 0 && chunk_bytes && mincore(ram + chunk, (size_t)(chunk_end - chunk), vec) == 0;
                 for (uint64_t off = chunk; off + 0x1000 <= chunk_end && !found; off += 0x4000) {
                     if (have_vec) {
                         size_t idx = (size_t)((off - chunk) / host_page);
