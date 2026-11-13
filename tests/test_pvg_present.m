@@ -85,6 +85,7 @@ static uint8_t *guest_ram;
 static uint8_t surface_desc[2][0x400];
 static uint8_t surface_record[128];
 static uint32_t sampler_record[7]; /* task 1 at 0x9000: a serialized sampler (test_sampler_made) */
+static uint8_t tex12_record[256];  /* task 1 at 0x9800: a type-12 texture entry (test_texture_type12) */
 
 /* Guest memory: task 1's object table, {type | size << 8, at, at >> 32} per ref; nothing else is read */
 static uint32_t table[16][3];
@@ -109,6 +110,7 @@ int hv_pvg_lite_task_read(HvPvgLite *p, uint32_t t, uint64_t a, void *o, uint32_
     }
     if (t == 1 && a == 0x8000 && n <= sizeof surface_record) return memcpy(o, surface_record, n), 0;
     if (t == 1 && a == 0x9000 && n <= sizeof sampler_record) return memcpy(o, sampler_record, n), 0;
+    if (t == 1 && a == 0x9800 && n <= sizeof tex12_record) return memcpy(o, tex12_record, n), 0;
     if (t == 3 && a == 0x3000 + 12 && n == 12) { /* task 3's ref 1: a buffer (test_tile_size_pages) */
         uint32_t e[3] = {1 | 16 << 8, 0x3100, 0};
         return memcpy(o, e, 12), 0;
@@ -2957,6 +2959,123 @@ static void test_colour_probe(void) {
     rmdir(dir);
 }
 
+@interface Tex12Device : NSObject
+@property(nonatomic, strong) MTLTextureDescriptor *made;
+@end
+@implementation Tex12Device
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d { _made = [d copy]; return [FakeTexture new]; }
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)f { (void)f; return 64; }
+@end
+
+static void test_texture_type12(void) {
+    printf("type 12 two-layout texture entries (v1, v2, and truncated)\n");
+    id saved_dev = r->device;
+    HvTexCaps saved_caps = r->caps;
+    uint32_t saved_entry[3];
+    memcpy(saved_entry, table[14], sizeof saved_entry);
+    uint8_t saved_rec[sizeof tex12_record];
+    memcpy(saved_rec, tex12_record, sizeof saved_rec);
+
+    Tex12Device *dev = [Tex12Device new];
+    r->device = (id)dev;
+    r->caps.samples |= (1u << 1) | (1u << 4);
+
+    /* Exact 176-byte type-12 layout seen from Chromium/ANGLE on macOS (2752x480 window -> 3072x512). */
+    memset(tex12_record, 0, sizeof tex12_record);
+    uint64_t length = 0x03000000ull, stride = 0x01800000ull, row = 0xc000ull;
+    uint32_t vpage = 0x1cd9u, w = 3072, h = 512, d = 1;
+    uint16_t mips = 1, slices = 1;
+    memcpy(tex12_record + 0, &length, 8);
+    memcpy(tex12_record + 8, &vpage, 4);
+    uint8_t *l1 = tex12_record + 12;
+    memcpy(l1 + 0, &mips, 2); memcpy(l1 + 2, &slices, 2);
+    memcpy(l1 + 12, &stride, 8);
+    l1[0x14] = 1, l1[0x15] = 1, l1[0x16] = 1, l1[0x17] = 4;
+    uint8_t *m1 = l1 + 0x18;
+    memcpy(m1 + 8, &stride, 8); memcpy(m1 + 0x10, &row, 8);
+    memcpy(m1 + 0x18, &w, 4); memcpy(m1 + 0x1c, &h, 4); memcpy(m1 + 0x20, &d, 4);
+    uint8_t *l2 = m1 + 36;
+    memcpy(l2 + 0, &mips, 2); memcpy(l2 + 2, &slices, 2);
+    memcpy(l2 + 4, &stride, 8); memcpy(l2 + 12, &stride, 8);
+    l2[0x14] = 1, l2[0x15] = 1, l2[0x16] = 1, l2[0x17] = 1;
+    uint8_t *rec = l2 + 0x18 + 36; /* offset 132 */
+    uint32_t hdr[3] = {0x14, 44, 14};
+    memcpy(rec, hdr, 12);
+    uint8_t *desc = rec + 12;
+    uint16_t format = 255 /* Depth24Unorm_Stencil8 -> Depth32Float_Stencil8 */, samples = 4, array = 1, options = 0x20;
+    desc[0] = (uint8_t)MTLTextureType2DMultisample, desc[1] = MTLTextureUsageRenderTarget;
+    memcpy(desc + 2, &format, 2);
+    memcpy(desc + 4, &w, 4); memcpy(desc + 8, &h, 4); memcpy(desc + 12, &d, 4);
+    memcpy(desc + 16, &mips, 2); memcpy(desc + 18, &samples, 2); memcpy(desc + 20, &array, 2); memcpy(desc + 22, &options, 2);
+
+    table[14][0] = 12 | (176u << 8), table[14][1] = 0x9800, table[14][2] = 0;
+    [r->tasks[1] removeObjectForKey:@14];
+    HvObject *o = [r object:14 task:1];
+    CHECK(o && o->object && o->kind == KIND_TEXTURE && dev.made != nil, "type 12 (176 bytes): built as KIND_TEXTURE");
+    CHECK(dev.made.width == 3072 && dev.made.height == 512 && dev.made.sampleCount == 4 &&
+          dev.made.pixelFormat == MTLPixelFormatDepth32Float_Stencil8,
+          "type 12 descriptor decoded (%lux%lu samples %lu fmt %lu)",
+          (unsigned long)dev.made.width, (unsigned long)dev.made.height,
+          (unsigned long)dev.made.sampleCount, (unsigned long)dev.made.pixelFormat);
+
+    /* Truncated type 12 (size 140 < 132 + 12 + 24): safely refused without overrun. */
+    dev.made = nil;
+    table[14][0] = 12 | (140u << 8), table[14][1] = 0x9800, table[14][2] = 0;
+    [r->tasks[1] removeObjectForKey:@14];
+    o = [r object:14 task:1];
+    CHECK(o && !o->object && o->kind == KIND_NONE && dev.made == nil, "truncated type 12: safely refused");
+
+    [r->tasks[1] removeObjectForKey:@14];
+    r->device = saved_dev;
+    r->caps = saved_caps;
+    memcpy(table[14], saved_entry, sizeof saved_entry);
+    memcpy(tex12_record, saved_rec, sizeof saved_rec);
+}
+
+static void test_dock_badge_metal_fixes(void) {
+    CHECK(pixel_bytes((MTLPixelFormat)552) == 8 && pixel_bytes((MTLPixelFormat)553) == 8 &&
+          pixel_bytes((MTLPixelFormat)554) == 4 && pixel_bytes((MTLPixelFormat)555) == 4,
+          "pixel_bytes supports XR10 formats 552..555");
+    CHECK(is_srgb_format(71) && is_srgb_format(81) && is_srgb_format(553) && is_srgb_format(555) && !is_srgb_format(70),
+          "is_srgb_format matches sRGB formats");
+
+    uint8_t v2[0x27] = {0};
+    uint16_t fmt = 70, mips = 1, samples = 1, array = 1;
+    uint32_t usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, w = 16, h = 16, depth = 1;
+    v2[0] = (uint8_t)MTLTextureType2D;
+    memcpy(v2 + 1, &fmt, 2);
+    memcpy(v2 + 3, &usage, 4);
+    memcpy(v2 + 7, &w, 4);
+    memcpy(v2 + 11, &h, 4);
+    memcpy(v2 + 15, &depth, 4);
+    memcpy(v2 + 19, &mips, 2);
+    memcpy(v2 + 21, &samples, 2);
+    memcpy(v2 + 23, &array, 2);
+    v2[0x23] = (uint8_t)MTLTextureSwizzleBlue;
+    v2[0x24] = (uint8_t)MTLTextureSwizzleGreen;
+    v2[0x25] = (uint8_t)MTLTextureSwizzleRed;
+    v2[0x26] = (uint8_t)MTLTextureSwizzleAlpha;
+    MTLTextureDescriptor *sw_t = descriptor_v2(v2);
+    CHECK(sw_t.swizzle.red == MTLTextureSwizzleRed && sw_t.swizzle.blue == MTLTextureSwizzleBlue,
+          "descriptor_v2 clears non-identity swizzle for ShaderWrite");
+
+    MTLTextureDescriptor *srgb_t = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
+                                                                                      width:16
+                                                                                     height:16
+                                                                                  mipmapped:NO];
+    srgb_t.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    srgb_t.allowGPUOptimizedContents = YES;
+    id<MTLDevice> saved_dev = r->device;
+    Tex12Device *dev = [Tex12Device new];
+    r->device = (id<MTLDevice>)dev;
+    [r refuse:srgb_t what:@"srgb linear test" buffer:4096 offset:0 row:256];
+    CHECK(!srgb_t.allowGPUOptimizedContents &&
+          (srgb_t.usage & MTLTextureUsageShaderWrite) == 0 &&
+          (srgb_t.usage & MTLTextureUsageShaderRead) != 0,
+          "refuse: clears allowGPUOptimizedContents for linear buffers and strips ShaderWrite on sRGB");
+    r->device = saved_dev;
+}
+
 #ifdef HV_PVG_TEST_NO_METAL /* test_pvg_present_nometal: these check pvg_metal.m against Metal's own descriptor objects,
                                which that build hasn't got (tests/pvg_nometal_stubs.m); test_pvg_present_nogpu runs them */
 #define METAL_OBJECTS(test) printf("%s: skipped, it needs Metal's own descriptors (run in test_pvg_present_nogpu)\n", #test)
@@ -3040,6 +3159,8 @@ int main(int argc, char **argv) {
     test_stale_map();
     test_exec_throw();
         test_view_chains();
+        test_texture_type12();
+        test_dock_badge_metal_fixes();
         METAL_OBJECTS(test_pipeline_checks);
         METAL_OBJECTS(test_building_note);
 #endif

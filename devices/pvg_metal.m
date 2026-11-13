@@ -655,9 +655,9 @@ static NSUInteger pixel_bytes(MTLPixelFormat f) {
     case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRG16Float: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB:
     case MTLPixelFormatRGBA8Snorm: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
     case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG11B10Float: case MTLPixelFormatRGB9E5Float:
-    case MTLPixelFormatBGR10A2Unorm: return 4;
+    case MTLPixelFormatBGR10A2Unorm: case 554: case 555: return 4;
     case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRG32Float: case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Snorm:
-    case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA16Float: return 8;
+    case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA16Float: case 552: case 553: return 8;
     case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: case MTLPixelFormatRGBA32Float: return 16;
     default: return 0;
     }
@@ -668,9 +668,7 @@ static NSUInteger pixel_bytes(MTLPixelFormat f) {
 static BOOL linear_texture_fits(id<MTLDevice> device, MTLTextureDescriptor *t, uint64_t offset, uint64_t row, NSUInteger length) {
     NSUInteger bpp = pixel_bytes(t.pixelFormat);
     if (!bpp) return YES;
-    static NSUInteger cached_align;
-    if (!cached_align) cached_align = [device minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm] ?: 64;
-    NSUInteger align = cached_align;
+    NSUInteger align = [device minimumLinearTextureAlignmentForPixelFormat:t.pixelFormat] ?: 64;
     uint64_t last_row = (uint64_t)t.width * bpp;
     BOOL wrap = t.height > 1 && row > (UINT64_MAX - last_row) / (t.height - 1);
     uint64_t needed = wrap ? UINT64_MAX : (t.height ? (t.height - 1) * row + last_row : 0);
@@ -945,7 +943,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     t.mipmapLevelCount = mips, t.sampleCount = samples, t.arrayLength = array;
     descriptor_common(t, d[0], options);
     t.swizzle = safe_swizzle(d + 0x23, d, 0x27, "texture");
-    if (t.usage & MTLTextureUsageRenderTarget) /* Metal aborts on a swizzled render target */
+    if (t.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) /* Metal aborts on a swizzled render target or ShaderWrite texture */
         t.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
     return t;
 }
@@ -1006,11 +1004,20 @@ static HvTexDesc made_desc(id<MTLTexture> t) {
    a bad one is told, and its object stays nil. len, offset and row: the buffer under a linear texture (len 0: none).
    Usage bits Metal doesn't take are dropped from t first, not refused: they are hints, and a texture refused for one
    is a texture missing (macOS's Liquid Glass blurs into textures with private bit 0x10000, and drew black without them). */
+static BOOL is_srgb_format(uint32_t f) {
+    return f == 11 || f == 31 || f == 71 || f == 81 || f == 553 || f == 555;
+}
+
 - (BOOL)refuse:(MTLTextureDescriptor *)t what:(NSString *)what buffer:(uint64_t)len offset:(uint64_t)offset row:(uint64_t)row {
+    if (len) t.allowGPUOptimizedContents = NO;
     uint64_t extra = (uint64_t)t.usage & ~(uint64_t)HV_PVG_USAGE_OK;
     if (extra) {
         [self complain:[NSString stringWithFormat:@"%@: usage bits %llx dropped", what, extra]];
         t.usage = (MTLTextureUsage)((uint64_t)t.usage & HV_PVG_USAGE_OK);
+    }
+    if ((t.usage & MTLTextureUsageShaderWrite) && is_srgb_format((uint32_t)t.pixelFormat)) {
+        [self complain:[NSString stringWithFormat:@"%@: ShaderWrite dropped on sRGB format %lu", what, (unsigned long)t.pixelFormat]];
+        t.usage &= ~MTLTextureUsageShaderWrite;
     }
     HvTexDesc d = tex_desc(t);
     const char *why;
@@ -1536,12 +1543,12 @@ static void pipeline_timed(HvReplay *r, double t) {
     if (!o->object) [self complain:@"buffer failed"];
 }
 
-- (void)makeTexture:(HvObject *)o at:(uint64_t)at size:(uint32_t)size task:(uint32_t)task {
+- (void)makeTexture:(HvObject *)o at:(uint64_t)at size:(uint32_t)size task:(uint32_t)task twoPlanes:(BOOL)twoPlanes {
     if (size < 12 + 0x18) { [self complain:[NSString stringWithFormat:@"texture entry of %u bytes", size]]; return; }
     NSMutableData *all = [NSMutableData dataWithLength:size];
     if (hv_pvg_lite_task_read(lite, task, at, all.mutableBytes, size)) return;
     const uint8_t *d = all.bytes;
-    /* {length, page}, a layout table, {tag, size, ref}, the description. */
+    /* {length, page}, a layout table (two layouts for type 12), {tag, size, ref}, the description. */
     memcpy(&o->length, d, 8);
     memcpy(&o->vpage, d + 8, 4);
     const uint8_t *layout = d + 12;
@@ -1551,13 +1558,34 @@ static void pipeline_timed(HvReplay *r, double t) {
     memcpy(&o->tex_stride, layout + 12, 8);
     o->tex_block_h = layout[0x15];
     uint32_t table = o->tex_mips * 36;
-    if (12 + 0x18 + table + 12 > size) { [self complain:@"texture entry too small"]; return; }
+    uint64_t need = 12 + 0x18 + (uint64_t)table;
+    if (need + 12 > size) { [self complain:@"texture entry too small"]; return; }
     const uint8_t *rec = layout + 0x18 + table;
+    if (twoPlanes) {
+        if (need + 0x18 > size) { [self complain:@"texture entry too small"]; return; }
+        const uint8_t *layout2 = rec;
+        uint32_t mips2 = *(const uint16_t *)layout2 & 0x3fff;
+        uint32_t table2 = mips2 * 36;
+        need += 0x18 + (uint64_t)table2;
+        if (need + 12 > size) { [self complain:@"texture entry too small"]; return; }
+        rec = layout2 + 0x18 + table2;
+    }
     uint32_t tag = *(const uint32_t *)rec;
     BOOL v2 = tag == 0x34 || tag == 0x39;
-    if (12 + 0x18 + table + 12 + (v2 ? 0x27 : 0x18) > size) { [self complain:@"texture entry cut short"]; return; }
+    if (twoPlanes && tag != 1 && tag != 0x14 && !v2) {
+        NSMutableString *m = [NSMutableString stringWithFormat:@"texture type 12 unexpected tag 0x%x at %llu of %u:", tag, (unsigned long long)(rec - d), size];
+        for (uint32_t i = 0; i + 4 <= size; i += 4) {
+            uint32_t w = 0;
+            memcpy(&w, d + i, 4);
+            [m appendFormat:@" %08x", w];
+        }
+        [self complain:m];
+        return;
+    }
+    if (need + 12 + (v2 ? 0x27 : 0x18) > size) { [self complain:@"texture entry cut short"]; return; }
     MTLTextureDescriptor *t = v2 ? descriptor_v2(rec + 12) : descriptor_v1(rec + 12);
     t.storageMode = MTLStorageModePrivate;
+    MTLTextureUsage orig_usage = t.usage;
     t.usage |= MTLTextureUsageShaderRead;
     if ([self refuse:t what:@"texture"]) return;
     /* Its layout in the guest's memory, checked once here so the copies between the two (page:toGuest:) can trust it:
@@ -1580,8 +1608,16 @@ static void pipeline_timed(HvReplay *r, double t) {
         memcpy(o->tex_layout, layout + 0x18, table);
     }
     o->object = [device newTextureWithDescriptor:t];
+    if (!o->object && t.usage != orig_usage) {
+        t.usage = orig_usage;
+        if (![self refuse:t what:@"texture"]) o->object = [device newTextureWithDescriptor:t];
+    }
     if (o->object) o->guest_backed = YES;
     else [self complain:[NSString stringWithFormat:@"texture format %lu %lux%lu failed", (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height]];
+}
+
+- (void)makeTexture:(HvObject *)o at:(uint64_t)at size:(uint32_t)size task:(uint32_t)task {
+    [self makeTexture:o at:at size:size task:task twoPlanes:NO];
 }
 
 /* A texture over a buffer: {tag 9, size, ref, buffer ref, offset, bytes per row, description}. */
@@ -1643,6 +1679,10 @@ static void pipeline_timed(HvReplay *r, double t) {
         uint32_t vf = v.format;
         if (vf == 255) vf = (uint32_t)MTLPixelFormatDepth32Float_Stencil8;
         if (vf == 262) vf = (uint32_t)MTLPixelFormatX32_Stencil8;
+        if (vf != (uint32_t)from.pixelFormat && !(from.usage & MTLTextureUsagePixelFormatView)) {
+            [self complain:[NSString stringWithFormat:@"view tag %u: format %u over %lu without PixelFormatView", h.tag, v.format, (unsigned long)from.pixelFormat]];
+            return;
+        }
         if (h.tag == 7) o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)vf];
         else if (h.tag == 8) o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)vf textureType:(MTLTextureType)v.type levels:levels slices:slices];
         else o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)vf textureType:(MTLTextureType)v.type levels:levels slices:slices
@@ -1663,6 +1703,7 @@ static void pipeline_timed(HvReplay *r, double t) {
     if (!buffer) { [self complain:@"linear texture without a buffer"]; return; }
     MTLTextureDescriptor *t = h.tag == 0x37 ? descriptor_v2(h.d) : descriptor_v1(h.d);
     t.resourceOptions = buffer.resourceOptions;
+    t.allowGPUOptimizedContents = NO;
     set_framebuffer_only(t, NO);
     t.usage |= MTLTextureUsageShaderRead;
     if ([self refuse:t what:@"linear texture" buffer:buffer.length offset:h.offset row:h.row]) return;
@@ -2204,11 +2245,16 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
     if (!surface) return;
     MTLTextureDescriptor *t = h.tag == 0x39 ? descriptor_v2(h.d) : descriptor_v1(h.d);
     t.storageMode = MTLStorageModeShared;
+    t.allowGPUOptimizedContents = NO;
     set_framebuffer_only(t, NO);
     t.usage |= MTLTextureUsageShaderRead;
-    /* Metal aborts on a swizzled render target: views over it (tags 7/8/0x1b) can still swizzle.
-       Preserve swizzle on non-render-targets. */
-    if (t.usage & MTLTextureUsageRenderTarget) {
+    if ((t.usage & MTLTextureUsageShaderWrite) && is_srgb_format((uint32_t)t.pixelFormat)) {
+        [self complain:[NSString stringWithFormat:@"surface %llu: ShaderWrite dropped on sRGB format %lu", h.mapping, (unsigned long)t.pixelFormat]];
+        t.usage &= ~MTLTextureUsageShaderWrite;
+    }
+    /* Metal aborts on a swizzled render target or ShaderWrite texture: views over it (tags 7/8/0x1b) can still swizzle.
+       Preserve swizzle on read-only textures. */
+    if (t.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) {
         MTLTextureSwizzleChannels sw = t.swizzle;
         if (sw.red != MTLTextureSwizzleRed || sw.green != MTLTextureSwizzleGreen || sw.blue != MTLTextureSwizzleBlue || sw.alpha != MTLTextureSwizzleAlpha) {
             static int told;
@@ -2240,18 +2286,33 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
         }
     }
     if (!o->object && surface->object) {
-        NSUInteger req_row = surface->row >= t.width * pixel_bytes(t.pixelFormat) ? surface->row : t.width * pixel_bytes(t.pixelFormat);
-        NSUInteger align = [device minimumLinearTextureAlignmentForPixelFormat:t.pixelFormat];
-        if (align && (req_row % align)) req_row = (req_row + align - 1) & ~(align - 1);
-        if (linear_texture_fits(device, t, surface->first, req_row, [(id<MTLBuffer>)surface->object length]))
-            o->object = [(id<MTLBuffer>)surface->object newTextureWithDescriptor:t offset:surface->first bytesPerRow:req_row];
+        id<MTLBuffer> buf = surface->object;
+        t.allowGPUOptimizedContents = NO;
+        /* Only alias the guest buffer directly when surface->row already satisfies hardware alignment and bounds,
+           otherwise rows would be read/written with the wrong stride. */
+        if (![self refuse:t what:@"surface linear texture" buffer:buf.length offset:surface->first row:surface->row] &&
+            linear_texture_fits(device, t, surface->first, surface->row, buf.length)) {
+            o->object = [buf newTextureWithDescriptor:t offset:surface->first bytesPerRow:(NSUInteger)surface->row];
+            if (!o->object && (t.usage & ~0x3full)) {
+                t.usage &= 0x3full;
+                o->object = [buf newTextureWithDescriptor:t offset:surface->first bytesPerRow:(NSUInteger)surface->row];
+            }
+            if (!o->object && (t.usage & MTLTextureUsageShaderWrite)) {
+                t.usage &= ~MTLTextureUsageShaderWrite;
+                o->object = [buf newTextureWithDescriptor:t offset:surface->first bytesPerRow:(NSUInteger)surface->row];
+            }
+            if (!o->object && t.usage != MTLTextureUsageShaderRead && !(t.usage & MTLTextureUsageRenderTarget)) {
+                t.usage = MTLTextureUsageShaderRead;
+                o->object = [buf newTextureWithDescriptor:t offset:surface->first bytesPerRow:(NSUInteger)surface->row];
+            }
+        }
     }
     if (!o->object) {
         [self complain:[NSString stringWithFormat:@"surface %llu: format %lu row %llu not possible", h.mapping, (unsigned long)t.pixelFormat, surface->row]];
         t.storageMode = MTLStorageModeShared;
         if (![self refuse:t what:@"surface stand-in"]) {
             o->object = [device newTextureWithDescriptor:t];
-            if (o->object && surface->mapped) {
+            if (o->object && surface->mapped && t.textureType == MTLTextureType2D) {
                 NSUInteger bpp = pixel_bytes(t.pixelFormat);
                 NSUInteger src_row = (NSUInteger)surface->row;
                 uint64_t needed = t.height ? (t.height - 1) * surface->row + (uint64_t)t.width * bpp : 0;
@@ -2352,6 +2413,8 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
     case OBJ_BUFFER: [self makeBuffer:o at:at task:task]; break;
     case OBJ_TEXTURE: case 3: /* 3: macOS 13's driver, the same {length, page, layout, mips, record} entry */
         [self makeTexture:o at:at size:size task:task]; break;
+    case 12: /* two-layout texture (e.g. combined depth+stencil or dual-plane): two layout headers + mip tables before {tag, size, ref, desc} */
+        [self makeTexture:o at:at size:size task:task twoPlanes:YES]; break;
     case OBJ_FUNCTION: o->object = [self makeFunction:at task:task]; break;
     case OBJ_SERIALIZED: o->object = [self makeSerialized:at length:size task:task kind:&serialized into:o]; break;
     case OBJ_LINEAR_TEXTURE: case 9: [self makeLinearTexture:o at:at size:size task:task]; break;
@@ -2376,7 +2439,7 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
     o->kind = !o->object ? KIND_NONE
             : type == OBJ_SERIALIZED ? serialized
             : type == OBJ_BUFFER || type == 19 || type == 14 ? KIND_BUFFER
-            : type == OBJ_TEXTURE || type == 3 || type == OBJ_LINEAR_TEXTURE || type == 9 || type == OBJ_MAPPED_TEXTURE ? KIND_TEXTURE
+            : type == OBJ_TEXTURE || type == 3 || type == 12 || type == OBJ_LINEAR_TEXTURE || type == 9 || type == OBJ_MAPPED_TEXTURE ? KIND_TEXTURE
             : type == OBJ_FUNCTION ? KIND_FUNCTION
             : type == 13 ? KIND_HEAP : KIND_NONE;
     if (o->kind == KIND_NONE) o->object = nil;
