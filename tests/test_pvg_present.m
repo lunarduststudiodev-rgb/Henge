@@ -3088,6 +3088,85 @@ static void test_dock_badge_metal_fixes(void) {
     r->device = saved_dev;
 }
 
+@interface StandinTex : NSObject
+@property(nonatomic) NSUInteger textureType, pixelFormat, width, height, replaceCalls, lastRow;
+@property(nonatomic) const void *lastBytes;
+@property(nonatomic) BOOL isFramebufferOnly;
+@end
+@implementation StandinTex
+- (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row {
+    _replaceCalls++;
+    _lastBytes = bytes;
+    _lastRow = row;
+}
+@end
+
+@interface StandinBlit : NSObject
+@property(nonatomic) NSUInteger copyCalls, dstOff, dstRow;
+@end
+@implementation StandinBlit
+- (void)copyFromTexture:(id)t sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)sz
+               toBuffer:(id)b destinationOffset:(NSUInteger)off destinationBytesPerRow:(NSUInteger)row
+ destinationBytesPerImage:(NSUInteger)img {
+    _copyCalls++;
+    _dstOff = off;
+    _dstRow = row;
+}
+@end
+
+@interface StandinCB : NSObject
+@property(nonatomic, strong) StandinBlit *blit;
+@end
+@implementation StandinCB
+- (id)blitCommandEncoder {
+    if (!_blit) _blit = [StandinBlit new];
+    return _blit;
+}
+@end
+
+static void test_surface_standin_view_and_writeback(void) {
+    uint8_t raw[4096] = {0};
+    FakeBuffer *buf = [FakeBuffer new];
+    buf.length = sizeof raw;
+
+    HvObject *surface = [HvObject new];
+    surface->mapped = raw;
+    surface->length = sizeof raw;
+    surface->row = 80; /* 20x20 BGRA8: 16-byte aligned, not 64-byte aligned */
+    surface->first = 16;
+    surface->object = buf;
+
+    StandinTex *tex = [StandinTex new];
+    tex.textureType = MTLTextureType2D;
+    tex.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    tex.width = 20;
+    tex.height = 20;
+
+    HvObject *standin = [HvObject new];
+    standin->surface = surface;
+    standin->surface_standin = YES;
+    standin->object = tex;
+
+    HvObject *view = [HvObject new];
+    view->parent = standin;
+    view->surface = surface;
+    view->object = tex;
+
+    CHECK(surface_standin_root(standin) == standin && surface_standin_root(view) == standin,
+          "surface_standin_root resolves stand-in through view parent chain");
+
+    upload_surface_standin(standin);
+    CHECK(tex.replaceCalls == 1 && tex.lastRow == 80 && tex.lastBytes == raw + 16,
+          "upload_surface_standin uses surface->row (%lu) and surface->first", (unsigned long)tex.lastRow);
+
+    StandinCB *cb = [StandinCB new];
+    id<MTLBlitCommandEncoder> enc = nil;
+    download_surface_standin(standin, (id<MTLCommandBuffer>)cb, &enc);
+    CHECK(cb.blit && cb.blit.copyCalls == 1 && cb.blit.dstOff == 16 && cb.blit.dstRow == 80,
+          "download_surface_standin blits stand-in back at surface->first (%lu) with surface->row (%lu)",
+          (unsigned long)cb.blit.dstOff, (unsigned long)cb.blit.dstRow);
+}
+
 @interface StaleTex : NSObject
 @property(nonatomic) NSUInteger textureType, pixelFormat, width, height, depth, mipmapLevelCount, sampleCount, arrayLength, usage;
 @property(nonatomic) NSUInteger cpuCacheMode, storageMode, hazardTrackingMode, parentRelativeLevel, parentRelativeSlice;
@@ -3350,6 +3429,7 @@ int main(int argc, char **argv) {
         test_view_chains();
         test_texture_type12();
         test_dock_badge_metal_fixes();
+        test_surface_standin_view_and_writeback();
         test_guest_stale_writes();
         METAL_OBJECTS(test_guest_stale_render_pass);
         METAL_OBJECTS(test_pipeline_checks);
