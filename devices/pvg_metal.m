@@ -175,6 +175,11 @@ static BOOL presenter_commit(HvReplay *r, uint64_t generation, CAMetalLayer *tar
 static PresenterPick presenter_pick(HvReplay *r, uint64_t generation, CAMetalLayer *target, uint32_t W, uint32_t H, BOOL fits,
                                     BOOL half, id<MTLCommandBuffer> cb, uint64_t *swap_ns);
 
+typedef struct {
+    uint32_t page;
+    const void *src;
+} HvCopiedPage;
+
 /* What is known about a made object, so a reused ref is noticed. */
 @interface HvObject : NSObject {
 @public
@@ -198,8 +203,9 @@ static PresenterPick presenter_pick(HvReplay *r, uint64_t generation, CAMetalLay
     uint8_t tex_block_h;
     uint8_t *tex_layout; /* the mip table, 36 bytes each */
     BOOL guest_backed, surface_standin;
-    void **copied_srcs; /* surface pages not on a 16 KB boundary: copied here instead of zero-copy vm_remap */
-    uint64_t copied_n;
+    HvCopiedPage *copied_pages; /* surface pages not on a 16 KB boundary: copied here instead of zero-copy vm_remap */
+    uint32_t copied_n;
+    uint64_t copied_sync_tick;
     uint32_t retries; /* a mapped texture made before its surface was described: tried again on later uses */
     uint8_t described[0x30]; /* a surface: the older driver's compact description it was made from */
     uint64_t on_mapping; /* a mapped texture: the surface id it is over */
@@ -270,7 +276,7 @@ static PresenterPick presenter_pick(HvReplay *r, uint64_t generation, CAMetalLay
     }
     if (heap_total) atomic_fetch_sub(heap_total, heap_size);
     free(pages);
-    free(copied_srcs);
+    free(copied_pages);
     free(tex_layout);
 }
 @end
@@ -414,6 +420,7 @@ static void over_surface(HvObject *o) {
     uint32_t tasks_forgot[2]; /* tasks deleted, and defined again before a delete, that held anything: logged at 1, 10, 100... (worker) */
     uint64_t execs, draws, synced, remaps, remaps_failed;
     uint64_t pages_misaligned; /* a surface's guest pages not on a 16 KB boundary: zeros, never shifted bytes (S3-2) */
+    uint64_t copied_sync_seq;
     /* An exec's resources' objects (exec), kept here, not freed at its end: a throw out of the exec (caught in
        hv_pvg_metal_submit; ARC doesn't release on one) leaves them held only until the next exec clears them. */
     HvObject *__strong *exec_found;
@@ -2146,18 +2153,22 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
     uint64_t misaligned = 0;
     for (uint64_t i = 0; i < n; i++) {
         void *src = (pages[i] & 1) ? hv_pvg_lite_phys(lite, (uint64_t)(pages[i] & ~1u) << 12, 0x4000) : NULL;
-        if ((uintptr_t)src & 0x3fff) {
-            /* vm_remap requires 16 KB alignment; copy valid guest RAM instead of leaving zeros. */
-            memcpy(surface->mapped + (i << 14), src, 0x4000);
-            if (!surface->copied_srcs) surface->copied_srcs = calloc(n, sizeof(void *));
-            if (surface->copied_srcs) surface->copied_srcs[i] = src;
-            src = NULL;
-            misaligned++;
-        }
+        if ((uintptr_t)src & 0x3fff) misaligned++;
         srcs[i] = src;
     }
     if (misaligned) {
-        surface->copied_n = surface->copied_srcs ? n : 0;
+        surface->copied_pages = calloc(misaligned, sizeof(HvCopiedPage));
+        uint32_t k = 0;
+        for (uint64_t i = 0; i < n; i++) {
+            if ((uintptr_t)srcs[i] & 0x3fff) {
+                /* vm_remap requires 16 KB alignment; copy valid guest RAM instead of leaving zeros. */
+                memcpy(surface->mapped + (i << 14), srcs[i], 0x4000);
+                if (surface->copied_pages)
+                    surface->copied_pages[k++] = (HvCopiedPage){ .page = (uint32_t)i, .src = srcs[i] };
+                srcs[i] = NULL;
+            }
+        }
+        surface->copied_n = k;
         pages_misaligned += misaligned;
         [self complain:[NSString stringWithFormat:@"surface pages not on a 16 KB boundary: copied instead of zero-copy (fourcc %08x)", surface->fourcc]];
     }
@@ -2229,9 +2240,9 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
 
 /* Refresh misaligned surface pages copied from guest RAM when the GPU hasn't dirtied the surface. */
 static void sync_copied_surface(HvObject *s) {
-    if (!s || s->gone || !s->mapped || !s->copied_srcs || s->guest_stale) return;
-    for (uint64_t i = 0; i < s->copied_n; i++)
-        if (s->copied_srcs[i]) memcpy(s->mapped + (i << 14), s->copied_srcs[i], 0x4000);
+    if (!s || s->gone || !s->mapped || !s->copied_pages || s->guest_stale) return;
+    for (uint32_t i = 0; i < s->copied_n; i++)
+        memcpy((uint8_t *)s->mapped + ((size_t)s->copied_pages[i].page << 14), s->copied_pages[i].src, 0x4000);
 }
 
 /* Upload guest surface bytes into a non-linear surface stand-in texture (MTLStorageModeShared). */
@@ -4407,6 +4418,7 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
     NSMutableArray<HvVideo *> *video = nil; /* the video surfaces this exec uses: it is their newest reader */
     NSMutableArray<HvObject *> *video_by = nil; /* a mapping of each that it names */
     NSMutableData *video_flags = nil; /* and all the flags it names it with, through any of them (uint32_t each) */
+    uint64_t sync_tick = ++copied_sync_seq;
     for (uint32_t i = 0; i < nres; i++) {
         HvObject *o = found[i] = [self object:res[i * 2] task:task];
         if (!o) continue;
@@ -4435,7 +4447,11 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
             o->guest_stale = NO, o->host_valid = NO; /* the guest wrote it */
             if (o->surface) o->surface->guest_stale = NO;
         }
-        if (!o->guest_stale) sync_copied_surface(o->surface);
+        if (!o->guest_stale && o->surface && o->surface->copied_pages && !o->surface->guest_stale &&
+            o->surface->copied_sync_tick != sync_tick) {
+            o->surface->copied_sync_tick = sync_tick;
+            sync_copied_surface(o->surface);
+        }
         if (o->surface_standin && !o->host_valid && !o->guest_stale && o->surface && !o->surface->gone && o->surface->mapped) {
             upload_surface_standin(o);
             o->host_valid = YES;
@@ -5802,8 +5818,8 @@ static void drop_surface(HvReplay *r, uint32_t mapping, BOOL stale) {
     if (s && s->video) planar_keep(r, s->video); /* soon mapped again by another process, maybe: what was drawn is still there */
     if (s) {
         s->gone = YES; /* textures over it the guest still names are made anew (object:task:) */
-        free(s->copied_srcs);
-        s->copied_srcs = NULL, s->copied_n = 0;
+        free(s->copied_pages);
+        s->copied_pages = NULL, s->copied_n = 0;
     }
     /* and let go of now: kept until their refs were named again, they held the surface's pages and GPU mapping */
     for (HvObject *o in s ? s->over.allObjects : @[]) {

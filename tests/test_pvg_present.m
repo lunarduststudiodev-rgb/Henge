@@ -1078,6 +1078,8 @@ static void test_surface_misaligned(void) {
               "copied from guest RAM (%02x, not page below 0x41), and counted (%llu)",
               s && s->mapped ? s->mapped[0x100 + 64 * 3] : 0xff,
               r->pages_misaligned - misaligned0);
+        CHECK(s && s->copied_pages && s->copied_n == 1 && s->copied_pages[0].page == 0,
+              "compact copied_pages tracks only the misaligned page (%u)", s ? s->copied_n : 0);
         guest_ram[0x6000 + 0x100 + 64 * 3] = 0x79;
         sync_copied_surface(s);
         CHECK(s && s->mapped && s->mapped[0x100 + 64 * 3] == 0x79, "guest write refreshed copied misaligned page (%02x)",
