@@ -2296,17 +2296,17 @@ static void upload_surface_standin_blit(HvObject *o, id<MTLCommandBuffer> cb, id
 }
 
 /* Copy GPU-written surface stand-in pixels back into the surface's guest-backed buffer. */
-static void download_surface_standin(HvObject *o, id<MTLCommandBuffer> cb, id<MTLBlitCommandEncoder> *blit) {
+static BOOL download_surface_standin(HvObject *o, id<MTLCommandBuffer> cb, id<MTLBlitCommandEncoder> *blit) {
     HvObject *surface = o ? o->surface : nil;
     id<MTLTexture> tex = o ? o->object : nil;
     id<MTLBuffer> buf = surface ? surface->object : nil;
-    if (!surface || surface->gone || !buf || !tex || tex.textureType != MTLTextureType2D || tex.isFramebufferOnly) return;
+    if (!surface || surface->gone || !buf || !tex || tex.textureType != MTLTextureType2D || tex.isFramebufferOnly) return NO;
     NSUInteger bpp = pixel_bytes(tex.pixelFormat);
     NSUInteger dst_row = (NSUInteger)surface->row;
     uint64_t needed = tex.height ? (tex.height - 1) * surface->row + (uint64_t)tex.width * bpp : 0;
     if (!bpp || dst_row < tex.width * bpp || dst_row % bpp != 0 || surface->first % bpp != 0 ||
         surface->first > buf.length || needed > buf.length - surface->first)
-        return;
+        return NO;
     if (!*blit) *blit = [cb blitCommandEncoder];
     [*blit copyFromTexture:tex
                sourceSlice:0
@@ -2317,6 +2317,7 @@ static void download_surface_standin(HvObject *o, id<MTLCommandBuffer> cb, id<MT
          destinationOffset:surface->first
     destinationBytesPerRow:dst_row
   destinationBytesPerImage:0];
+    return YES;
 }
 
 /* A surface (IOSurface in the guest): a texture over its guest pages, so the
@@ -2637,8 +2638,8 @@ static BOOL has_guest_pages(HvObject *o) { return o->pages && o->pages_in_ram; }
         HvObject *standin = surface_standin_root(o);
         if (standin && standin->host_valid) {
             if (!cb) cb = [queue commandBuffer];
-            download_surface_standin(standin, cb, &blit);
-            if (!(standin->surface && standin->surface->copied_pages)) standin->guest_stale = NO;
+            if (download_surface_standin(standin, cb, &blit) && !(standin->surface && standin->surface->copied_pages))
+                standin->guest_stale = NO;
         }
         if (!o || !o->guest_backed || !o->host_valid) continue;
         if (!cb) cb = [queue commandBuffer];
@@ -4712,18 +4713,25 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
     if (e) [e endEncoding];
     pass_indirect = nil, pass_args = nil, exec_left = nil;
     id<MTLBlitCommandEncoder> back = nil;
+    NSMutableSet<HvObject *> *written_surfaces = nil, *written_standins = nil;
     for (uint32_t i = 0; i < nres; i++) {
         uint32_t rflags = res[i * 2 + 1];
         HvObject *o = found[i];
         if (!o) continue;
         HvObject *standin = surface_standin_root(o);
+        BOOL downloaded = NO;
         if (standin && standin->host_valid && ((rflags & 2) || ((rflags & 4) && standin->guest_stale))) {
-            download_surface_standin(standin, cb, &back);
-            if ((rflags & 4) && !(standin->surface && standin->surface->copied_pages)) standin->guest_stale = NO;
+            downloaded = download_surface_standin(standin, cb, &back);
+            if (downloaded && (rflags & 4) && !(standin->surface && standin->surface->copied_pages))
+                standin->guest_stale = NO;
         }
-        if ((rflags & 2) && o->surface) {
-            for (HvObject *ov in o->surface->over.allObjects)
-                if (ov->surface_standin && ov != standin) ov->host_valid = NO;
+        if ((rflags & 2) && o->surface && (!standin || downloaded)) {
+            if (!written_surfaces) written_surfaces = [NSMutableSet new];
+            [written_surfaces addObject:o->surface];
+            if (standin) {
+                if (!written_standins) written_standins = [NSMutableSet new];
+                [written_standins addObject:standin];
+            }
         }
         if (sync_after && (rflags & 4)) { /* the guest wants these back as soon as this is done */
             HvObject *s = o->surface;
@@ -4733,6 +4741,12 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
             o->guest_stale = NO;
         }
     }
+    for (HvObject *s in written_surfaces)
+        for (HvObject *ov in s->over.allObjects)
+            if (ov->surface_standin && ![written_standins containsObject:ov]) {
+                ov->host_valid = NO;
+                ov->guest_stale = NO;
+            }
     [back endEncoding];
     for (uint32_t i = 0; i < nres; i++) found[i] = nil;
     exec_found_n = 0;

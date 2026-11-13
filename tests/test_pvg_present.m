@@ -3142,10 +3142,18 @@ static void test_dock_badge_metal_fixes(void) {
 }
 @end
 
+@interface StandinBuf : FakeBuffer
+@end
+@implementation StandinBuf
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)o bytesPerRow:(NSUInteger)r {
+    (void)d; (void)o; (void)r;
+    return nil;
+}
+@end
+
 static void test_surface_standin_view_and_writeback(void) {
     uint8_t raw[4096] = {0};
     FakeBuffer *buf = [FakeBuffer new];
-    buf.length = sizeof raw;
 
     HvObject *surface = [HvObject new];
     surface->mapped = raw;
@@ -3192,8 +3200,8 @@ static void test_surface_standin_view_and_writeback(void) {
 
     StandinCB *cb = [StandinCB new];
     id<MTLBlitCommandEncoder> enc = nil;
-    download_surface_standin(standin, (id<MTLCommandBuffer>)cb, &enc);
-    CHECK(cb.blit && cb.blit.copyCalls == 1 && cb.blit.dstOff == 16 && cb.blit.dstRow == 80,
+    CHECK(download_surface_standin(standin, (id<MTLCommandBuffer>)cb, &enc) &&
+          cb.blit && cb.blit.copyCalls == 1 && cb.blit.dstOff == 16 && cb.blit.dstRow == 80,
           "download_surface_standin blits stand-in back at surface->first (%lu) with surface->row (%lu)",
           (unsigned long)cb.blit.dstOff, (unsigned long)cb.blit.dstRow);
 
@@ -3202,41 +3210,56 @@ static void test_surface_standin_view_and_writeback(void) {
     id<MTLCommandQueue> saved_queue = r->queue;
     StandinQueue *sq = [StandinQueue new];
     r->queue = (id<MTLCommandQueue>)sq;
-    uint32_t saved_e20[3], saved_e21[3];
+    uint32_t saved_e20[3], saved_e21[3], saved_e22[3];
     memcpy(saved_e20, table[20], 12);
     memcpy(saved_e21, table[21], 12);
+    memcpy(saved_e22, table[22], 12);
     table[20][0] = 1, table[20][1] = 0x1111, table[20][2] = 0;
     table[21][0] = 1, table[21][1] = 0x2222, table[21][2] = 0;
+    table[22][0] = 1, table[22][1] = 0x3333, table[22][2] = 0;
     memcpy(standin->entry, table[20], 12);
     memcpy(view->entry, table[21], 12);
+    memcpy(sibling->entry, table[22], 12);
     if (!r->tasks[1]) r->tasks[1] = [HvTaskObjects new];
     objs_set(r->tasks[1], 20, standin);
     objs_set(r->tasks[1], 21, view);
+    objs_set(r->tasks[1], 22, sibling);
 
     /* flags = 1 on view: refreshes stand-in via blit copyFromBuffer:toTexture: and clears sibling host_valid */
-    uint32_t exec_up[14] = {1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 21, 1};
+    uint32_t exec_up[5] = {1, 1, 0, 21, 1};
     [r exec:exec_up length:sizeof exec_up channel:1 stamp:900];
     CHECK(sq.lastCB && sq.lastCB.blit && sq.lastCB.blit.uploadCalls == 1 &&
-          sq.lastCB.blit.srcOff == 16 && sq.lastCB.blit.srcRow == 80 && sq.lastCB.blit.copyCalls == 0,
-          "exec flags=1 on view uploads stand-in via blit (uploads=%lu copies=%lu)",
+          sq.lastCB.blit.srcOff == 16 && sq.lastCB.blit.srcRow == 80 && sq.lastCB.blit.copyCalls == 0 &&
+          !sibling->host_valid,
+          "exec flags=1 on view uploads stand-in via blit and invalidates sibling (uploads=%lu copies=%lu)",
           (unsigned long)sq.lastCB.blit.uploadCalls, (unsigned long)sq.lastCB.blit.copyCalls);
     [sq.lastCB finish:YES];
     settle();
 
-    /* flags = 2 on view: writes stand-in back via blit and invalidates sibling->host_valid */
+    /* flags = 2 on view: writes stand-in back via blit and clears sibling host_valid + guest_stale */
     sibling->host_valid = YES;
-    uint32_t exec_wr[14] = {1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 21, 2};
+    sibling->guest_stale = YES;
+    uint32_t exec_wr[5] = {1, 1, 0, 21, 2};
     [r exec:exec_wr length:sizeof exec_wr channel:1 stamp:901];
     CHECK(sq.lastCB && sq.lastCB.blit && sq.lastCB.blit.copyCalls == 1 &&
-          sq.lastCB.blit.dstOff == 16 && sq.lastCB.blit.dstRow == 80 && !sibling->host_valid,
-          "exec flags=2 on view writes stand-in back and invalidates sibling");
+          sq.lastCB.blit.dstOff == 16 && sq.lastCB.blit.dstRow == 80 &&
+          !sibling->host_valid && !sibling->guest_stale,
+          "exec flags=2 on view writes stand-in back and clears sibling host_valid/guest_stale");
+    [sq.lastCB finish:YES];
+    settle();
+
+    /* Next use of sibling (flags = 0): re-uploads updated surface pixels via blit */
+    uint32_t exec_sib[5] = {1, 1, 0, 22, 0};
+    [r exec:exec_sib length:sizeof exec_sib channel:1 stamp:902];
+    CHECK(sq.lastCB && sq.lastCB.blit && sq.lastCB.blit.uploadCalls == 1 && sibling->host_valid,
+          "sibling stand-in re-uploads updated surface pixels after peer flags=2 write");
     [sq.lastCB finish:YES];
     settle();
 
     /* read-only flags = 4 without guest_stale: does not blit stand-in back */
     standin->guest_stale = NO;
-    uint32_t exec_ro[14] = {1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 21, 4};
-    [r exec:exec_ro length:sizeof exec_ro channel:1 stamp:902];
+    uint32_t exec_ro[5] = {1, 1, 0, 21, 4};
+    [r exec:exec_ro length:sizeof exec_ro channel:1 stamp:903];
     CHECK(sq.lastCB && (!sq.lastCB.blit || sq.lastCB.blit.copyCalls == 0),
           "exec read-only flags=4 without guest_stale skips stand-in writeback");
     [sq.lastCB finish:YES];
@@ -3257,10 +3280,57 @@ static void test_surface_standin_view_and_writeback(void) {
     CHECK(!standin->host_valid && !sibling->host_valid,
           "invalidate: propagates host_valid=NO to stand-in root and sibling");
 
+    /* makeMappedTexture: preserves PixelFormatView | ShaderWrite when falling back to surface_standin */
+    id<MTLDevice> saved_dev = r->device;
+    Tex12Device *dev = [Tex12Device new];
+    r->device = (id<MTLDevice>)dev;
+    HvObject *surf2 = [HvObject new];
+    surf2->mapped = raw;
+    surf2->length = sizeof raw;
+    surf2->row = 128; /* 64-byte aligned so linear_texture_fits passes, StandinBuf returns nil */
+    surf2->first = 0;
+    surf2->object = [StandinBuf new];
+    surf2->over = [NSHashTable weakObjectsHashTable];
+    r->surfaces[@77] = surf2;
+    uint8_t saved_sr[sizeof surface_record];
+    memcpy(saved_sr, surface_record, sizeof saved_sr);
+    memset(surface_record, 0, sizeof surface_record);
+    uint64_t m77 = 77;
+    uint32_t tag39 = 0x39, sz38 = 0x38, ref0 = 0;
+    uint16_t fmt80 = 80 /* BGRA8Unorm */, mips1 = 1, samp1 = 1, arr1 = 1;
+    uint32_t usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+    uint32_t w20 = 20, h20 = 20, d1 = 1;
+    memcpy(surface_record + 0, &m77, 8);
+    memcpy(surface_record + 8, &tag39, 4);
+    memcpy(surface_record + 12, &sz38, 4);
+    memcpy(surface_record + 16, &ref0, 4);
+    uint8_t *d2 = surface_record + 20;
+    d2[0] = (uint8_t)MTLTextureType2D;
+    memcpy(d2 + 1, &fmt80, 2);
+    memcpy(d2 + 3, &usage, 4);
+    memcpy(d2 + 7, &w20, 4);
+    memcpy(d2 + 11, &h20, 4);
+    memcpy(d2 + 15, &d1, 4);
+    memcpy(d2 + 19, &mips1, 2);
+    memcpy(d2 + 21, &samp1, 2);
+    memcpy(d2 + 23, &arr1, 2);
+    HvObject *mapped_si = [HvObject new];
+    [r makeMappedTexture:mapped_si at:0x8000 task:1];
+    CHECK(mapped_si->surface_standin && dev.made &&
+          (dev.made.usage & (MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView)) ==
+              (MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView),
+          "makeMappedTexture: preserves PixelFormatView | ShaderWrite on surface_standin fallback (usage=%lu)",
+          (unsigned long)dev.made.usage);
+    memcpy(surface_record, saved_sr, sizeof saved_sr);
+    [r->surfaces removeObjectForKey:@77];
+    r->device = saved_dev;
+
     objs_set(r->tasks[1], 20, nil);
     objs_set(r->tasks[1], 21, nil);
+    objs_set(r->tasks[1], 22, nil);
     memcpy(table[20], saved_e20, 12);
     memcpy(table[21], saved_e21, 12);
+    memcpy(table[22], saved_e22, 12);
     r->queue = saved_queue;
 }
 
