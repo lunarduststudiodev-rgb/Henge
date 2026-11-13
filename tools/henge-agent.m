@@ -698,9 +698,43 @@ static NSString *caretContext(AXUIElementRef e) {
     return [NSString stringWithFormat:@"%ld %@ %@", (long)sel.length, b64(before), b64(after)];
 }
 
-// Apps built on Chrome (Chrome, Edge, Brave, Arc, and Electron's Slack, VS Code, Discord...) carry its page renderer
+static BOOL isCodeEditor(NSString *bundle) {
+    if (!bundle.length) return NO;
+    static NSSet<NSString *> *editorBundles;
+    if (!editorBundles) editorBundles = [NSSet setWithObjects:
+        @"com.google.antigravity", @"com.google.Antigravity", @"dev.antigravity.app",
+        @"com.microsoft.VSCode", @"com.microsoft.VSCodeInsiders", @"com.vscodium",
+        @"com.todesktop.230313mzl4w4u92", @"com.exafunction.windsurf",
+        @"dev.zed.Zed", @"com.sublimetext.4", @"com.panic.Nova",
+        @"com.barebones.bbedit", @"com.apple.dt.Xcode", nil];
+    if ([editorBundles containsObject:bundle] || [bundle hasPrefix:@"com.jetbrains."]) return YES;
+    NSString *lower = bundle.lowercaseString;
+    for (NSString *sub in @[ @"antigravity", @"vscode", @"visualstudio.code", @"vscodium", @"cursor", @"windsurf", @"zed" ])
+        if ([lower containsString:sub]) return YES;
+    return NO;
+}
+
+static BOOL isCodeEditorApp(NSRunningApplication *app) {
+    if (!app) return NO;
+    if (isCodeEditor(app.bundleIdentifier ?: @"")) return YES;
+    NSString *name = app.localizedName.lowercaseString;
+    if (!name.length) return NO;
+    for (NSString *sub in @[ @"antigravity", @"vs code", @"vscode", @"visual studio code", @"vscodium", @"cursor", @"windsurf", @"zed" ])
+        if ([name containsString:sub]) return YES;
+    return NO;
+}
+
+static BOOL isCodeEditorElement(AXUIElementRef e) {
+    if (!e) return NO;
+    pid_t pid = 0;
+    if (AXUIElementGetPid(e, &pid) != kAXErrorSuccess || pid <= 0) return NO;
+    return isCodeEditorApp([NSRunningApplication runningApplicationWithProcessIdentifier:pid]);
+}
+
+// Apps built on Chrome (Chrome, Edge, Brave, Arc, and Electron's Slack, Discord...) carry its page renderer
 // as "NAME Helper (Renderer).app" among their frameworks, whatever they are called.
 static BOOL builtOnChrome(NSRunningApplication *app) {
+    if (isCodeEditorApp(app)) return NO;
     NSURL *frameworks = [app.bundleURL URLByAppendingPathComponent:@"Contents/Frameworks" isDirectory:YES];
     if (!frameworks) return NO;
     NSDirectoryEnumerator<NSURL *> *walk = [NSFileManager.defaultManager enumeratorAtURL:frameworks
@@ -720,6 +754,8 @@ static BOOL builtOnChrome(NSRunningApplication *app) {
     return NO;
 }
 
+static CFTypeRef copyAttribute(AXUIElementRef element, CFStringRef attr); // below
+
 // What a field takes, for the device's keyboard: "code" (a terminal or a code editor: no autocorrect, no capitals, as
 // iOS would "fix" commands), "address" (a browser's address bar: no capitals), "plain" (an email address, a user name,
 // a web address: no autocorrect, no capitals), or "prose".
@@ -728,15 +764,17 @@ static const char *fieldKind(AXUIElementRef e, NSString *bundle) {
     if (!coders) coders = [NSSet setWithObjects:@"com.apple.Terminal", @"com.googlecode.iterm2", @"dev.warp.Warp-Stable",
                            @"com.mitchellh.ghostty", @"net.kovidgoyal.kitty", @"org.alacritty", @"io.alacritty", @"com.github.wez.wezterm",
                            @"co.zeit.hyper", @"com.apple.dt.Xcode", @"com.microsoft.VSCode", @"com.microsoft.VSCodeInsiders",
-                           @"com.vscodium", @"com.todesktop.230313mzl4w4u92", @"dev.zed.Zed", @"com.sublimetext.4", @"com.panic.Nova",
+                           @"com.vscodium", @"com.todesktop.230313mzl4w4u92", @"com.exafunction.windsurf",
+                           @"com.google.antigravity", @"com.google.Antigravity", @"dev.antigravity.app",
+                           @"dev.zed.Zed", @"com.sublimetext.4", @"com.panic.Nova",
                            @"com.barebones.bbedit", @"com.apple.ScriptEditor2", nil];
-    if ([coders containsObject:bundle] || [bundle hasPrefix:@"com.jetbrains."]) return "code";
+    if ([coders containsObject:bundle] || isCodeEditor(bundle)) return "code";
     NSMutableString *said = [NSMutableString string];
     for (NSString *attribute in @[ (__bridge NSString *)kAXDescriptionAttribute, (__bridge NSString *)kAXTitleAttribute,
                                    (__bridge NSString *)kAXPlaceholderValueAttribute, (__bridge NSString *)kAXIdentifierAttribute,
                                    @"AXDOMIdentifier" ]) {
-        CFTypeRef v = NULL;
-        if (AXUIElementCopyAttributeValue(e, (__bridge CFStringRef)attribute, &v) == kAXErrorSuccess && v) {
+        CFTypeRef v = copyAttribute(e, (__bridge CFStringRef)attribute);
+        if (v) {
             if (CFGetTypeID(v) == CFStringGetTypeID()) [said appendFormat:@" %@", (__bridge NSString *)v];
             CFRelease(v);
         }
@@ -808,7 +846,7 @@ static pid_t panelWithField(pid_t front) {
         if (when && -when.timeIntervalSinceNow < 2) continue;
         AXUIElementRef app = AXUIElementCreateApplication(p.intValue);
         if (!app) continue;
-        AXUIElementSetMessagingTimeout(app, 0.3f);
+        AXUIElementSetMessagingTimeout(app, 0.05f);
         CFTypeRef focused = NULL;
         AXError error = AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute, &focused);
         CFRelease(app);
@@ -816,6 +854,8 @@ static pid_t panelWithField(pid_t front) {
         else [slow removeObjectForKey:p];
         if (!focused) continue;
         CFTypeRef role = NULL;
+        if (CFGetTypeID(focused) == AXUIElementGetTypeID())
+            AXUIElementSetMessagingTimeout((AXUIElementRef)focused, 0.04f);
         BOOL text = CFGetTypeID(focused) == AXUIElementGetTypeID() &&
                     AXUIElementCopyAttributeValue(focused, kAXRoleAttribute, &role) == kAXErrorSuccess && role &&
                     CFGetTypeID(role) == CFStringGetTypeID() &&
@@ -833,6 +873,26 @@ static pid_t panelWithField(pid_t front) {
 // MARK: Whether something takes typing
 
 enum { EDIT_UNKNOWN = -1, EDIT_NO = 0, EDIT_YES = 1 };
+
+static _Thread_local BOOL axTimedOut;
+
+static AXError copyAttributeError(AXUIElementRef element, CFStringRef attr, CFTypeRef *outValue) {
+    *outValue = NULL;
+    if (!element || axTimedOut) return kAXErrorCannotComplete;
+    AXUIElementSetMessagingTimeout(element, 0.04f);
+    AXError err = AXUIElementCopyAttributeValue(element, attr, outValue);
+    if (err == kAXErrorCannotComplete || err == kAXErrorAPIDisabled) axTimedOut = YES;
+    return err;
+}
+
+static CFTypeRef copyAttribute(AXUIElementRef element, CFStringRef attr) {
+    CFTypeRef v = NULL;
+    if (copyAttributeError(element, attr, &v) != kAXErrorSuccess) {
+        if (v) CFRelease(v);
+        return NULL;
+    }
+    return v;
+}
 
 // Accessibility couldn't answer: it timed out or "cannot complete" (the app is busy), the element went away (a page
 // re-rendering), or the app doesn't do Accessibility. Anything else is an answer, a "no" included.
@@ -875,7 +935,7 @@ static int editability(AXUIElementRef e, BOOL *secure, NSString **role, NSString
     *role = nil;
     *why = nil;
     CFTypeRef v = NULL;
-    AXError error = AXUIElementCopyAttributeValue(e, kAXRoleAttribute, &v);
+    AXError error = copyAttributeError(e, kAXRoleAttribute, &v);
     if (error != kAXErrorSuccess || !v || CFGetTypeID(v) != CFStringGetTypeID()) {
         if (v) CFRelease(v);
         *why = [NSString stringWithFormat:@"its role %@", axSaid(error == kAXErrorSuccess ? kAXErrorNoValue : error)];
@@ -890,7 +950,7 @@ static int editability(AXUIElementRef e, BOOL *secure, NSString **role, NSString
     }
     v = NULL;
     if (![r isEqualToString:@"AXWebArea"]) {
-        error = AXUIElementCopyAttributeValue(e, kAXSubroleAttribute, &v);
+        error = copyAttributeError(e, kAXSubroleAttribute, &v);
         if (unsure(error)) {
             if (v) CFRelease(v);
             *why = [NSString stringWithFormat:@"%@'s subrole %@", r, axSaid(error)];
@@ -906,15 +966,21 @@ static int editability(AXUIElementRef e, BOOL *secure, NSString **role, NSString
         return EDIT_YES;
     }
     if ([typed containsObject:r]) return EDIT_YES;
+    if (axTimedOut) {
+        *why = [NSString stringWithFormat:@"%@ timed out", r];
+        return EDIT_UNKNOWN;
+    }
+    AXUIElementSetMessagingTimeout(e, 0.04f);
     Boolean settable = false;
     error = AXUIElementIsAttributeSettable(e, kAXValueAttribute, &settable);
+    if (error == kAXErrorCannotComplete) axTimedOut = YES;
     if (unsure(error)) {
         *why = [NSString stringWithFormat:@"whether %@'s value can be changed %@", r, axSaid(error)];
         return EDIT_UNKNOWN;
     }
     if (error == kAXErrorSuccess && settable) {
         CFTypeRef range = NULL;
-        error = AXUIElementCopyAttributeValue(e, kAXSelectedTextRangeAttribute, &range);
+        error = copyAttributeError(e, kAXSelectedTextRangeAttribute, &range);
         BOOL caret = error == kAXErrorSuccess && range;
         if (range) CFRelease(range);
         if (caret) return EDIT_YES;
@@ -927,7 +993,7 @@ static int editability(AXUIElementRef e, BOOL *secure, NSString **role, NSString
         // An AXWebArea is the web document container; only check editable ancestor if fast.
         // If it times out or returns error, it's not a text field (EDIT_NO).
         CFTypeRef editable = NULL;
-        error = AXUIElementCopyAttributeValue(e, CFSTR("AXEditableAncestor"), &editable);
+        error = copyAttributeError(e, CFSTR("AXEditableAncestor"), &editable);
         BOOL yes = error == kAXErrorSuccess && editable;
         if (editable) CFRelease(editable);
         if (yes) return EDIT_YES;
@@ -936,7 +1002,7 @@ static int editability(AXUIElementRef e, BOOL *secure, NSString **role, NSString
     if ([r isEqualToString:(__bridge NSString *)kAXGroupRole] ||
         [r isEqualToString:(__bridge NSString *)kAXStaticTextRole]) {
         CFTypeRef editable = NULL;
-        error = AXUIElementCopyAttributeValue(e, CFSTR("AXEditableAncestor"), &editable);
+        error = copyAttributeError(e, CFSTR("AXEditableAncestor"), &editable);
         BOOL yes = error == kAXErrorSuccess && editable;
         if (editable) CFRelease(editable);
         if (yes) return EDIT_YES;
@@ -1031,12 +1097,15 @@ static void requestLook(void) {
 }
 
 // The element that has the focus now, or nothing. Another one than at the last look gets a new ID.
+static BOOL fieldIsCodeEditor;
+
 static void setField(AXUIElementRef element, pid_t pid) {
-    BOOL same = element ? fieldElement && CFEqual(fieldElement, element) : !fieldElement && fieldApp == pid;
+    BOOL same = element ? fieldElement && CFEqual(fieldElement, element) : !fieldElement && fieldApp == pid && !fieldIsCodeEditor;
     if (same) return;
     if (fieldElement) CFRelease(fieldElement);
     fieldElement = element ? (AXUIElementRef)CFRetain(element) : NULL;
     fieldApp = pid;
+    fieldIsCodeEditor = NO;
     fieldID++;
     fieldEdit = element ? EDIT_UNKNOWN : EDIT_NO;
     fieldSecure = NO;
@@ -1048,6 +1117,7 @@ static void setField(AXUIElementRef element, pid_t pid) {
 // One look: FOCUS_SAID_* (focus-said.h). *why says why it is unknown, or what has the focus when it isn't a text field,
 // for Henge's log; *appName which app was asked.
 static int lookNow(NSString **why, NSString **appName) {
+    axTimedOut = NO;
     *why = nil;
     *appName = nil;
     // Which app holds macOS's secure input, if any: it counts only for that app, or for macOS's own password prompts
@@ -1090,6 +1160,39 @@ static int lookNow(NSString **why, NSString **appName) {
         *why = @"no app is in front";
         return focus_said(FOCUS_CANT_TELL, NO, held);
     }
+    if (isCodeEditorApp(front)) {
+        if (observedPid != 0) {
+            observedPid = 0;
+            dispatch_async(dispatch_get_main_queue(), ^{ observeApp(0); });
+        }
+        static NSMutableSet<NSNumber *> *wokeUp;
+        if (!wokeUp) wokeUp = [NSMutableSet set];
+        if (![wokeUp containsObject:@(pid)]) {
+            [wokeUp addObject:@(pid)];
+            AXUIElementRef app = AXUIElementCreateApplication(pid);
+            if (app) {
+                AXUIElementSetMessagingTimeout(app, 0.04f);
+                AXUIElementSetAttributeValue(app, CFSTR("AXManualAccessibility"), kCFBooleanFalse);
+                AXUIElementSetAttributeValue(app, CFSTR("AXEnhancedUserInterface"), kCFBooleanFalse);
+                CFRelease(app);
+            }
+        }
+        if (fieldElement) {
+            CFRelease(fieldElement);
+            fieldElement = NULL;
+        }
+        if (fieldApp != pid || !fieldIsCodeEditor) {
+            fieldApp = pid;
+            fieldIsCodeEditor = YES;
+            fieldID++;
+        }
+        fieldEdit = EDIT_YES;
+        fieldSecure = NO;
+        fieldKindSaid = "code";
+        fieldFrame = CGRectNull;
+        fieldRole = @"AXTextArea";
+        return focus_said(FOCUS_FIELD, NO, held);
+    }
     if (pid != observedPid) {
         observedPid = pid;
         dispatch_async(dispatch_get_main_queue(), ^{ observeApp(pid); });
@@ -1099,9 +1202,9 @@ static int lookNow(NSString **why, NSString **appName) {
         *why = @"its app can't be asked";
         return focus_said(FOCUS_CANT_TELL, NO, held);
     }
-    AXUIElementSetMessagingTimeout(app, 0.25f);
+    AXUIElementSetMessagingTimeout(app, 0.05f);
     // Apps built on Chrome show their pages' fields to Accessibility only once asked, as a screen reader does:
-    // Electron's (Slack, VS Code, Discord...) take AXManualAccessibility, and browsers (Edge, Chrome, Brave, Arc...)
+    // Electron's (Slack, Discord...) take AXManualAccessibility, and browsers (Edge, Chrome, Brave, Arc...)
     // AXEnhancedUserInterface (YouTube's search box got no keyboard). Asked once for each app, and the second only of
     // apps built on Chrome, as others can slow their windows for it. Chrome takes it even as it answers with an error.
     static NSMutableSet<NSNumber *> *asked;
@@ -1137,7 +1240,7 @@ static int lookNow(NSString **why, NSString **appName) {
     setField((AXUIElementRef)focused, pid);
     CFRelease(focused);
     if (fieldEdit == EDIT_UNKNOWN) {
-        AXUIElementSetMessagingTimeout(fieldElement, 0.25f);
+        AXUIElementSetMessagingTimeout(fieldElement, 0.04f);
         BOOL secure = NO;
         NSString *role = nil, *whyNot = nil;
         int edit = editability(fieldElement, &secure, &role, &whyNot);
@@ -1151,7 +1254,7 @@ static int lookNow(NSString **why, NSString **appName) {
         if (edit == EDIT_YES) {
             fieldKindSaid = secure ? "plain" : fieldKind(fieldElement, bundle);
             CGRect f;
-            fieldFrame = frameOf(fieldElement, &f) ? screenFraction(f) : CGRectNull;
+            fieldFrame = !axTimedOut && frameOf(fieldElement, &f) ? screenFraction(f) : CGRectNull;
         }
     }
     if (fieldEdit == EDIT_NO) {
@@ -1170,10 +1273,10 @@ static BOOL linkUp(void) {
 
 // Whether the focus has moved off the element last looked at without the app saying so: one question.
 static BOOL focusMovedQuietly(void) {
-    if (fieldApp <= 0) return NO;
+    if (fieldApp <= 0 || fieldIsCodeEditor) return NO;
     AXUIElementRef app = AXUIElementCreateApplication(fieldApp);
     if (!app) return NO;
-    AXUIElementSetMessagingTimeout(app, 0.25f);
+    AXUIElementSetMessagingTimeout(app, 0.05f);
     CFTypeRef focused = NULL;
     AXError error = AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute, &focused);
     CFRelease(app);
@@ -1188,9 +1291,11 @@ static BOOL focusMovedQuietly(void) {
 // focus is still there (the caret moved: some apps move the focus without a word).
 static void readContext(BOOL check) {
     @autoreleasepool {
+        axTimedOut = NO;
         NSString *line;
         if (fieldElement && fieldEdit == EDIT_YES && !fieldSecure && !IsSecureEventInputEnabled()) {
             if (check && focusMovedQuietly()) return requestLook();
+            AXUIElementSetMessagingTimeout(fieldElement, 0.04f);
             NSString *context = caretContext(fieldElement);
             line = [NSString stringWithFormat:@"ctx %u %@\n", fieldID, context ?: @"none"];
         } else {
@@ -1383,8 +1488,8 @@ static CGSize screenSize(void) { return CGDisplayBounds(CGMainDisplayID()).size;
 static dispatch_queue_t hitQueue, tapQueue;
 
 static NSString *roleOf(AXUIElementRef e) {
-    CFTypeRef v = NULL;
-    if (AXUIElementCopyAttributeValue(e, kAXRoleAttribute, &v) != kAXErrorSuccess || !v) return @"";
+    CFTypeRef v = copyAttribute(e, kAXRoleAttribute);
+    if (!v) return @"";
     NSString *role = CFGetTypeID(v) == CFStringGetTypeID() ? (__bridge NSString *)v : @"";
     NSString *copy = [role copy];
     CFRelease(v);
@@ -1392,19 +1497,20 @@ static NSString *roleOf(AXUIElementRef e) {
 }
 
 static AXUIElementRef copyElement(AXUIElementRef e, CFStringRef attribute) {
-    CFTypeRef v = NULL;
-    if (AXUIElementCopyAttributeValue(e, attribute, &v) != kAXErrorSuccess || !v) return NULL;
+    CFTypeRef v = copyAttribute(e, attribute);
+    if (!v) return NULL;
     if (CFGetTypeID(v) != AXUIElementGetTypeID()) {
         CFRelease(v);
         return NULL;
     }
+    AXUIElementSetMessagingTimeout((AXUIElementRef)v, 0.04f);
     return (AXUIElementRef)v;
 }
 
 static BOOL frameOf(AXUIElementRef e, CGRect *frame) {
-    CFTypeRef p = NULL, s = NULL;
-    BOOL ok = AXUIElementCopyAttributeValue(e, kAXPositionAttribute, &p) == kAXErrorSuccess && p &&
-              AXUIElementCopyAttributeValue(e, kAXSizeAttribute, &s) == kAXErrorSuccess && s &&
+    CFTypeRef p = copyAttribute(e, kAXPositionAttribute);
+    CFTypeRef s = p ? copyAttribute(e, kAXSizeAttribute) : NULL;
+    BOOL ok = p && s &&
               AXValueGetValue(p, kAXValueTypeCGPoint, &frame->origin) && AXValueGetValue(s, kAXValueTypeCGSize, &frame->size);
     if (p) CFRelease(p);
     if (s) CFRelease(s);
@@ -1412,16 +1518,16 @@ static BOOL frameOf(AXUIElementRef e, CGRect *frame) {
 }
 
 static BOOL boolOf(AXUIElementRef e, CFStringRef attribute) {
-    CFTypeRef v = NULL;
-    if (AXUIElementCopyAttributeValue(e, attribute, &v) != kAXErrorSuccess || !v) return NO;
+    CFTypeRef v = copyAttribute(e, attribute);
+    if (!v) return NO;
     BOOL yes = CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)v);
     CFRelease(v);
     return yes;
 }
 
 static NSString *stringOf(AXUIElementRef e, CFStringRef attribute) {
-    CFTypeRef v = NULL;
-    if (AXUIElementCopyAttributeValue(e, attribute, &v) != kAXErrorSuccess || !v) return @"";
+    CFTypeRef v = copyAttribute(e, attribute);
+    if (!v) return @"";
     NSString *s = CFGetTypeID(v) == CFStringGetTypeID() ? [(__bridge NSString *)v copy] : @"";
     CFRelease(v);
     return s;
@@ -1456,13 +1562,14 @@ static AXUIElementRef systemWide(void) {
     static AXUIElementRef everything;
     if (!everything) {
         everything = AXUIElementCreateSystemWide();
-        AXUIElementSetMessagingTimeout(everything, 0.25f); // an app that doesn't answer is scrolled
+        AXUIElementSetMessagingTimeout(everything, 0.05f); // an app that doesn't answer is scrolled
     }
     return everything;
 }
 
 // HIT_UNKNOWN when nothing there answers (an app that is stuck, or a point Accessibility can't see into).
 static int dragsAt(AXUIElementRef hit, CGPoint at) {
+    if (!hit || axTimedOut || isCodeEditorElement(hit)) return HIT_UNKNOWN;
     static NSSet *grabbed, *scrollers;
     if (!grabbed) {
         grabbed = [NSSet setWithArray:@[ @"AXSlider", @"AXSplitter", @"AXMenu", @"AXMenuItem", @"AXMenuBar", @"AXMenuBarItem",
@@ -1473,12 +1580,13 @@ static int dragsAt(AXUIElementRef hit, CGPoint at) {
     }
     // Each question is a round trip to the app, so the cheapest answers first, and stop at the first that settles it.
     AXUIElementRef window = copyElement(hit, kAXWindowAttribute);
-    BOOL drag = window && inTitleBar(window, at);
+    BOOL drag = window && !axTimedOut && inTitleBar(window, at);
     if (window) CFRelease(window);
     if (probing && drag) printf("  in the title bar\n");
-    AXUIElementRef e = drag ? NULL : (AXUIElementRef)CFRetain(hit);
-    for (int depth = 0; e && depth < 24; depth++) {
+    AXUIElementRef e = drag || axTimedOut ? NULL : (AXUIElementRef)CFRetain(hit);
+    for (int depth = 0; e && depth < 24 && !axTimedOut; depth++) {
         NSString *role = roleOf(e);
+        if (axTimedOut) break;
         if (probing) printf("  %s\n", role.UTF8String);
         if ([grabbed containsObject:role]) drag = YES;
         else if ([role isEqualToString:@"AXWindow"]) drag = depth == 0; // its own background, as a drag would move it
@@ -1491,6 +1599,7 @@ static int dragsAt(AXUIElementRef hit, CGPoint at) {
         break; // settled: a grabbed control, the window, or something that scrolls
     }
     if (e) CFRelease(e);
+    if (axTimedOut && !drag) return HIT_UNKNOWN;
     return drag ? HIT_DRAG : HIT_SCROLL;
 }
 
@@ -1500,6 +1609,7 @@ static int dragsAt(AXUIElementRef hit, CGPoint at) {
 // it. So only buttons that can't be: those in a dialog, an alert or a sheet, and a window's own close, minimize and
 // zoom buttons, and none inside anything that scrolls or lists. Its frame in the global points events use.
 static BOOL pressableAt(AXUIElementRef hit, CGRect *frame) {
+    if (!hit || axTimedOut || isCodeEditorElement(hit)) return NO;
     static NSSet *buttons, *windowButtons, *dialogs, *blockers;
     if (!buttons) {
         buttons = [NSSet setWithArray:@[ @"AXButton", @"AXCheckBox", @"AXRadioButton", @"AXDisclosureTriangle" ]];
@@ -1509,14 +1619,16 @@ static BOOL pressableAt(AXUIElementRef hit, CGRect *frame) {
                                           @"AXTextArea", @"AXGrid", @"AXLayoutArea", @"AXCollection", @"AXTabGroup", @"AXToolbar",
                                           @"AXMenu", @"AXMenuBar", @"AXMenuBarItem", @"AXMenuItem", @"AXPopover", @"AXDockItem" ]];
     }
-    if (![buttons containsObject:roleOf(hit)]) return NO;
+    if (![buttons containsObject:roleOf(hit)] || axTimedOut) return NO;
     CGRect f;
-    if (!frameOf(hit, &f) || f.size.width < 4 || f.size.height < 4 || f.size.width > 400 || f.size.height > 160) return NO;
+    if (!frameOf(hit, &f) || axTimedOut || f.size.width < 4 || f.size.height < 4 || f.size.width > 400 || f.size.height > 160) return NO;
     BOOL windowButton = [windowButtons containsObject:stringOf(hit, kAXSubroleAttribute)];
+    if (axTimedOut) return NO;
     BOOL ok = NO;
     AXUIElementRef e = copyElement(hit, kAXParentAttribute);
-    for (int depth = 0; e && depth < 24; depth++) {
+    for (int depth = 0; e && depth < 24 && !axTimedOut; depth++) {
         NSString *role = roleOf(e);
+        if (axTimedOut) break;
         if ([blockers containsObject:role]) break;
         if ([role isEqualToString:@"AXSheet"]) {
             ok = YES;
@@ -1531,6 +1643,7 @@ static BOOL pressableAt(AXUIElementRef hit, CGRect *frame) {
         e = up;
     }
     if (e) CFRelease(e);
+    if (axTimedOut) return NO;
     if (probing) printf("  %s pressed as it is touched\n", ok ? "is" : "isn't");
     if (ok) *frame = f;
     return ok;
@@ -1564,21 +1677,20 @@ static int dragsFromWindows(CGPoint at) {
 
 // The text field or text area a scroll area holds (retained), or NULL: one of its first few children.
 static AXUIElementRef textInside(AXUIElementRef scroll, BOOL *secure) {
-    CFTypeRef children = NULL;
-    if (AXUIElementCopyAttributeValue(scroll, kAXChildrenAttribute, &children) != kAXErrorSuccess || !children) return NULL;
+    CFTypeRef children = copyAttribute(scroll, kAXChildrenAttribute);
+    if (!children) return NULL;
     AXUIElementRef found = NULL;
     if (CFGetTypeID(children) == CFArrayGetTypeID()) {
         CFArrayRef list = children;
-        for (CFIndex i = 0; i < CFArrayGetCount(list) && i < 4 && !found; i++) {
+        for (CFIndex i = 0; i < CFArrayGetCount(list) && i < 4 && !found && !axTimedOut; i++) {
             AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(list, i);
             if (CFGetTypeID(child) != AXUIElementGetTypeID()) continue;
-            AXUIElementSetMessagingTimeout(child, 0.15f);
-            CFTypeRef role = NULL;
-            BOOL text = AXUIElementCopyAttributeValue(child, kAXRoleAttribute, &role) == kAXErrorSuccess && role &&
-                        CFGetTypeID(role) == CFStringGetTypeID() &&
+            AXUIElementSetMessagingTimeout(child, 0.04f);
+            CFTypeRef role = copyAttribute(child, kAXRoleAttribute);
+            BOOL text = role && CFGetTypeID(role) == CFStringGetTypeID() &&
                         [@[ @"AXTextField", @"AXTextArea", @"AXSearchField" ] containsObject:(__bridge NSString *)role];
             if (role) CFRelease(role);
-            if (!text) continue;
+            if (!text || axTimedOut) continue;
             NSString *r = nil, *why = nil;
             if (editability(child, secure, &r, &why) == EDIT_YES) found = (AXUIElementRef)CFRetain(child);
         }
@@ -1591,32 +1703,41 @@ static AXUIElementRef textInside(AXUIElementRef scroll, BOOL *secure) {
 // app to move its focus: "tap ID editable|secure|no|unknown ROLE [X Y W H]" (version 28). The element under the
 // finger and up to three of its parents (a web page's text is inside the field that takes it), answered within
 // tapPatience or "unknown"; X Y W H is the field, as fractions of the screen, ROLE the element's ("-" when not known).
-// On an emulated Mac an app busy with the tap itself (Safari loading a page) often takes 200-600 ms to say what is
-// at a point: 150 ms (version 28) gave up on most of them, and the keyboard then waited for the focus to move,
-// seconds later. It runs on its own queue (tapQueue), so a slow answer holds up no hit's drag-or-scroll.
-static const double tapPatience = 0.9; // seconds; the device waits a little longer (KeyboardOwner.tapWait)
+static const double tapPatience = 0.12; // seconds; tight budget so an unresponsive app never stalls tapQueue for seconds
 static NSString *tapAnswer(unsigned id, CGPoint at, AXUIElementRef under) {
+    axTimedOut = NO;
     uint64_t began = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), deadline = began + (uint64_t)(tapPatience * NSEC_PER_SEC);
-    // Each call may take what is left of the time, at most half a second (an app that has hung doesn't take it all).
     float (^left)(void) = ^float(void) {
         uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         double s = now >= deadline ? 0.02 : (double)(deadline - now) / NSEC_PER_SEC;
-        return (float)fmin(fmax(s, 0.02), 0.5);
+        return (float)fmin(fmax(s, 0.02), 0.04);
     };
     const char *answer = "unknown";
     NSString *firstRole = nil;
     CGRect field = CGRectNull;
     AXUIElementRef e = under ? (AXUIElementRef)CFRetain(under) : NULL;
-    if (!e && trusted()) {
-        static AXUIElementRef everything;
-        if (!everything) everything = AXUIElementCreateSystemWide();
-        // The system-wide element's timeout is every element's that has none of its own (the hit answers' too):
-        // set back as soon as this one call is done.
-        AXUIElementSetMessagingTimeout(everything, left());
-        if (AXUIElementCopyElementAtPosition(everything, (float)at.x, (float)at.y, &e) != kAXErrorSuccess) e = NULL;
-        AXUIElementSetMessagingTimeout(everything, 0.25f);
+    if (isCodeEditorElement(e) || (!e && isCodeEditorApp(NSWorkspace.sharedWorkspace.frontmostApplication))) {
+        if (e) {
+            CFRelease(e);
+            e = NULL;
+        }
+        answer = "editable";
+        firstRole = @"AXTextArea";
+    } else if (!e && trusted()) {
+        if (AXUIElementCopyElementAtPosition(systemWide(), (float)at.x, (float)at.y, &e) != kAXErrorSuccess) e = NULL;
+        if (isCodeEditorElement(e)) {
+            CFRelease(e);
+            e = NULL;
+            answer = "editable";
+            firstRole = @"AXTextArea";
+        }
     }
-    for (int depth = 0; e && depth < 4 && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < deadline; depth++) {
+    for (int depth = 0; e && !axTimedOut && depth < 4 && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < deadline; depth++) {
+        if (isCodeEditorElement(e)) {
+            answer = "editable";
+            firstRole = firstRole ?: @"AXTextArea";
+            break;
+        }
         AXUIElementSetMessagingTimeout(e, left());
         BOOL secure = NO;
         NSString *role = nil, *why = nil;
@@ -1625,10 +1746,10 @@ static NSString *tapAnswer(unsigned id, CGPoint at, AXUIElementRef under) {
         if (edit == EDIT_YES) {
             answer = secure ? "secure" : "editable";
             CGRect f;
-            if (frameOf(e, &f)) field = screenFraction(f);
+            if (!axTimedOut && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < deadline && frameOf(e, &f)) field = screenFraction(f);
             break;
         }
-        if (edit == EDIT_UNKNOWN) {
+        if (edit == EDIT_UNKNOWN || axTimedOut) {
             if (depth == 0) break; // what is under the finger couldn't be told: unknown
             answer = "no";         // a parent couldn't be told: the element itself said no
             break;
@@ -1636,16 +1757,17 @@ static NSString *tapAnswer(unsigned id, CGPoint at, AXUIElementRef under) {
         answer = "no";
         // A text view's scroll area reaches past its text (Spotlight's field is a line of text in a taller scroll
         // area): a tap in it is a tap in the text it holds.
-        if ([role hasPrefix:@"AXScrollArea"]) {
+        if ([role hasPrefix:@"AXScrollArea"] && !axTimedOut && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < deadline) {
             AXUIElementRef inside = textInside(e, &secure);
             if (inside) {
                 answer = secure ? "secure" : "editable";
                 CGRect f;
-                if (frameOf(inside, &f)) field = screenFraction(f);
+                if (!axTimedOut && frameOf(inside, &f)) field = screenFraction(f);
                 CFRelease(inside);
                 break;
             }
         }
+        if (axTimedOut || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) >= deadline) break;
         // Windows, the menu bar and the like have nothing above them that takes typing.
         if ([role hasPrefix:@"AXWindow"] || [role hasPrefix:@"AXMenu"] || [role hasPrefix:@"AXApplication"]) break;
         AXUIElementRef parent = copyElement(e, kAXParentAttribute);
@@ -1653,7 +1775,7 @@ static NSString *tapAnswer(unsigned id, CGPoint at, AXUIElementRef under) {
         e = parent;
     }
     if (e) CFRelease(e);
-    if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) >= deadline && !strcmp(answer, "unknown"))
+    if ((axTimedOut || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) >= deadline) && !strcmp(answer, "unknown"))
         firstRole = firstRole ?: @"timed-out";
     NSString *line = [NSString stringWithFormat:@"tap %u %s %@", id, answer,
                                                 [firstRole stringByReplacingOccurrencesOfString:@" " withString:@"_"] ?: @"-"];
@@ -1678,16 +1800,23 @@ static void answerTap(unsigned id, double x, double y) {
 static void answerHit(unsigned id, double x, double y) {
     dispatch_async(hitQueue, ^{
         @autoreleasepool {
+            axTimedOut = NO;
             CGPoint at = onScreen(x, y);
             int quick = dragsFromWindows(at), answer = quick == HIT_DRAG ? HIT_DRAG : HIT_UNKNOWN;
             CGRect press = CGRectNull;
             AXUIElementRef hit = NULL;
-            if (trusted() && AXUIElementCopyElementAtPosition(systemWide(), (float)at.x, (float)at.y, &hit) == kAXErrorSuccess && hit) {
-                if (answer == HIT_UNKNOWN) answer = dragsAt(hit, at);
-                CGRect f;
-                if (pressableAt(hit, &f)) press = f;
-            } else {
-                hit = NULL;
+            if (trusted() && !isCodeEditorApp(NSWorkspace.sharedWorkspace.frontmostApplication)) {
+                AXError err = AXUIElementCopyElementAtPosition(systemWide(), (float)at.x, (float)at.y, &hit);
+                if (err == kAXErrorCannotComplete) axTimedOut = YES;
+                if (err == kAXErrorSuccess && hit) {
+                    if (!isCodeEditorElement(hit) && !axTimedOut) {
+                        if (answer == HIT_UNKNOWN) answer = dragsAt(hit, at);
+                        CGRect f;
+                        if (!axTimedOut && pressableAt(hit, &f)) press = f;
+                    }
+                } else {
+                    hit = NULL;
+                }
             }
             if (answer == HIT_UNKNOWN) answer = quick == 2 ? HIT_DRAG : HIT_SCROLL; // the app didn't say: the window server's guess
             NSString *line = [NSString stringWithFormat:@"hit %u %s", id, answer == HIT_DRAG ? "drag" : "scroll"];
@@ -1738,16 +1867,18 @@ static void answerMenu(unsigned id) {
 // in them) and the menu bar (its menus are there, closed or not) are left alone. How many it closed: 0 when it
 // can't (no Accessibility permission, or an app that doesn't answer), and Henge falls back to its guarded Escape.
 static int cancelMenusUnder(AXUIElementRef e, int depth, CFAbsoluteTime until) {
-    if (CFAbsoluteTimeGetCurrent() > until) return 0; // taking too long: what's left stays (Henge waits for the count)
-    CFArrayRef kids = NULL;
-    if (AXUIElementCopyAttributeValue(e, kAXChildrenAttribute, (CFTypeRef *)&kids) != kAXErrorSuccess || !kids) return 0;
+    if (axTimedOut || CFAbsoluteTimeGetCurrent() > until) return 0; // taking too long: what's left stays (Henge waits for the count)
+    CFArrayRef kids = (CFArrayRef)copyAttribute(e, kAXChildrenAttribute);
+    if (!kids) return 0;
     int n = 0;
     if (CFGetTypeID(kids) == CFArrayGetTypeID()) {
-        for (CFIndex i = 0; i < CFArrayGetCount(kids) && i < 200; i++) {
+        for (CFIndex i = 0; i < CFArrayGetCount(kids) && i < 200 && !axTimedOut; i++) {
             AXUIElementRef kid = (AXUIElementRef)CFArrayGetValueAtIndex(kids, i);
             if (CFGetTypeID(kid) != AXUIElementGetTypeID()) continue;
             NSString *role = roleOf(kid);
+            if (axTimedOut) break;
             if ([role isEqualToString:@"AXMenu"]) {
+                AXUIElementSetMessagingTimeout(kid, 0.04f);
                 if (AXUIElementPerformAction(kid, kAXCancelAction) == kAXErrorSuccess) n++;
             } else if (depth < 3 && ![role isEqualToString:@"AXWindow"] && ![role isEqualToString:@"AXMenuBar"]) {
                 n += cancelMenusUnder(kid, depth + 1, until);
@@ -1760,6 +1891,7 @@ static int cancelMenusUnder(AXUIElementRef e, int depth, CFAbsoluteTime until) {
 
 static int closeMenus(void) {
     if (!trusted()) return 0;
+    axTimedOut = NO;
     CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
     if (!list) return 0;
     NSMutableOrderedSet<NSNumber *> *owners = [NSMutableOrderedSet orderedSet];
@@ -1770,16 +1902,13 @@ static int closeMenus(void) {
             [owners addObject:pid];
     }
     CFRelease(list);
-    // Every element's calls wait 0.25 s at most (a timeout set on the system-wide element is everyone's; one set
-    // on the app would cover the app alone, not the elements found under it), and the whole walk half a second.
-    AXUIElementRef everyone = AXUIElementCreateSystemWide();
-    if (everyone) AXUIElementSetMessagingTimeout(everyone, 0.25f), CFRelease(everyone);
-    CFAbsoluteTime until = CFAbsoluteTimeGetCurrent() + 0.5;
+    CFAbsoluteTime until = CFAbsoluteTimeGetCurrent() + 0.25;
     int n = 0;
     for (NSNumber *pid in owners) {
+        axTimedOut = NO;
         AXUIElementRef app = AXUIElementCreateApplication(pid.intValue);
         if (!app) continue;
-        AXUIElementSetMessagingTimeout(app, 0.25f);
+        AXUIElementSetMessagingTimeout(app, 0.05f);
         n += cancelMenusUnder(app, 0, until);
         CFRelease(app);
     }
@@ -1860,9 +1989,9 @@ static void glideStep(void) {
 static dispatch_queue_t glideWatchQueue;
 
 static BOOL scrollValue(AXUIElementRef bar, double *value) {
-    CFTypeRef v = NULL;
-    if (AXUIElementCopyAttributeValue(bar, kAXValueAttribute, &v) != kAXErrorSuccess || !v) return NO;
-    BOOL ok = CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberDoubleType, value);
+    CFTypeRef v = copyAttribute(bar, kAXValueAttribute);
+    if (!v) return NO;
+    BOOL ok = CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberDoubleType, value) && !isnan(*value);
     CFRelease(v);
     return ok;
 }
@@ -1870,34 +1999,47 @@ static BOOL scrollValue(AXUIElementRef bar, double *value) {
 static void watchGlide(unsigned number, CGPoint at, BOOL across, BOOL down) {
     if (!trusted()) return;
     dispatch_async(glideWatchQueue, ^{
+        axTimedOut = NO;
+        if (isCodeEditorApp(NSWorkspace.sharedWorkspace.frontmostApplication)) return;
+        AXUIElementRef wide = AXUIElementCreateSystemWide();
+        if (!wide) return;
+        AXUIElementSetMessagingTimeout(wide, 0.03f);
         AXUIElementRef hit = NULL, area = NULL;
-        if (AXUIElementCopyElementAtPosition(systemWide(), (float)at.x, (float)at.y, &hit) != kAXErrorSuccess || !hit) return;
+        AXError hitErr = AXUIElementCopyElementAtPosition(wide, (float)at.x, (float)at.y, &hit);
+        AXUIElementSetMessagingTimeout(wide, 0.05f);
+        CFRelease(wide);
+        if (hitErr != kAXErrorSuccess || !hit) return;
+        if (isCodeEditorElement(hit)) {
+            CFRelease(hit);
+            return;
+        }
         AXUIElementRef e = hit;
-        for (int depth = 0; e && depth < 24; depth++) {
+        for (int depth = 0; e && depth < 24 && !axTimedOut; depth++) {
             if ([roleOf(e) isEqualToString:@"AXScrollArea"]) {
                 area = e;
                 break;
             }
+            if (axTimedOut) break;
             AXUIElementRef up = copyElement(e, kAXParentAttribute);
             if (e != hit) CFRelease(e);
             e = up;
         }
         if (e && e != area && e != hit) CFRelease(e);
-        AXUIElementRef bars[2] = {down && area ? copyElement(area, kAXVerticalScrollBarAttribute) : NULL,
-                                  across && area ? copyElement(area, kAXHorizontalScrollBarAttribute) : NULL};
+        AXUIElementRef bars[2] = {!axTimedOut && down && area ? copyElement(area, kAXVerticalScrollBarAttribute) : NULL,
+                                  !axTimedOut && across && area ? copyElement(area, kAXHorizontalScrollBarAttribute) : NULL};
         if (area && area != hit) CFRelease(area);
         CFRelease(hit);
         double last[2] = {NAN, NAN};
         BOOL moved = NO;
         int still = 0;
-        for (int i = 0; i < 100 && (bars[0] || bars[1]); i++) { // checked every 50 ms, for as long as a glide can last
+        for (int i = 0; i < 100 && !axTimedOut && (bars[0] || bars[1]); i++) { // checked every 50 ms, for as long as a glide can last
             usleep(50000);
             if (atomic_load(&glideNumber) != number) break;
             BOOL changed = NO, atEnd = YES, read = YES;
             for (int k = 0; k < 2; k++) {
                 if (!bars[k]) continue;
-                double v;
-                if (!scrollValue(bars[k], &v)) {
+                double v = NAN;
+                if (!scrollValue(bars[k], &v) || isnan(v)) {
                     read = NO;
                     break;
                 }
@@ -2550,9 +2692,9 @@ static void applyLightweightUIFlags(void) {
         CFPreferencesSetAppValue(CFSTR("NSAutomaticDashSubstitutionEnabled"), kCFBooleanFalse, kCFPreferencesAnyApplication);
         CFPreferencesSetAppValue(CFSTR("AppleEnableSwipeNavigateWithScrolls"), kCFBooleanFalse, kCFPreferencesAnyApplication);
         CFPreferencesSetAppValue(CFSTR("AppleMiniaturizeOnDoubleClick"), kCFBooleanFalse, kCFPreferencesAnyApplication);
-        // Keep Electron/Chromium IDEs (e.g. Antigravity, VS Code) and helper workers unthrottled by App Nap
-        CFPreferencesSetAppValue(CFSTR("NSAppSleepDisabled"), kCFBooleanTrue, kCFPreferencesAnyApplication);
-        CFPreferencesSetAppValue(CFSTR("NSDisableAutomaticTermination"), kCFBooleanTrue, kCFPreferencesAnyApplication);
+        // Restore normal macOS App Nap and automatic termination (undoing v42's global disablement)
+        CFPreferencesSetAppValue(CFSTR("NSAppSleepDisabled"), NULL, kCFPreferencesAnyApplication);
+        CFPreferencesSetAppValue(CFSTR("NSDisableAutomaticTermination"), NULL, kCFPreferencesAnyApplication);
         CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
 
         // Avoid .DS_Store metadata writes over VirtIOFS shared folders and USB drives, and skip Time Machine disk prompts
@@ -2608,25 +2750,12 @@ static void applyLightweightUIFlags(void) {
             CFNotificationCenterPostNotification(dist, CFSTR("com.apple.controlcenter.prefschanged"), NULL, NULL, YES);
             CFNotificationCenterPostNotification(dist, CFSTR("AppleNoRedisplayAppearancePreferenceChanged"), NULL, NULL, YES);
         }
-        note(@"applied lightweight macOS UI preferences (reduced motion/transparency, zero-delay animations, App Nap disabled)");
+        note(@"applied lightweight macOS UI preferences (reduced motion/transparency, zero-delay animations, App Nap restored)");
     }
 }
 
-// Restarts Dock once per boot/agent-version so snapshot-resumed Macs flush cached notification badge
-// textures and pick up updated Dock preferences without crash-looping.
 static void refreshDockCacheOnce(void) {
-    char marker[64];
-    snprintf(marker, sizeof marker, "/tmp/.henge-agent-dock-v%d-%u", HV_AGENT_VERSION, (unsigned)getuid());
-    int fd = open(marker, O_CREAT | O_EXCL | O_WRONLY, 0644);
-    if (fd < 0) return;
-    close(fd);
-    char *args[] = {"/usr/bin/killall", "Dock", NULL};
-    pid_t pid = 0;
-    if (posix_spawn(&pid, args[0], NULL, NULL, args, environ) == 0) {
-        int st = 0;
-        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-        note(@"refreshed Dock badge cache (one-time restart for v42)");
-    }
+    // No-op: avoid running killall Dock on live systems, which causes a multi-second Dock restart and WindowServer spike.
 }
 
 // Populates System Profiler's "CPU Names" cache from IODeviceTree:/ model-number so About This Mac
@@ -4230,7 +4359,8 @@ static void applySystemLightweightFlags(void) {
         CFPreferencesSetValue(CFSTR("reduceTransparency"), kCFBooleanTrue, ua, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
         CFPreferencesSynchronize(ua, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
 
-        CFPreferencesSetValue(CFSTR("NSAppSleepDisabled"), kCFBooleanTrue, kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
+        CFPreferencesSetValue(CFSTR("NSAppSleepDisabled"), NULL, kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
+        CFPreferencesSetValue(CFSTR("NSDisableAutomaticTermination"), NULL, kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
         CFPreferencesSynchronize(kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
 
         // Control Center: show Battery in Menu Bar

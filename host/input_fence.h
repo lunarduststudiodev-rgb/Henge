@@ -11,7 +11,7 @@
 
 #include <stdint.h>
 
-#define HV_FENCE_LIMIT_MS 300
+#define HV_FENCE_LIMIT_MS 120
 #define HV_FENCE_CONTACTS 10
 
 typedef struct HvFenceEvent HvFenceEvent;
