@@ -19,9 +19,13 @@ the packager as an environment variable (`HENGE_ENTITLEMENTS=... ios/scripts/pac
   on-device pairing on iOS 27). The app claims one 1 GB region per launch
   (`JITBootstrap.jitBytes`) and the engine writes through a `vm_remap`'d alias
   (`host/jit_region.c`, split mode).
-- **Memory**: `increased-memory-limit` is recommended, not required. Once a
-  debugger has attached, guest RAM is kept out of the app's memory limit, and if
-  iOS refuses that it comes from a file on free storage instead.
+- **Memory**: `increased-memory-limit` and `extended-virtual-addressing` are
+  both included in `Henge/Henge.entitlements` (and preserved by
+  `package_ipa.sh --trollstore`). Once a debugger has attached, guest RAM is kept
+  out of the app's memory limit, and if iOS refuses that it comes from a file on
+  free storage instead. 6 GB guest RAM is selectable on iPads with >= 8 GB
+  physical RAM when both entitlements are signed (4 GB remains suggested on 8 GB
+  iPads to avoid iPadOS compression thrashing).
 - **Machines** are installed on the iPhone from Apple's restore image
   (`Installer.swift`, [docs/architecture.md](../docs/architecture.md)). A machine
   can also be exported from the app, or made on a Mac with

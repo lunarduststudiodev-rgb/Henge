@@ -124,7 +124,7 @@ struct InstallView: View {
                 .padding(.horizontal, 17)
                 .padding(.vertical, 14)
             Rectangle().fill(Desk.hairline).frame(height: 0.5)
-            Stepper(value: $ramGB, in: Device.memoryChoices) {
+            Stepper(value: $ramGB, in: Device.selectableMemoryChoices) {
                 HStack {
                     Text("Memory").font(.system(size: 16))
                     Spacer()
@@ -135,6 +135,13 @@ struct InstallView: View {
             .padding(.vertical, 10)
             if Device.memoryNote(ramGB) != nil {
                 MemoryNote(gb: ramGB)
+                    .padding(.horizontal, 17)
+                    .padding(.bottom, 10)
+            }
+            if Device.isPad && Device.physicalMemoryMB >= 7_000 && !Device.supports6GBGuest {
+                Text("6 GB requires the increased-memory and extended-virtual-addressing entitlements.")
+                    .font(.system(size: 13)).foregroundStyle(Desk.dim)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 17)
                     .padding(.bottom, 10)
             }

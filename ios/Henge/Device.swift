@@ -30,6 +30,53 @@ extension Device {
         henge_vm_set_device_info(id.modelName, id.socName)
     }
 
+    // MARK: - Guest memory limits
+
+    /// Physical RAM reported by iOS in MiB (~7400–7600 MiB on an 8 GB iPad).
+    static var physicalMemoryMB: UInt64 { ProcessInfo.processInfo.physicalMemory >> 20 }
+
+    /// Whether this device can select and run a 6 GB (6144 MiB) guest without immediate jetsam:
+    /// requires an iPad with >= 8 GB physical RAM (>= 7000 MiB usable) and both memory entitlements.
+    static var supports6GBGuest: Bool {
+        supports6GBGuest(
+            isPad: isPad,
+            physicalMemoryMB: physicalMemoryMB,
+            increasedMemory: Entitlements.increasedMemory,
+            extendedAddressing: Entitlements.extendedAddressing
+        )
+    }
+
+    static func supports6GBGuest(isPad: Bool, physicalMemoryMB: UInt64,
+                                 increasedMemory: Bool, extendedAddressing: Bool) -> Bool {
+        isPad && physicalMemoryMB >= 7_000 && increasedMemory && extendedAddressing
+    }
+
+    /// Maximum guest RAM (in GB) selectable on this device without risking guaranteed jetsam.
+    static var maxSelectableRAMGB: Int {
+        maxSelectableRAMGB(
+            isPad: isPad,
+            physicalMemoryMB: physicalMemoryMB,
+            suggestedRAMGB: suggestedRAMGB,
+            increasedMemory: Entitlements.increasedMemory,
+            extendedAddressing: Entitlements.extendedAddressing
+        )
+    }
+
+    static func maxSelectableRAMGB(isPad: Bool, physicalMemoryMB: UInt64, suggestedRAMGB: Int,
+                                   increasedMemory: Bool, extendedAddressing: Bool) -> Int {
+        guard increasedMemory else { return min(suggestedRAMGB, 3) }
+        guard extendedAddressing else { return min(suggestedRAMGB, 4) }
+        if physicalMemoryMB >= 14_000 { return memoryChoices.upperBound }
+        if physicalMemoryMB >= 10_000 { return isPad ? 8 : 6 }
+        if isPad && physicalMemoryMB >= 7_000 { return 6 }
+        return suggestedRAMGB
+    }
+
+    /// Selectable guest RAM choices in GB for this device and its signed entitlements.
+    static var selectableMemoryChoices: ClosedRange<Int> {
+        1...max(1, maxSelectableRAMGB)
+    }
+
     private static let knownModels: [String: HostIdentity] = [
         // iPad Pro (M1, 2021)
         "iPad13,4": HostIdentity(modelName: "iPad Pro (11-inch, M1)", socName: "Apple M1"),

@@ -53,8 +53,19 @@ enum GuestMemory {
             .volumeAvailableCapacityForImportantUsage ?? 0
         let room = free > 0 ? UInt64(max(free - (2 << 30), 0)) >> 20 : UInt64.max
         let reach = henge_largest_mapping_mb()
-        let ram = min(UInt64(mac.ramMB), room, reach > 512 ? reach - 512 : 0) / 512 * 512
-        HengeLog.log("session", "guest RAM \(ram) MB (asked \(mac.ramMB), disk room \(room), largest mapping \(reach))")
+        let mappingCap = reach > 512 ? reach - 512 : 0
+        let deviceCap = UInt64(Device.maxSelectableRAMGB) * 1024
+        let asked = UInt64(mac.ramMB)
+        let ram = min(asked, room, mappingCap, deviceCap) / 512 * 512
+        var clampReasons: [String] = []
+        if ram < asked {
+            if room < asked { clampReasons.append("disk room \(room) MB") }
+            if mappingCap < asked { clampReasons.append("largest mapping - 512 = \(mappingCap) MB") }
+            if deviceCap < asked { clampReasons.append("device/entitlement limit \(deviceCap) MB") }
+            if clampReasons.isEmpty { clampReasons.append("512 MB alignment") }
+        }
+        let clampNote = clampReasons.isEmpty ? "" : "; clamped by \(clampReasons.joined(separator: ", "))"
+        HengeLog.log("session", "guest RAM \(ram) MB (asked \(mac.ramMB), disk room \(room), largest mapping \(reach)\(clampNote))")
         lastRoomMB = room
         return ram
     }

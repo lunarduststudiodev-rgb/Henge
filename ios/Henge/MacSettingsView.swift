@@ -32,7 +32,7 @@ struct MacSettingsView: View {
                         Text("Up to \(Device.suggestedRAMGB) GB suggested on this \(Device.name)")
                             .font(.system(size: 13)).foregroundStyle(Desk.dim).multilineTextAlignment(.trailing)
                     }
-                    Stepper("Memory", value: Binding(get: { mac.ramMB / 1024 }, set: { mac.ramMB = $0 * 1024; save() }), in: Device.memoryChoices)
+                    Stepper("Memory", value: Binding(get: { mac.ramMB / 1024 }, set: { mac.ramMB = $0 * 1024; save() }), in: Device.selectableMemoryChoices)
                         .font(.system(size: 16))
                     MemoryNote(gb: mac.ramMB / 1024)
                     if Device.memoryTooHigh(mac.ramMB / 1024) {
@@ -46,6 +46,12 @@ struct MacSettingsView: View {
                         .buttonStyle(.bordered)
                         .tint(Desk.warn)
                     }
+                    if Device.isPad && Device.physicalMemoryMB >= 7_000 && !Device.supports6GBGuest {
+                        Text("6 GB requires the increased-memory and extended-virtual-addressing entitlements.")
+                            .font(.system(size: 13)).foregroundStyle(Desk.dim)
+                    }
+                    Text("Applies the next time this Mac starts from cold; a suspended Mac carries on with its saved memory.")
+                        .font(.system(size: 13)).foregroundStyle(Desk.dim)
                 }
                 .padding(17)
                 .deskCard()
