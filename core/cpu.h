@@ -162,7 +162,7 @@ typedef struct HvCpu {
     /* TLB slots (table << HV_TLB_BITS | index) filled with user addresses since the
        last user flush, so a context switch clears those instead of scanning all
        three tables. More than HV_USER_FILLS means: scan. */
-#define HV_USER_FILLS 2048
+#define HV_USER_FILLS 4096
     uint16_t user_fills[HV_USER_FILLS];
     uint32_t nuser_fills;
     /* The same for kernel entries, so a whole-TLB flush (macOS 27 asks for hundreds a second) clears
@@ -273,7 +273,7 @@ typedef struct HvCpu {
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
    indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
 #define HV_IJC_BITS 18
-#define HV_UCODE_BITS 18
+#define HV_UCODE_BITS 20
 #define HV_IJC_TABLE_BYTES ((1u << HV_IJC_BITS) * 16)
 #define HV_CPU_TLB_EL      32 /* between a slot's tables */
 

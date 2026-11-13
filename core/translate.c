@@ -805,7 +805,7 @@ static int superblocks(void) {
    must not fall through: their taken edge is hot and must not be pushed out of line. */
 static int go_on(Emit *e, uint64_t pc, uint64_t target) {
     if (target <= pc) return 0;
-    return ((pc + 4) & ~e->page_mask) == e->page && e->cur_i + 1 < 48;
+    return ((pc + 4) & ~e->page_mask) == e->page && e->cur_i + 1 < 64;
 }
 
 /* Calls and returns the way the host's CPU can predict them. It keeps a stack of return
@@ -835,7 +835,8 @@ static int use_ras(const Emit *e) {
 }
 
 static void put_call(Emit *e, uint64_t ret) {
-    uint32_t off = HV_CPU_RET_TAB + hv_ijc_table(e->flags) * HV_RET_TAB_BYTES + (((uint32_t)ret >> 2) & ((1u << HV_RET_BITS) - 1)) * 16;
+    uint32_t idx = (uint32_t)(((ret >> 2) ^ (ret >> (2 + HV_RET_BITS))) & ((1u << HV_RET_BITS) - 1));
+    uint32_t off = HV_CPU_RET_TAB + hv_ijc_table(e->flags) * HV_RET_TAB_BYTES + idx * 16;
     uint32_t to_l = e->n;
     put(e, 0x94000000u); /* bl L */
     put_branch_exit(e, ret, 1);
@@ -851,7 +852,8 @@ static void put_call(Emit *e, uint64_t ret) {
 /* The other half: a return. A miss goes through the indirect-branch cache. */
 static void put_return(Emit *e) {
     uint32_t tab = HV_CPU_RET_TAB + hv_ijc_table(e->flags) * HV_RET_TAB_BYTES;
-    put(e, UBFM_X(7, 30, 2, 2 + HV_RET_BITS - 1));                        /* ubfx x7, x30, #2, #bits */
+    put(e, 0xca400000u | 30u << 16 | (uint32_t)HV_RET_BITS << 10 | 30u << 5 | 7u); /* eor x7, x30, x30, lsr #bits */
+    put(e, UBFM_X(7, 7, 2, 2 + HV_RET_BITS - 1));                        /* ubfx x7, x7, #2, #bits */
     put(e, ADD_LSL(7, 28, 7, 4));
     put(e, 0x91400000u | (tab >> 12) << 10 | 7 << 5 | 7);                 /* add x7, x7, #tab, lsl #12 */
     put(e, 0xa9400000u | 6 << 10 | 7 << 5 | 15);                          /* ldp x15, x6, [x7] */

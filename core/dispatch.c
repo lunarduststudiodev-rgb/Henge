@@ -1328,6 +1328,10 @@ static uint32_t wfe(HvCpu *cpu) {
     HvPerCpu *pcs = cpu->pc_state;
     int timed_out = 0;
     __atomic_store_n(&pcs->wfe_waiting, 1, __ATOMIC_RELAXED);
+    /* Not using the TLB while waiting on the already-resolved RAM address or sleeping below,
+       so peer hv_cpu_sync calls complete immediately instead of blocking on a spinning/depressed vCPU. */
+    __atomic_store_n(&pcs->tlb_live, 0, __ATOMIC_SEQ_CST);
+    hv_cpu_ack_wake(cpu);
     for (;;) {
         uint64_t v;
         switch (size) { /* LDAXR arms the host monitor too, so the WFE below wakes on a write */
@@ -1358,10 +1362,14 @@ static uint32_t wfe(HvCpu *cpu) {
             pcs->wfe_spin_rounds = 0;
             if (cpu->m->stats_interval) HV_CPU_COUNT(cpu, wfe_yields, 1);
             /* Every other runnable thread here first, this one's priority lowered until it runs again (or 1 ms).
-               Nothing is held: the dispatcher sees exit_req next and answers requests as usual. */
-            thread_switch(MACH_PORT_NULL, SWITCH_OPTION_DEPRESS, 1);
+               Skip sleeping if stop_the_world or a machine pause is waiting for this vCPU to reach the gate. */
+            if (!__atomic_load_n(&cpu->m->stw_active, __ATOMIC_RELAXED) &&
+                !__atomic_load_n(&cpu->m->pause_req, __ATOMIC_RELAXED))
+                thread_switch(MACH_PORT_NULL, SWITCH_OPTION_DEPRESS, 1);
         }
     }
+    __atomic_store_n(&pcs->tlb_live, 1, __ATOMIC_SEQ_CST);
+    hv_cpu_process_requests(cpu);
     __atomic_store_n(&pcs->wfe_waiting, 0, __ATOMIC_RELAXED); /* the core given up above is part of the spin */
     return 0;
 }

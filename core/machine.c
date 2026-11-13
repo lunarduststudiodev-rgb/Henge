@@ -432,6 +432,8 @@ static void knobs_init(void) {
     for (int i = 0; i < HV_K_COUNT; i++)
         hv_knob[i] = getenv(hv_knob_names[i]) ? atoi(getenv(hv_knob_names[i])) : 0;
     if (getenv("HV_NO_RAS") && !*getenv("HV_NO_RAS")) hv_knob[HV_K_NO_RAS] = 1;
+    if (!getenv("HV_SYNC_WAIT")) hv_knob[HV_K_SYNCWAIT] = 1;
+    if (!getenv("HV_RANGE_DROP")) hv_knob[HV_K_RANGEDROP] = 1024;
     /* HV_SWITCH_FLUSH stays off unless asked (it was on by default from e540907): on the iPad (2026-11-09) its own
        checks found entries macOS had removed, a kernel page among them, still held when macOS asked for the flush
        it leaves out (tests/test_switch_flush.c). */
@@ -713,7 +715,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
         if (ack >= seq) break;
         if (!__atomic_load_n(&t->tlb_live, __ATOMIC_SEQ_CST)) break; /* parked: it does the work before it runs again */
         if (self) hv_cpu_process_requests(self);
-        if (sleep && spins >= 64) {
+        if (sleep && spins >= 32) {
             __atomic_add_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
             /* Asleep until ack_seq's low word moves or 100 us pass (a missed wake costs no more than that). */
             if (__atomic_load_n(&t->ack_seq, __ATOMIC_SEQ_CST) == ack && __atomic_load_n(&t->tlb_live, __ATOMIC_SEQ_CST))
@@ -721,6 +723,8 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
             __atomic_sub_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
         } else if (spins > 200) {
             sched_yield();
+        } else {
+            __asm__ volatile("yield" ::: "memory");
         }
     }
     if (s) {

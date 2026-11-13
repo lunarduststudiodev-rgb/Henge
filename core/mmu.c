@@ -1300,15 +1300,18 @@ void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
         uint32_t ch = (uint32_t)(b->va >> 25) & 255, cid = (uint32_t)(cpu->ijc_salt[0] >> 48); /* the id after any reset in ucode_add */
         pcs->cid_chunks[cid][ch >> 6] |= 1ull << (ch & 63);
     }
-    uint32_t k = hv_ijc_key(b->va, cpu->ijc_salt[kernel]);
-    if (!(pcs->ijc_keyed[k >> 6] >> (k & 63) & 1)) {
-        pcs->ijc_keyed[k >> 6] |= 1ull << (k & 63);
-        pcs->ijc_keyed_used |= HV_PART(k >> 6, 14);
-        if (++pcs->ijc_keyed_count > (1u << 17)) { /* an eighth full: start the cache and the filter over */
-            HV_CPU_COUNT(cpu, reset_why[6], 1);
-            hv_ijc_reset(cpu, 0);
-            hv_ijc_reset(cpu, 1);
-            keyed_clear(pcs);
+    if (kernel) {
+        /* ijc_keyed is only queried for kernel VAs (ijc_drop_va); keeping user VAs out stops multi-process apps
+           from overflowing it and triggering unnecessary user+kernel branch cache resets. */
+        uint32_t k = hv_ijc_key(b->va, cpu->ijc_salt[1]);
+        if (!(pcs->ijc_keyed[k >> 6] >> (k & 63) & 1)) {
+            pcs->ijc_keyed[k >> 6] |= 1ull << (k & 63);
+            pcs->ijc_keyed_used |= HV_PART(k >> 6, 14);
+            if (++pcs->ijc_keyed_count > (1u << 17)) { /* an eighth full: start the kernel cache and filter over */
+                HV_CPU_COUNT(cpu, reset_why[6], 1);
+                hv_ijc_reset(cpu, 1);
+                keyed_clear(pcs);
+            }
         }
     }
     pcs->last_fill[kernel] = (b->va & ~(uint64_t)PAGE_MASK) ^ cpu->ijc_salt[kernel] ^ 1; /* the salt after any reset above */
@@ -1359,7 +1362,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
     int kernel = flags & HV_BLOCK_EL1;
 #define FAIL(k) do { if (m->stats_interval) HV_CPU_COUNT(cpu, light_fail[k], 1); return 0; } while (0)
     if (!m->chain || hv_at_stop(m, va) || (int)((va >> 55) & 1) != kernel || (va & 3)) FAIL(0);
-    if (pcs->ijc_keyed_count >= (1u << 17) || pcs->ucode_count + 1 >= (1u << HV_UCODE_BITS) / 2) FAIL(1);
+    if (kernel ? pcs->ijc_keyed_count >= (1u << 17) : pcs->ucode_count + 1 >= (1u << HV_UCODE_BITS) / 2) FAIL(1);
     if (!hv_tlb_is_ready(cpu)) FAIL(2); /* as hv_tlb_refill: the dispatcher readies it */
     unsigned bits;
     int table = hv_tlb_block_table(flags, &bits);
