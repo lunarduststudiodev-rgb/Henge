@@ -286,7 +286,8 @@ static struct Conn *conn_find(const Tcp *t) {
     uint32_t h = conn_hash_fn(t->far_ip, t->guest_port, t->far_port);
     for (int step = 0; step < 16; step++) {
         int idx = conn_hash[(h + step) & CONN_HASH_MASK];
-        if (idx < 0) return NULL;
+        if (idx == -1) return NULL;
+        if (idx < 0) continue;
         struct Conn *c = &conns[idx];
         if (c->opened && c->far_ip == t->far_ip && c->guest_port == t->guest_port && c->far_port == t->far_port) return c;
     }
@@ -344,7 +345,7 @@ static void track(const uint8_t *frame, uint32_t len, int to_guest_dir) {
                 uint32_t old_h = conn_hash_fn(c->far_ip, c->guest_port, c->far_port);
                 for (int step = 0; step < 16; step++) {
                     uint32_t pos = (old_h + step) & CONN_HASH_MASK;
-                    if (conn_hash[pos] == slot) { conn_hash[pos] = -1; break; }
+                    if (conn_hash[pos] == slot) { conn_hash[pos] = -2; break; }
                 }
             }
             *c = (struct Conn){.far_ip = t.far_ip, .guest_port = t.guest_port, .far_port = t.far_port, .opened = now};
@@ -762,8 +763,6 @@ static int make_slirp(void) {
 static void restart(void) {
     if (slirp) slirp_cleanup(slirp); /* closes every socket it had, the shared folder's connection with them */
     for (int i = 0; i < MAX_TIMERS; i++) timers[i].used = 0;
-    conn_hash_inited = 0;
-    memset(conns, 0, sizeof conns);
     slirp = NULL;
     restarts++;
     hv_dns_network_changed();

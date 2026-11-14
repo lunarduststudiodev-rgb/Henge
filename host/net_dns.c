@@ -84,6 +84,7 @@ typedef struct Pending {
     int fd[2];       /* IPv4, IPv6 */
     int64_t t0, next_send;
     int gai;         /* 0 not asked, 1 asking, 2 done */
+    int gai_empty;   /* 1 when getaddrinfo returned no addresses (EAI_NONAME/EAI_NODATA) */
     uint64_t token;
     uint8_t *fallback; /* the best refusal so far */
     uint32_t fallback_len;
@@ -491,6 +492,7 @@ static void keep_refusal(Pending *p, const uint8_t *msg, uint32_t len) {
 
 static void give_up(Pending *p) {
     if (p->fallback) send_to_guest(&p->q, p->fallback, p->fallback_len);
+    else if (p->gai_empty) answer_here(p, 0, NULL, 0, p->gai_type == 1 ? 4 : 16);
     else answer_here(p, 2, NULL, 0, 0); /* SERVFAIL */
     finish(p);
 }
@@ -757,12 +759,12 @@ static void gai_finished(GaiJob *j) {
         Pending *p = &pend[i];
         if (!p->used || p->token != j->token) continue;
         p->gai = 2;
-        if (j->status == 2) {
+        if (j->status != 0 || j->n == 0) {
+            if (j->status == 1) p->gai_empty = 1;
             maybe_done(p);
             continue;
         }
-        /* The host's own resolver has its say. With no address of that kind, an empty answer, not "no
-           such name", so the other kind still works. */
+        /* The host's own resolver has its say. */
         if (!told_gai) fprintf(stderr, "hengevm: dns: no DNS server answers; asking the host's own resolver\n");
         told_gai = 1;
         uint8_t out[ANSWER_MAX];
