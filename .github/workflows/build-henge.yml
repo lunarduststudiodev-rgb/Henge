@@ -1,7 +1,7 @@
-# Builds this branch (walriyami/Henge's code, kept here as it is) from the fork's Actions tab:
-# Actions > Build Henge IPA > Run workflow > branch walriyami-fork. It has the same file name as the
-# workflow on main so that GitHub lists it; the steps are the "ipa" job of this tree's own
-# .github/workflows/dev-build.yml, without the Mac test jobs.
+# Builds and tests this branch from the fork's Actions tab:
+# Actions > Build Henge IPA > Run workflow > branch walriyami-fork. Combines the "mac-tests" and
+# "ipa" jobs from .github/workflows/dev-build.yml so workflow_dispatch verifies the Mac tests and
+# builds Henge.ipa / Henge.tipa.
 
 name: Build Henge IPA
 
@@ -12,6 +12,29 @@ permissions:
   contents: read
 
 jobs:
+  mac-tests:
+    name: Engine tests (Mac)
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the libraries the Mac build links
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: brew install pkg-config cmake glib libimobiledevice libtatsu libzip
+
+      - name: Build
+        run: make -j"$(sysctl -n hw.ncpu)" all
+
+      - name: Test
+        run: make test
+
+      # The tests that drive the host's GPU (Metal), which make test leaves out; run whatever make test said
+      - name: GPU tests
+        if: ${{ !cancelled() }}
+        run: make test-gpu
+
   ipa:
     name: Henge.ipa
     runs-on: xcode-27
