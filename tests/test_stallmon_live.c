@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../core/cpu.h"
@@ -25,10 +26,12 @@
 __thread HvCpu *hv_self;
 void (*hv_prof_register)(void);
 static HvMachine machine;
-static _Atomic uint64_t frames;
+static _Atomic int done, frames_on = 1, cpu0_burn, cpu1_stall;
+static _Atomic uint64_t frozen_frame;
+static uint64_t wall_frame(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 16000000ull; }
 HvMachine *hv_vm_machine(void) { return &machine; }
 int hv_vm_paused(void) { return 0; }
-uint64_t hv_vm_gpu_frames(void) { return atomic_load(&frames); }
+uint64_t hv_vm_gpu_frames(void) { return atomic_load(&frames_on) ? wall_frame() : atomic_load(&frozen_frame); }
 void hv_vm_gfx_stages(uint32_t ms[5]) { memset(ms, 0, 5 * sizeof *ms); }
 
 static int running(void) { return 1; }
@@ -46,7 +49,6 @@ static int failures;
         }                                                                                                              \
     } while (0)
 
-static _Atomic int done, frames_on = 1, cpu0_burn, cpu1_stall;
 static pthread_mutex_t held = PTHREAD_MUTEX_INITIALIZER;
 static HvCpu *cpus[2];
 
@@ -84,15 +86,6 @@ static void *cpu_thread(void *arg) {
             p->active = 0;
             usleep(2000);
         }
-    }
-    return NULL;
-}
-
-static void *frame_thread(void *unused) {
-    (void)unused;
-    while (!atomic_load(&done)) {
-        if (atomic_load(&frames_on)) atomic_fetch_add(&frames, 1);
-        usleep(16000);
     }
     return NULL;
 }
@@ -135,14 +128,15 @@ static void *scenario(void *unused) {
     (void)unused;
     pthread_t t;
     for (int i = 0; i < 2; i++) pthread_create(&t, NULL, cpu_thread, (void *)(intptr_t)i);
-    pthread_create(&t, NULL, frame_thread, NULL);
     usleep(1000000); /* frames flowing, CPUs asleep */
 
     pthread_mutex_lock(&held);
     atomic_store(&cpu1_stall, 1);
     atomic_store(&cpu0_burn, 1);
+    usleep(20000);
+    atomic_store(&frozen_frame, wall_frame());
     atomic_store(&frames_on, 0);
-    usleep(400000);
+    usleep(600000);
     atomic_store(&frames_on, 1);
     atomic_store(&cpu0_burn, 0);
     pthread_mutex_unlock(&held);
@@ -167,7 +161,9 @@ static void *scenario(void *unused) {
             CHECK(names_fn(c1, (void *)stuck_on_lock), "cpu1's stack doesn't show stuck_on_lock: %s", c1);
             CHECK(thread_count(line, "cpu0", "engine") >= 10, "cpu0 working: %s", line);
             CHECK(names_fn(c0, (void *)burn), "cpu0's stack doesn't show burn: %s", c0);
-            CHECK(strstr(line, "\"ms\":4") || strstr(line, "\"ms\":3"), "hitch length: %s", line);
+            const char *mp = strstr(line, "\"ms\":");
+            int hitch_ms = mp ? atoi(mp + 5) : 0;
+            CHECK(hitch_ms >= 450 && hitch_ms <= 950, "hitch length: %s", line);
             free(c0), free(c1);
         } else if (strstr(line, "\"kind\":\"app\"")) {
             apps++;

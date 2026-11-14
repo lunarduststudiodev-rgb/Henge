@@ -30,10 +30,9 @@
 __thread HvCpu *hv_self;
 void (*hv_prof_register)(void);
 static HvMachine machine;
-static _Atomic uint64_t frames;
 HvMachine *hv_vm_machine(void) { return &machine; }
 int hv_vm_paused(void) { return 0; }
-uint64_t hv_vm_gpu_frames(void) { return atomic_load(&frames); }
+uint64_t hv_vm_gpu_frames(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 16000000ull; }
 void hv_vm_gfx_stages(uint32_t ms[5]) { memset(ms, 0, 5 * sizeof *ms); }
 static int running(void) { return 1; }
 static double no_input(void) { return -1; }
@@ -51,12 +50,6 @@ static int failures;
     } while (0)
 
 static _Atomic int done, burning;
-
-static void *frame_thread(void *unused) {
-    (void)unused;
-    while (!atomic_load(&done)) atomic_fetch_add(&frames, 1), usleep(16000);
-    return NULL;
-}
 
 enum { BURNERS = 4 };
 static uint64_t wall_us(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000; }
@@ -107,7 +100,6 @@ static const char *dir;
 static void *scenario(void *unused) {
     (void)unused;
     pthread_t t;
-    pthread_create(&t, NULL, frame_thread, NULL);
     for (int i = 0; i < BURNERS; i++) pthread_create(&t, NULL, burner, NULL);
     usleep(300000);
 

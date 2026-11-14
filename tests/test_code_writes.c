@@ -20,6 +20,7 @@
 
 #include "dispatch.h"
 #include "machine.h"
+#include "../host/jit_region.h"
 #include "evict_lists.h"
 #include "zalloc.h"
 
@@ -105,6 +106,14 @@ void sys_icache_invalidate(void *start, size_t len) {
     __asm__ volatile("dsb ish\n\tisb" ::: "memory");
 }
 
+static void finish2_hook(void) {
+    if (poke_word) {
+        uint32_t v = poke_word;
+        poke_word = 0;
+        write32(F, v);
+    }
+}
+
 /* 6: two threads keep rewriting F (movz x0, #4 / #5) until told to stop. */
 static volatile int writing;
 static void *rewriter(void *arg) {
@@ -132,6 +141,7 @@ static void calm(void) {
 
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    hv_jit_finish2_test_hook = finish2_hook;
     if (hv_machine_init(&machine, 64u << 20) != 0) return 1;
     machine.chain = 1;
     ram = aligned_alloc(PAGE, (size_t)NPAGES * PAGE);
@@ -307,7 +317,8 @@ int main(void) {
     run(0, C_CALL, 0, F);
     write32(RPAGE + 0x2000, 0); /* R's page written where no code came from: */
     check(block(RPAGE) != NULL, "  (R's blocks kept by a write elsewhere on the page)");
-    write32(RPAGE + 4 * 70, 0xd503201f); /* in their piece: all retired */
+    write32(RPAGE + 4 * 10, 0xd503201f); /* in piece 0 (blocks 0..63) */
+    write32(RPAGE + 4 * 70, 0xd503201f); /* in piece 1 (block 64): all retired */
     check(block(RPAGE) == NULL, "R's blocks retired");
     hv_jit_make_room(&machine, -1);
     printf("zones: R's %d, S's %d; emptied and filled next: %d\n", zr, zs, machine.zone);

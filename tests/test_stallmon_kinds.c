@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../core/cpu.h"
@@ -28,10 +29,12 @@
 __thread HvCpu *hv_self;
 void (*hv_prof_register)(void);
 static HvMachine machine;
-static _Atomic uint64_t frames;
+static _Atomic int done, frames_on = 1, spin, fault, wait_lock;
+static _Atomic uint64_t frozen_frame;
+static uint64_t wall_frame(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 16000000ull; }
 HvMachine *hv_vm_machine(void) { return &machine; }
 int hv_vm_paused(void) { return 0; }
-uint64_t hv_vm_gpu_frames(void) { return atomic_load(&frames); }
+uint64_t hv_vm_gpu_frames(void) { return atomic_load(&frames_on) ? wall_frame() : atomic_load(&frozen_frame); }
 void hv_vm_gfx_stages(uint32_t ms[5]) { memset(ms, 0, 5 * sizeof *ms); }
 static int running(void) { return 1; }
 static double no_input(void) { return -1; }
@@ -50,7 +53,6 @@ static int failures;
 
 enum { NCPU = 3 };
 static HvCpu *cpus[NCPU];
-static _Atomic int done, frames_on = 1, spin, fault, wait_lock;
 static pthread_mutex_t held = PTHREAD_MUTEX_INITIALIZER;
 #define MAP_LEN (64u << 20)
 static volatile uint8_t *map;
@@ -72,8 +74,11 @@ __attribute__((noinline, used)) static void wfe_wait(HvPerCpu *p) {
 /* Guest RAM the host has let go of: every page comes back from the file */
 __attribute__((noinline, used)) static void fault_in(void) {
     volatile uint64_t sum = 0;
-    while (atomic_load(&fault))
-        for (size_t i = 0; i < MAP_LEN && atomic_load(&fault); i += 16384) sum += map[i];
+    size_t idx = 0;
+    while (atomic_load(&fault)) {
+        sum += map[idx];
+        idx = (idx + 17 * 16384) & (MAP_LEN - 1);
+    }
 }
 
 /* Drops the mapping's pages while cpu1 reads them, from its own thread: an msync on cpu1 would be a call to the
@@ -108,15 +113,6 @@ static void *cpu_thread(void *arg) {
     return NULL;
 }
 
-static void *frame_thread(void *unused) {
-    (void)unused;
-    while (!atomic_load(&done)) {
-        if (atomic_load(&frames_on)) atomic_fetch_add(&frames, 1);
-        usleep(16000);
-    }
-    return NULL;
-}
-
 static unsigned thread_count(const char *line, const char *thread, const char *key) {
     char name[64], k[64];
     snprintf(name, sizeof name, "\"name\":\"%s\"", thread);
@@ -131,8 +127,10 @@ static const char *dir;
 static void stall(_Atomic int *a, _Atomic int *b) {
     atomic_store(a, 1);
     if (b) atomic_store(b, 1);
+    usleep(20000);
+    atomic_store(&frozen_frame, wall_frame());
     atomic_store(&frames_on, 0);
-    usleep(400000);
+    usleep(650000);
     atomic_store(&frames_on, 1);
     atomic_store(a, 0);
     if (b) atomic_store(b, 0);
@@ -143,7 +141,6 @@ static void *scenario(void *unused) {
     (void)unused;
     pthread_t t;
     for (int i = 0; i < NCPU; i++) pthread_create(&t, NULL, cpu_thread, (void *)(intptr_t)i);
-    pthread_create(&t, NULL, frame_thread, NULL);
     pthread_create(&t, NULL, invalidator, NULL);
     usleep(1000000);
 

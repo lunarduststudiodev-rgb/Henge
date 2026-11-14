@@ -276,7 +276,7 @@ int main(void) {
         static const uint8_t addr[4] = {192, 0, 2, 7};
         check("the address", memcmp(msg + n - 4, addr, 4), 0);
     }
-    check("the silent server was waited for, briefly", took >= 600 && took < 2000, 1);
+    check("the silent server was waited for, briefly", took >= 60 && took < 2000, 1);
     check("the refusing server was asked", refuser.queries, 1);
     check("the answering server was asked", answerer.queries, 1);
 

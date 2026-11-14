@@ -556,7 +556,7 @@ $(CACHE_STAMPS):
 	@rm -f $(dir $@).rosetta-4k-* $(dir $@).flags-*
 	@touch $@
 $(filter-out $(B)/enter.o,$(sort $(patsubst %,$(B)/%.o,aes audio_mac audio_usb bdif camera_apple cfg classify codestore disk dispatch exception install \
-    frame_pace input_fence jit_region libusb_shim machine mdns memop mmu net_dns net_forward net_slirp operands pcie power_source pvg_lite pvg_mac pvg_metal pvg_metal_test ramfile rosetta saveguard share snapshot \
+    frame_pace input_fence jit_region libusb_shim machine mdns memop metallib mmu net_dns net_forward net_slirp operands pcie power_source pvg_lite pvg_mac pvg_metal pvg_metal_test ramfile rosetta saveguard share snapshot \
     sysreg timer translate usb_audio usb_host usb_storage usb_video virtio virtio_balloon virtio_blk virtio_fs virtio_input virtio_net \
     virtio_snd virtio_usb vm vmapple vmapple_snap xhci gicv3 gicv3_snap pl011 pl031 pl061 hvsparse))): $(B)/$(FLAGS_STAMP)
 $(IOS_OBJ): $(IB)/$(FLAGS_STAMP)

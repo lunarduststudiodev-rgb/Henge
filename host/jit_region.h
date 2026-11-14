@@ -38,6 +38,8 @@ void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words);
 void hv_jit_patch(HvJitRegion *region, uint32_t *const *at, const uint32_t *words, size_t n);
 /* hv_jit_finish for two ranges at once (a block's hot and cold parts): one wait for the instruction caches, not two. */
 void hv_jit_finish2(HvJitRegion *region, uint32_t *a, size_t na, uint32_t *b, size_t nb);
+/* Optional test-only hook invoked once at the start of hv_jit_finish2 before cache maintenance (NULL in production). */
+extern void (*hv_jit_finish2_test_hook)(void);
 /* After rewriting one B (an unconditional branch) as another B, which a CPU may run as it changes (Arm allows it for
    B): the instruction caches drop the line without waiting for them all to have done so. A CPU still running the old
    branch takes the way the old one went (chaining: the exit's stub, which follows the slot) until its cache lets go. */

@@ -126,11 +126,14 @@ static void ic_lines(uint32_t *start, size_t words, int *n) {
     }
 }
 
+void (*hv_jit_finish2_test_hook)(void);
+
 void hv_jit_finish2(HvJitRegion *region, uint32_t *a, size_t na, uint32_t *b, size_t nb) {
     (void)region;
 #if TARGET_OS_OSX
     if (!region->rw_diff) pthread_jit_write_protect_np(1);
 #endif
+    if (__builtin_expect(hv_jit_finish2_test_hook != NULL, 0)) hv_jit_finish2_test_hook();
     int n = 0;
     __asm__ volatile("dsb ish" ::: "memory");
     ic_lines(a, na, &n);

@@ -87,6 +87,7 @@ struct HvPvgLite {
        a define or an object list ahead of the worker, which may still have the number's old task's work queued. */
     PvgTasks tasks, worker_tasks;
     int old_driver; /* macOS 14's (and older) GPU driver: object lists at a fixed place, compact surface descriptions */
+    int objects_cmd_seen, worker_objects_cmd_seen; /* 0x44 seen on modern driver: do not fall back between 0x38 and 0x44 */
     uint32_t root_told[8]; /* root ring ops below 0x100 already logged as seen, a bit each */
     uint32_t long_told[8]; /* root ring ops already logged as too long to take, a bit each */
     int mapping_told; /* a mapper id outside what Apple's host takes, logged */
@@ -208,6 +209,7 @@ static void task_defined(HvPvgLite *p, const uint32_t args[4]) {
    number's old task, queued ahead, reads the old tables) */
 void hv_pvg_lite_task_command(HvPvgLite *p, uint32_t op, const uint32_t *args, uint32_t n) {
     tasks_apply(&p->worker_tasks, op, args, n);
+    if (op == 0x44 && n >= 28 && args[0] < 512) p->worker_objects_cmd_seen = 1;
 }
 
 /* 1 the first time op (below 0x100) is asked about, a bit each */
@@ -680,7 +682,7 @@ void *hv_pvg_lite_phys(HvPvgLite *p, uint64_t pa, uint64_t length) {
 #define OLD_DRIVER_OBJECTS 0x4000
 uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task) {
     if (task >= 512) return 0;
-    if (!p->worker_tasks.objects[task] && p->worker_tasks.root[task]) {
+    if (!p->worker_tasks.objects[task] && p->worker_tasks.root[task] && !p->worker_objects_cmd_seen) {
         if (!p->old_driver) {
             p->old_driver = 1;
             fprintf(stderr, "hengevm: pvg-lite: an older guest GPU driver (no object list command): its own layouts\n");
@@ -964,6 +966,7 @@ static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, 
     if (op == 0x44) {
         ring_read(p, table, size, rd + 12 + skip, args, 28);
         tasks_apply(&p->tasks, 0x44, args, 28);
+        if (args[0] < 512) p->objects_cmd_seen = 1;
         if (args[0] < 512 && p->tally) fprintf(stderr, "pvgobj list task %u objects %llx len %x placement %llx len %x\n", args[0], (unsigned long long)p->tasks.objects[args[0]], args[5], (unsigned long long)p->tasks.placement[args[0]], args[6]);
         return;
     }
@@ -1014,6 +1017,7 @@ static void ensure_metal(HvPvgLite *p) {
     os_unfair_lock_lock(&p->layer_lock);
     if (!__atomic_load_n(&p->metal_tried, __ATOMIC_RELAXED)) {
         p->worker_tasks = p->tasks; /* a worker with nothing queued: every command read so far is its own */
+        p->worker_objects_cmd_seen = p->objects_cmd_seen;
         /* No Metal side with either switch (gpu_switch.h): HV_NO_GPU keeps the GPU off on a host (the MacBook) */
         HvPvgMetal *metal = hv_gpu_switched_off() ? NULL : hv_pvg_metal_create(p);
         /* The mapper's state as its own, first: the ops walked before it existed (or before a snapshot was taken) are
@@ -1651,6 +1655,13 @@ int hv_pvg_lite_load(HvPvgLite *p, const uint8_t *data, size_t len, HvPvgBytes *
     for (int i = 0; i < MAX_CHANNELS; i++) atomic_store_explicit(&p->wait_since[i], 0, memory_order_relaxed);
     p->root_waiting = 1; /* a root command may have been waiting for a barrier when saved: looked at again at the next poll */
     p->tasks = t.tasks; /* the worker's copy is made from it with the worker (ensure_metal) */
+    p->objects_cmd_seen = 0;
+    for (int i = 0; i < 512; i++) {
+        if (p->tasks.objects[i]) {
+            p->objects_cmd_seen = 1;
+            break;
+        }
+    }
     p->draining = 0;
     display_w = dw, display_h = dh, display_mm_w = mw, display_mm_h = mh, display_set = 1;
     memcpy(offered, q.off, sizeof offered);

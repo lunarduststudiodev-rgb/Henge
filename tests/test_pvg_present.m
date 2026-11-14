@@ -3343,6 +3343,8 @@ static void test_surface_standin_view_and_writeback(void) {
     memcpy(surface_record, saved_sr, sizeof saved_sr);
     [r->surfaces removeObjectForKey:@77];
     r->device = saved_dev;
+    surf2->mapped = NULL;
+    surface->mapped = NULL;
 
     objs_set(r->tasks[1], 13, saved_o13);
     objs_set(r->tasks[1], 14, saved_o14);

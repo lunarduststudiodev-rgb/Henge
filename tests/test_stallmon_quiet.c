@@ -70,17 +70,17 @@ static void *scenario(void *unused) {
     atomic_store(&frozen, hv_vm_gpu_frames());
     atomic_store(&frames_on, 0);
     s0 = stops();
-    usleep(300000);
+    usleep(550000);
     unsigned stalled = stops() - s0;
     atomic_store(&frames_on, 1);
-    CHECK(stalled >= 10 * NCPU, "frames stopped for 300 ms: %u threads stopped, want them sampled", stalled);
+    CHECK(stalled >= 10 * NCPU, "frames stopped for 550 ms: %u threads stopped, want them sampled", stalled);
 
     usleep(50000); /* it sees the frames again */
     s0 = stops();
     usleep(500000);
     unsigned after = stops() - s0;
     CHECK(after <= SLACK, "frames back: %u threads stopped, want none", after);
-    printf("stops: %u in a second of steady frames, %u in a 300 ms stall, %u after\n", quiet, stalled, after);
+    printf("stops: %u in a second of steady frames, %u in a 550 ms stall, %u after\n", quiet, stalled, after);
 
     atomic_store(&done, 1);
     scratch_done();
