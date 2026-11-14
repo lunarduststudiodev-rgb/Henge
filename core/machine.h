@@ -705,7 +705,7 @@ static inline int hv_block_dying(const HvMachine *m, const HvBlock *b) {
 static inline HvBlock *hv_block_find(HvMachine *m, uint32_t h, uint64_t va, uint64_t pa, uint32_t flags, uint32_t gen) {
     for (uint32_t i = __atomic_load_n(&m->hash[h], __ATOMIC_ACQUIRE); i;) {
         HvBlock *b = &m->blocks[i - 1];
-        if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen && !hv_block_dying(m, b)) return b;
+        if (b->va == va && b->pa == pa && b->flags == flags && __atomic_load_n(&b->gen, __ATOMIC_ACQUIRE) == gen && !hv_block_dying(m, b)) return b;
         i = __atomic_load_n(&b->hash_next, __ATOMIC_ACQUIRE);
     }
     return NULL;

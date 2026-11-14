@@ -1139,7 +1139,8 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
     __typeof__(cpu->pc_state->jc[0]) *jc = cpu->pc_state->jc;
     HvBlock *c = jc[j].va == va ? jc[j].b : NULL;
-    if (c && c->va == va && !hv_block_dying(m, c) && c->pa == pa && c->flags == flags && c->ram->page_gen[c->pg] == c->gen) {
+    if (c && c->va == va && !hv_block_dying(m, c) && c->pa == pa && c->flags == flags &&
+        __atomic_load_n(&c->ram->page_gen[c->pg], __ATOMIC_ACQUIRE) == __atomic_load_n(&c->gen, __ATOMIC_ACQUIRE)) {
         cpu->pc_state->zone_hits[c->zone]++; /* which zones are in use (make_room) */
         hv_block_entered(c);
         return c;

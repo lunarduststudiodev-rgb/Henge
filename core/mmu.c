@@ -1390,7 +1390,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
     HvBlock *b = pcs->jc[j].va == va ? pcs->jc[j].b : NULL;
     /* Not a block of a zone being emptied (the reclaimer: this CPU's entries for it go at its next answer) */
-    if (!(b && b->va == va && b->pa == pa && b->flags == flags && b->gen == gen && !hv_block_dying(m, b))) {
+    if (!(b && b->va == va && b->pa == pa && b->flags == flags && __atomic_load_n(&b->gen, __ATOMIC_ACQUIRE) == gen && !hv_block_dying(m, b))) {
         b = hv_block_find(m, hv_block_hash(va, pa, flags), va, pa, flags, gen);
         if (!b) FAIL(3);
 #undef FAIL

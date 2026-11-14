@@ -942,12 +942,19 @@ void hv_block_gate(HvMachine *m, HvBlock *b) {
    synchronises its context; when it does (an ISB, an exception, an exception return) it goes through the
    dispatcher or an isb in its block, which sees the gate. The record stays as it is until its zone is emptied with
    every CPU stopped, so a lookup walking the hash past it carries on. */
-static void retire_page(HvMachine *m, HvRam *r, uint64_t pg) {
-    uint32_t gen = __atomic_load_n(&r->page_gen[pg], __ATOMIC_ACQUIRE);
+static void retire_page(HvMachine *m, HvRam *r, uint64_t pg, uint64_t want, uint32_t gen) {
     for (uint32_t i = r->block_heads[pg]; i;) {
         HvBlock *b = &m->blocks[i - 1];
         i = b->page_next;
-        if (b->gen == gen) continue; /* made since: current */
+        if (__atomic_load_n(&b->gen, __ATOMIC_RELAXED) == gen) continue; /* made since: current */
+        if (want != ~0ull) {
+            uint64_t off = (b->pa - r->pa) & ((1ull << HV_RAM_PAGE_BITS) - 1);
+            uint64_t b_mask = hv_code_pieces(off, 4ull * (b->ninsns ? b->ninsns : 1));
+            if (!(b_mask & want)) {
+                __atomic_store_n(&b->gen, gen, __ATOMIC_RELEASE);
+                continue;
+            }
+        }
         hv_page_list_remove(m, b);
         hv_hash_remove(m, b); /* its hash_next as it was: a lookup standing on it goes on (hv_block_find) */
         hv_ghost_note(m, b, 0);
@@ -971,7 +978,7 @@ static void retire_page(HvMachine *m, HvRam *r, uint64_t pg) {
    that marked the page afresh would find that CPU's hint already taken and not wait for it. That protector then
    finishes and reads the generation after this bump (its bytes are new) or before it (its block is stale once the
    bump lands, and refused or retired). */
-static void invalidate_page(HvMachine *m, HvRam *r, uint64_t pg) {
+static void invalidate_page(HvMachine *m, HvRam *r, uint64_t pg, uint64_t want) {
     uint8_t *mark = &r->code_pages[pg];
     uint8_t v;
     for (;;) {
@@ -1007,9 +1014,10 @@ static void invalidate_page(HvMachine *m, HvRam *r, uint64_t pg) {
         else HV_STAT_ADD(m, rewrite_changed, 1);
     }
     /* What code came from goes with it: blocks made from now set it again. */
-    __atomic_store_n(&r->code_mask[pg], 0, __ATOMIC_SEQ_CST);
+    if (want == ~0ull) __atomic_store_n(&r->code_mask[pg], 0, __ATOMIC_SEQ_CST);
+    else __atomic_and_fetch(&r->code_mask[pg], ~want, __ATOMIC_SEQ_CST);
     __atomic_store_n(&r->code_misses[pg], 0, __ATOMIC_RELAXED);
-    __atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST);
+    uint32_t gen = __atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST);
     HV_STAT_ADD(m, flush_smc, 1);
     if (hv_smc_counts && pg < hv_smc_pages) {
         hv_smc_counts[pg]++;
@@ -1037,13 +1045,15 @@ static void invalidate_page(HvMachine *m, HvRam *r, uint64_t pg) {
         if (site) hv_patch_add(m, site, 0x14000000u | (uint32_t)((m->slot_stub[idx] - site) & 0x3ffffff)); /* to its stub */
         m->nxchained--;
     }
-    retire_page(m, r, pg);
+    retire_page(m, r, pg, want, gen);
     /* Then the code, all at once (an isb on this thread too: a CPU writing its own page goes on in its block, and
        a chained exit there may lead into one just gated). */
     hv_patch_flush(m);
+    int any_left = r->block_heads[pg] != 0;
+    if (want != ~0ull && !any_left) __atomic_store_n(&r->code_mask[pg], 0, __ATOMIC_SEQ_CST);
     if (m->stats_interval) HV_STAT_ADD(m, smc_hold_ticks, mach_absolute_time() - hold_start);
     pthread_mutex_unlock(&m->tr_mu);
-    if (v == 1) __atomic_store_n(mark, 0, __ATOMIC_SEQ_CST);
+    if (v == 1) __atomic_store_n(mark, any_left ? 1 : 0, __ATOMIC_SEQ_CST);
 }
 
 void hv_invalidate_code(HvMachine *m, uint64_t pa) {
@@ -1051,7 +1061,7 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     if (!r) return;
     uint64_t pg = (pa - r->pa) >> HV_RAM_PAGE_BITS;
     if (!__atomic_load_n(&r->code_pages[pg], __ATOMIC_RELAXED)) return;
-    invalidate_page(m, r, pg);
+    invalidate_page(m, r, pg, ~0ull);
 }
 
 /* Every write to guest RAM that translated code's fast path does not make (C code on a
@@ -1077,10 +1087,12 @@ static void written(HvMachine *m, uint64_t pa, uint64_t len, int exact) {
         uint8_t v = __atomic_load_n(&r->code_pages[pg], __ATOMIC_RELAXED);
         if (v) {
             int hit = 1;
+            uint64_t drop_mask = ~0ull;
             if (exact && v != HV_CODE_RETIRING) {
                 uint64_t p0 = pg << HV_RAM_PAGE_BITS, lo = pa - r->pa < p0 ? p0 : pa - r->pa;
                 uint64_t want = hv_code_pieces(lo - p0, pa + len - r->pa - lo);
                 hit = (__atomic_load_n(&r->code_mask[pg], __ATOMIC_RELAXED) & want) != 0;
+                if (hit && !hv_knob[HV_K_GROUPS]) drop_mask = want;
                 if (!hit && m->stats_interval) HV_STAT_ADD(m, smc_missed, 1);
                 if (!hit) __atomic_store_n(&r->code_hash[pg], 0, __ATOMIC_RELAXED); /* the page's bytes moved: not known */
                 if (!hit && __atomic_add_fetch(&r->code_misses[pg], 1, __ATOMIC_RELAXED) == HV_CODE_MISS_LIMIT) {
@@ -1088,7 +1100,7 @@ static void written(HvMachine *m, uint64_t pa, uint64_t len, int exact) {
                     HV_STAT_ADD(m, smc_miss_drops, 1);
                 }
             }
-            if (hit) invalidate_page(m, r, pg);
+            if (hit) invalidate_page(m, r, pg, drop_mask);
         }
         /* Kept in files: changed, after the bytes (the writer clears the mark before it copies). A pointer lent for
            this write is done with: LENT goes back to plain dirty. */
