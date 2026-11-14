@@ -3268,12 +3268,23 @@ static void test_surface_standin_view_and_writeback(void) {
     [sq.lastCB finish:YES];
     settle();
 
-    /* synchronize: on view writes stand-in back; invalidate: propagates host_valid=NO across view and sibling */
+    /* multiple views over the same stand-in in one exec: download_surface_standin runs once and flags=4 clears guest_stale */
+    standin->host_valid = YES;
     standin->guest_stale = YES;
-    uint32_t sync_cmd[3] = {1, 1, 14};
+    uint32_t exec_dup[7] = {1, 2, 0, 13, 2, 14, 4};
+    [r exec:exec_dup length:sizeof exec_dup channel:1 stamp:904];
+    CHECK(sq.lastCB && sq.lastCB.blit && sq.lastCB.blit.copyCalls == 1 && !standin->guest_stale,
+          "exec deduplicates stand-in writeback across views (copies=%lu)",
+          (unsigned long)(sq.lastCB && sq.lastCB.blit ? sq.lastCB.blit.copyCalls : 0));
+    [sq.lastCB finish:YES];
+    settle();
+
+    /* synchronize: on stand-in and view deduplicates writeback and clears guest_stale */
+    standin->guest_stale = YES;
+    uint32_t sync_cmd[4] = {1, 2, 13, 14};
     [r synchronize:sync_cmd length:sizeof sync_cmd];
     CHECK(sq.lastCB && sq.lastCB.blit && sq.lastCB.blit.copyCalls == 1 && !standin->guest_stale,
-          "synchronize: on view blits stand-in back and clears guest_stale");
+          "synchronize: deduplicates stand-in writeback across views and clears guest_stale");
     [sq.lastCB finish:YES];
     settle();
 

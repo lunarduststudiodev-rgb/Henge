@@ -206,6 +206,8 @@ typedef struct {
     HvCopiedPage *copied_pages; /* surface pages not on a 16 KB boundary: copied here instead of zero-copy vm_remap */
     uint32_t copied_n;
     uint64_t copied_sync_tick;
+    uint64_t standin_dl_tick;
+    BOOL standin_dl_ok;
     uint32_t retries; /* a mapped texture made before its surface was described: tried again on later uses */
     uint8_t described[0x30]; /* a surface: the older driver's compact description it was made from */
     uint64_t on_mapping; /* a mapped texture: the surface id it is over */
@@ -2628,6 +2630,7 @@ static BOOL has_guest_pages(HvObject *o) { return o->pages && o->pages_in_ram; }
     HvTaskObjects *objs = task_objects(self, task, NO);
     id<MTLCommandBuffer> cb = nil;
     id<MTLBlitCommandEncoder> blit = nil;
+    uint64_t sync_tick = ++copied_sync_seq;
     for (uint32_t i = 0; i < count; i++) {
         HvObject *o = objs_get(objs, a[2 + i]);
         if (o && o->surface && o->surface->gone) continue; /* unmapped: its pages may be the guest's other memory now */
@@ -2637,8 +2640,12 @@ static BOOL has_guest_pages(HvObject *o) { return o->pages && o->pages_in_ram; }
         }
         HvObject *standin = surface_standin_root(o);
         if (standin && standin->host_valid) {
-            if (!cb) cb = [queue commandBuffer];
-            if (download_surface_standin(standin, cb, &blit) && !(standin->surface && standin->surface->copied_pages))
+            if (standin->standin_dl_tick != sync_tick) {
+                if (!cb) cb = [queue commandBuffer];
+                standin->standin_dl_tick = sync_tick;
+                standin->standin_dl_ok = download_surface_standin(standin, cb, &blit);
+            }
+            if (standin->standin_dl_ok && !(standin->surface && standin->surface->copied_pages))
                 standin->guest_stale = NO;
         }
         if (!o || !o->guest_backed || !o->host_valid) continue;
@@ -2675,7 +2682,7 @@ static BOOL has_guest_pages(HvObject *o) { return o->pages && o->pages_in_ram; }
         if (o->surface) {
             if (e[6]) o->surface->guest_stale = YES;
             if (e[7]) o->surface->guest_stale = NO;
-            for (HvObject *ov in o->surface->over.allObjects) {
+            for (HvObject *ov in o->surface->over) {
                 if (!ov->surface_standin) continue;
                 if (e[6]) ov->guest_stale = YES;
                 if (e[7]) ov->guest_stale = NO;
@@ -4532,7 +4539,7 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
             o->guest_stale = NO, o->host_valid = NO; /* the guest wrote it */
             if (o->surface) {
                 o->surface->guest_stale = NO;
-                for (HvObject *ov in o->surface->over.allObjects)
+                for (HvObject *ov in o->surface->over)
                     if (ov->surface_standin) ov->guest_stale = NO, ov->host_valid = NO;
             }
             for (HvObject *p = o->parent; p; p = p->parent)
@@ -4594,17 +4601,31 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
     HvSeg *segs = seg_data.mutableBytes;
     uint32_t nseg = 0;
     uint64_t copied = 0;
-    NSMutableDictionary<NSData *, NSNumber *> *seen = [NSMutableDictionary new]; /* {offset, length}: its segment */
+    struct { uint64_t off, blen; uint32_t seg; } seen_buf[16];
+    uint32_t seen_n = 0;
+    NSMutableDictionary<NSData *, NSNumber *> *seen = nil; /* overflow past 16 distinct segments */
     for (uint32_t b = 0; b < nbuf; b++) {
         uint64_t off, blen;
         memcpy(&off, bufs + b * 16, 8);
         memcpy(&blen, bufs + b * 16 + 8, 8);
         if (blen > (64u << 20) || blen < 8) continue;
-        NSData *range = [NSData dataWithBytes:bufs + b * 16 length:16];
-        NSNumber *again = seen[range];
-        if (again) {
-            segs[nseg++] = segs[again.unsignedIntValue];
-            continue;
+        BOOL dup = NO;
+        for (uint32_t k = 0; k < seen_n; k++) {
+            if (seen_buf[k].off == off && seen_buf[k].blen == blen) {
+                segs[nseg++] = segs[seen_buf[k].seg];
+                dup = YES;
+                break;
+            }
+        }
+        if (dup) continue;
+        NSData *range = nil;
+        if (seen) {
+            range = [NSData dataWithBytes:bufs + b * 16 length:16];
+            NSNumber *again = seen[range];
+            if (again) {
+                segs[nseg++] = segs[again.unsignedIntValue];
+                continue;
+            }
         }
         /* Its header first: how long the segment is, and so the copy */
         uint8_t head[24];
@@ -4630,7 +4651,13 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
         if (hv_pvg_lite_task_read(lite, task, off, copy.mutableBytes, (uint32_t)want)) { [self complain:@"command buffer unreadable"]; continue; }
         [copies addObject:copy];
         const uint8_t *p = copy.bytes;
-        seen[range] = @(nseg);
+        if (seen_n < 16) {
+            seen_buf[seen_n++] = (__typeof__(seen_buf[0])){off, blen, nseg};
+        } else {
+            if (!seen) seen = [NSMutableDictionary new];
+            if (!range) range = [NSData dataWithBytes:bufs + b * 16 length:16];
+            seen[range] = @(nseg);
+        }
         segs[nseg++] = (HvSeg){p + at, p + want, info & 0xff, (info >> 8) & 0xff, (info >> 16) & 0xff};
     }
     id e = nil; /* the open encoder */
@@ -4721,7 +4748,11 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
         HvObject *standin = surface_standin_root(o);
         BOOL downloaded = NO;
         if (standin && standin->host_valid && ((rflags & 2) || ((rflags & 4) && standin->guest_stale))) {
-            downloaded = download_surface_standin(standin, cb, &back);
+            if (standin->standin_dl_tick != sync_tick) {
+                standin->standin_dl_tick = sync_tick;
+                standin->standin_dl_ok = download_surface_standin(standin, cb, &back);
+            }
+            downloaded = standin->standin_dl_ok;
             if (downloaded && (rflags & 4) && !(standin->surface && standin->surface->copied_pages))
                 standin->guest_stale = NO;
         }
@@ -4742,7 +4773,7 @@ static uint32_t ids_from(id<MTLBuffer> b, uint64_t off, uint64_t size) { /* whol
         }
     }
     for (HvObject *s in written_surfaces)
-        for (HvObject *ov in s->over.allObjects)
+        for (HvObject *ov in s->over)
             if (ov->surface_standin && ![written_standins containsObject:ov]) {
                 ov->host_valid = NO;
                 ov->guest_stale = NO;
@@ -5351,13 +5382,13 @@ static id<MTLTexture> make_resample_mid(HvReplay *r, uint32_t w, uint32_t h, BOO
     /* An unmapped id is not brought back to the screen (a late present below, or set_layer's): unmap let it go (5c) */
     HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]);
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
-    sync_copied_surface(surface);
     on_screen = mapping;
     if ([self hasDisplayLayer]) {
         late = NO;
         [self showOnLayer:mapping swappedAt:swap_ns];
         return;
     }
+    sync_copied_surface(surface);
     if (now - last_capture < 0.066) { /* 15 a second is plenty until this is GPU work */
         late_mapping = mapping, late = YES;
         if (!late_queued) {
