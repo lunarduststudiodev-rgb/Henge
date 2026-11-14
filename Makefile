@@ -393,11 +393,11 @@ $(B)/test_host_fp: tests/test_host_fp.c devices/pvg_lite.c devices/frame_pace.c 
 $(B)/test_pvg_mapper_state: tests/test_pvg_mapper_state.c devices/pvg_lite.c devices/frame_pace.c tests/pvg_metal_standin.h $(PVG_H) | $(B)
 	$(CC) $(CFLAGS) $< devices/frame_pace.c -framework CoreFoundation -o $@
 
-$(B)/test_pvg_present: tests/test_pvg_present.m devices/pvg_metal.m devices/frame_pace.c devices/frame_pace.h $(PVG_H) | $(B)
-	$(CC) $(CFLAGS) -DHV_PVG_TEST_HOOKS -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations $< devices/frame_pace.c $(METAL_LIBS) -o $@
+$(B)/test_pvg_present: tests/test_pvg_present.m devices/pvg_metal.m devices/frame_pace.c devices/frame_pace.h devices/metallib.c devices/metallib.h $(PVG_H) | $(B)
+	$(CC) $(CFLAGS) -DHV_PVG_TEST_HOOKS -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations $< devices/frame_pace.c devices/metallib.c $(METAL_LIBS) -o $@
 # the same with no way to reach a GPU (MTLCreateSystemDefaultDevice is nil): its fakes only
-$(B)/test_pvg_present_nogpu: tests/test_pvg_present.m devices/pvg_metal.m devices/frame_pace.c devices/frame_pace.h $(PVG_H) | $(B)
-	$(CC) $(CFLAGS) -DHV_PVG_TEST_HOOKS -DHV_PVG_TEST_NO_GPU -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations $< devices/frame_pace.c $(METAL_LIBS) -o $@
+$(B)/test_pvg_present_nogpu: tests/test_pvg_present.m devices/pvg_metal.m devices/frame_pace.c devices/frame_pace.h devices/metallib.c devices/metallib.h $(PVG_H) | $(B)
+	$(CC) $(CFLAGS) -DHV_PVG_TEST_HOOKS -DHV_PVG_TEST_NO_GPU -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations $< devices/frame_pace.c devices/metallib.c $(METAL_LIBS) -o $@
 # the same with neither Metal nor QuartzCore linked, for Macs where nothing may link Metal: the tests that check against
 # Metal's own descriptor objects are left to test_pvg_present_nogpu (tests/pvg_nometal_stubs.m says which and why).
 # The build fails if the binary ever links Metal, any Metal framework (MetalKit, MetalPerformanceShaders...),
@@ -405,12 +405,12 @@ $(B)/test_pvg_present_nogpu: tests/test_pvg_present.m devices/pvg_metal.m device
 # CoreFoundation, as test_pvg_queue does): what this guarantees is that none of the binary's own code can call them,
 # so no GPU device, and no GPU work, can be made from it.
 NOMETAL_LIBS = -framework Foundation -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
-$(B)/test_pvg_present_nometal: tests/test_pvg_present.m tests/pvg_nometal.h tests/pvg_nometal_stubs.m devices/pvg_metal.m devices/frame_pace.c devices/frame_pace.h $(PVG_H) | $(B)
-	$(CC) $(CFLAGS) -DHV_PVG_TEST_HOOKS -DHV_PVG_TEST_NO_GPU -DHV_PVG_TEST_NO_METAL -include tests/pvg_nometal.h -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations $< tests/pvg_nometal_stubs.m devices/frame_pace.c $(NOMETAL_LIBS) -o $@
+$(B)/test_pvg_present_nometal: tests/test_pvg_present.m tests/pvg_nometal.h tests/pvg_nometal_stubs.m devices/pvg_metal.m devices/frame_pace.c devices/frame_pace.h devices/metallib.c devices/metallib.h $(PVG_H) | $(B)
+	$(CC) $(CFLAGS) -DHV_PVG_TEST_HOOKS -DHV_PVG_TEST_NO_GPU -DHV_PVG_TEST_NO_METAL -include tests/pvg_nometal.h -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations $< tests/pvg_nometal_stubs.m devices/frame_pace.c devices/metallib.c $(NOMETAL_LIBS) -o $@
 	@if otool -L $@ | grep -E '/(Metal[A-Za-z]*|QuartzCore|CoreImage)\.framework/'; then echo "$@ links Metal, QuartzCore or CoreImage (above): it must not"; rm -f $@; exit 1; fi
 # the same without the tests' hooks, as the app's build: HV_PVG_ENCODE_ONLY fails closed there (its fakes only: no GPU)
-$(B)/test_pvg_present_app: tests/test_pvg_present.m devices/pvg_metal.m devices/frame_pace.c devices/frame_pace.h $(PVG_H) | $(B)
-	$(CC) $(CFLAGS) -DHV_PVG_TEST_NO_GPU -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations $< devices/frame_pace.c $(METAL_LIBS) -o $@
+$(B)/test_pvg_present_app: tests/test_pvg_present.m devices/pvg_metal.m devices/frame_pace.c devices/frame_pace.h devices/metallib.c devices/metallib.h $(PVG_H) | $(B)
+	$(CC) $(CFLAGS) -DHV_PVG_TEST_NO_GPU -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations $< devices/frame_pace.c devices/metallib.c $(METAL_LIBS) -o $@
 
 $(B)/test_pvg_video: tests/test_pvg_video.c devices/pvg_video.h devices/pvg_validate.h | $(B)
 	$(CC) $(CFLAGS) $< -o $@

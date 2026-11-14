@@ -170,6 +170,7 @@ void hv_pvg_lite_pointer_space(uint32_t sw, uint32_t sh, uint32_t *w, uint32_t *
     *w = test_pointer_w ? test_pointer_w : sw, *h = test_pointer_h ? test_pointer_h : sh;
 }
 int hv_pvg_lite_retina(void) { return 0; }
+int hv_pvg_lite_old_driver(HvPvgLite *p) { (void)p; return 0; }
 int hv_pvg_tracing(void) { return 0; }
 /* Saving and restoring aren't tested here (test_pvg_snap is) */
 void hv_pvg_blob_put(HvPvgBlob *b, const void *v, size_t n) { (void)b, (void)v, (void)n; abort(); }
