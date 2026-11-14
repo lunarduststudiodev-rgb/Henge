@@ -2102,6 +2102,7 @@ static void back_once(NSMutableArray<HvObject *> *writeback, HvObject *s) {
 
 /* A guest surface (IOSurface) from its description: its pages in one host buffer (or a real IOSurface for planes). */
 - (HvObject *)newSurface:(uint64_t)mapping {
+    if (mapping < HV_PVG_MAPPING_IDS && (unmapped[mapping / 8] >> (mapping % 8) & 1)) return nil;
     NSNumber *key = @(mapping);
     HvObject *surface = nil;
     const uint8_t *guest_desc = hv_pvg_lite_surface(lite, mapping);

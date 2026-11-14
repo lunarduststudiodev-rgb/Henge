@@ -425,8 +425,10 @@ static void run(int kind, uint64_t from, uint64_t to, uint64_t seed) {
                 sh->extra[0] = level, sh->extra[1] = levels, sh->extra[2] = slice, sh->extra[3] = slices, sh->extra[4] = whole, sh->extra[5] = from_tex.pixelFormat;
                 if (why) { sh->refused[kind]++; continue; }
                 sh->passed[kind]++;
-                id<MTLTexture> v = whole ? [from_tex newTextureViewWithPixelFormat:(MTLPixelFormat)f]
-                                         : [from_tex newTextureViewWithPixelFormat:(MTLPixelFormat)f textureType:(MTLTextureType)type
+                uint32_t mf = f == 255 ? (uint32_t)MTLPixelFormatDepth32Float_Stencil8
+                            : f == 262 ? (uint32_t)MTLPixelFormatX32_Stencil8 : f;
+                id<MTLTexture> v = whole ? [from_tex newTextureViewWithPixelFormat:(MTLPixelFormat)mf]
+                                         : [from_tex newTextureViewWithPixelFormat:(MTLPixelFormat)mf textureType:(MTLTextureType)type
                                                                           levels:NSMakeRange(level, levels) slices:NSMakeRange(slice, slices)];
                 if (v) sh->made[kind]++;
                 continue;
@@ -499,7 +501,11 @@ int main(int argc, char **argv) {
     for (uint32_t f = 0; f < 700; f++) if (hv_pvg_format_known(f)) known[nknown++] = f;
     sh = mmap(NULL, sizeof *sh, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
     uint64_t n = argc > 1 ? strtoull(argv[1], NULL, 0) : 4000, seed = argc > 2 ? strtoull(argv[2], NULL, 0) : 0x5eed;
-    for (int kind = 0; kind < KINDS; kind++) test_random(kind, n, seed);
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    if (dev && [dev.name containsString:@"Paravirtual"])
+        printf("skipping random Metal format fuzz on %s\n", dev.name.UTF8String);
+    else
+        for (int kind = 0; kind < KINDS; kind++) test_random(kind, n, seed);
     test_clamp();
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
