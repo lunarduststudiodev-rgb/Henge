@@ -999,7 +999,8 @@ static void invalidate_page(HvMachine *m, HvRam *r, uint64_t pg, uint64_t want) 
                     t0 = 1;
                 }
             }
-            return;
+            if (__atomic_load_n(mark, __ATOMIC_ACQUIRE) == 0) return;
+            continue;
         }
         if (v != 1) break; /* being marked: leave the mark */
         if (__atomic_compare_exchange_n(mark, &v, HV_CODE_RETIRING, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) break;
@@ -1017,7 +1018,6 @@ static void invalidate_page(HvMachine *m, HvRam *r, uint64_t pg, uint64_t want) 
     if (want == ~0ull) __atomic_store_n(&r->code_mask[pg], 0, __ATOMIC_SEQ_CST);
     else __atomic_and_fetch(&r->code_mask[pg], ~want, __ATOMIC_SEQ_CST);
     __atomic_store_n(&r->code_misses[pg], 0, __ATOMIC_RELAXED);
-    uint32_t gen = __atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST);
     HV_STAT_ADD(m, flush_smc, 1);
     if (hv_smc_counts && pg < hv_smc_pages) {
         hv_smc_counts[pg]++;
@@ -1045,7 +1045,9 @@ static void invalidate_page(HvMachine *m, HvRam *r, uint64_t pg, uint64_t want) 
         if (site) hv_patch_add(m, site, 0x14000000u | (uint32_t)((m->slot_stub[idx] - site) & 0x3ffffff)); /* to its stub */
         m->nxchained--;
     }
+    uint32_t gen = __atomic_load_n(&r->page_gen[pg], __ATOMIC_RELAXED) + 1;
     retire_page(m, r, pg, want, gen);
+    __atomic_store_n(&r->page_gen[pg], gen, __ATOMIC_SEQ_CST);
     /* Then the code, all at once (an isb on this thread too: a CPU writing its own page goes on in its block, and
        a chained exit there may lead into one just gated). */
     hv_patch_flush(m);
