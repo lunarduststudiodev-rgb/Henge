@@ -816,8 +816,16 @@ static BOOL isChromeElement(AXUIElementRef e) {
 }
 
 static _Atomic(pid_t) chromeAXSuppressedPid;
+static _Atomic uint64_t chromeAXEnabledAtNs;
 static NSMutableSet<NSNumber *> *chromeAXEnabled;
 static pthread_mutex_t chromeAXLock = PTHREAD_MUTEX_INITIALIZER;
+
+static BOOL chromeAXSettling(void) {
+    uint64_t enabledAt = atomic_load(&chromeAXEnabledAtNs);
+    if (!enabledAt) return NO;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    return now >= enabledAt && (now - enabledAt) < 350 * NSEC_PER_MSEC;
+}
 
 // Enables Chromium AX on demand (on tap/click/focus-probe) so web text fields and <input type="password"> are
 // detected, unless suppressed while actively typing in a confirmed field. Returns YES if it was suppressed and just re-enabled.
@@ -848,6 +856,7 @@ static BOOL ensureChromeAX(NSRunningApplication *app, BOOL forceReenable) {
                 AXUIElementSetAttributeValue(axApp, CFSTR("AXEnhancedUserInterface"), kCFBooleanTrue);
             CFRelease(axApp);
         }
+        atomic_store(&chromeAXEnabledAtNs, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     }
     pthread_mutex_unlock(&chromeAXLock);
     return wasSuppressed;
@@ -1359,6 +1368,10 @@ static int lookNow(NSString **why, NSString **appName) {
         NSString *role = nil, *whyNot = nil;
         int edit = editability(fieldElement, &secure, &role, &whyNot);
         fieldRole = role;
+        if (edit == EDIT_NO && [role isEqualToString:@"AXWebArea"] && builtOnChrome(front) && chromeAXSettling()) {
+            *why = @"Chromium AX settling";
+            return focus_said(FOCUS_CANT_TELL, NO, held);
+        }
         if (edit == EDIT_UNKNOWN) {
             *why = whyNot;
             return focus_said(FOCUS_CANT_TELL, NO, held);
@@ -1528,12 +1541,11 @@ static void safetyTick(void) {
         BOOL appChanged = (frontPid != lastFrontPid);
         lastFrontPid = frontPid;
         if (appChanged) atomic_store(&chromeAXSuppressedPid, 0);
-        // Re-enable Chromium AX once typing has been idle for >1.5 s so Tab/Enter/focus changes are detected.
+        // Re-enable Chromium AX once real key-down typing has been idle for >=1.5 s so Tab/Enter/focus changes are detected.
         pid_t suppressed = atomic_load(&chromeAXSuppressedPid);
         if (suppressed && suppressed == frontPid) {
-            uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-            uint64_t lastNotify = atomic_load(&lastCaretNotifyNs);
-            if (now >= lastNotify && now - lastNotify > 1500 * NSEC_PER_MSEC) {
+            double keyIdle = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState, kCGEventKeyDown);
+            if (keyIdle >= 1.5) {
                 atomic_store(&chromeAXSuppressedPid, 0);
                 return lookAtFocus();
             }
@@ -1914,6 +1926,22 @@ static NSString *tapAnswer(unsigned id, CGPoint at, AXUIElementRef under) {
             answer = "no";         // a parent couldn't be told: the element itself said no
             break;
         }
+        // If Chrome AX was just re-enabled and hit-testing landed on AXWebArea with EDIT_NO while Blink is still
+        // rebuilding its tree, retry briefly within tapPatience; if still unsettled, report "unknown" so tapLate works.
+        if (depth == 0 && [role isEqualToString:@"AXWebArea"] && chromeAXSettling() && isChromeElement(e)) {
+            if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 25 * NSEC_PER_MSEC < deadline) {
+                usleep(25000);
+                AXUIElementRef fresh = NULL;
+                if (AXUIElementCopyElementAtPosition(systemWide(), (float)at.x, (float)at.y, &fresh) == kAXErrorSuccess && fresh) {
+                    CFRelease(e);
+                    e = fresh;
+                    depth = -1;
+                    continue;
+                }
+            }
+            answer = "unknown";
+            break;
+        }
         answer = "no";
         // A text view's scroll area reaches past its text (Spotlight's field is a line of text in a taller scroll
         // area): a tap in it is a tap in the text it holds.
@@ -1950,7 +1978,7 @@ static NSString *tapAnswer(unsigned id, CGPoint at, AXUIElementRef under) {
 static void answerTap(unsigned id, double x, double y) {
     dispatch_async(tapQueue, ^{
         @autoreleasepool {
-            if (ensureChromeAX(NSWorkspace.sharedWorkspace.frontmostApplication, YES)) usleep(30000);
+            ensureChromeAX(NSWorkspace.sharedWorkspace.frontmostApplication, YES);
             linkSend(tapAnswer(id, onScreen(x, y), NULL));
         }
     });
@@ -1968,7 +1996,7 @@ static void answerHit(unsigned id, double x, double y) {
             AXUIElementRef hit = NULL;
             NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
             if (trusted() && !isCodeEditorApp(front)) {
-                if (ensureChromeAX(front, YES)) usleep(30000);
+                ensureChromeAX(front, YES);
                 AXError err = AXUIElementCopyElementAtPosition(systemWide(), (float)at.x, (float)at.y, &hit);
                 if (err == kAXErrorCannotComplete) axTimedOut = YES;
                 if (err == kAXErrorSuccess && hit) {
