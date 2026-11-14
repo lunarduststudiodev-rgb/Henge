@@ -380,18 +380,18 @@ PVG_H = devices/pvg_lite.h devices/gpu_switch.h devices/pvg_validate.h devices/p
 $(B)/test_pvg_fuzz: tests/test_pvg_fuzz.c devices/pvg_command.h $(ENGINE) $(DEV_TEST) $(SNAP)
 	$(CC) $(CFLAGS) tests/test_pvg_fuzz.c $(ENGINE) $(DEV_TEST) $(SNAP) $(METAL_LIBS) -lcompression -o $@
 
-$(B)/test_pvg_queue: tests/test_pvg_queue.c devices/pvg_lite.c tests/pvg_metal_standin.h $(PVG_H) | $(B)
-	$(CC) $(CFLAGS) $< -framework CoreFoundation -o $@
+$(B)/test_pvg_queue: tests/test_pvg_queue.c devices/pvg_lite.c devices/frame_pace.c tests/pvg_metal_standin.h $(PVG_H) | $(B)
+	$(CC) $(CFLAGS) $< devices/frame_pace.c -framework CoreFoundation -o $@
 
 $(B)/test_sig_say: tests/test_sig_say.c host/sig_say.h | $(B)
 	$(CC) $(CFLAGS) $< -o $@
 
-$(B)/test_host_fp: tests/test_host_fp.c devices/pvg_lite.c tests/pvg_metal_standin.h host/host_fp.h $(PVG_H) | $(B)
-	$(CC) $(CFLAGS) $< -framework CoreFoundation -o $@
+$(B)/test_host_fp: tests/test_host_fp.c devices/pvg_lite.c devices/frame_pace.c tests/pvg_metal_standin.h host/host_fp.h $(PVG_H) | $(B)
+	$(CC) $(CFLAGS) $< devices/frame_pace.c -framework CoreFoundation -o $@
 
 # The mapper's state, with the Metal side stood in for: no GPU, nor Metal linked
-$(B)/test_pvg_mapper_state: tests/test_pvg_mapper_state.c devices/pvg_lite.c tests/pvg_metal_standin.h $(PVG_H) | $(B)
-	$(CC) $(CFLAGS) $< -framework CoreFoundation -o $@
+$(B)/test_pvg_mapper_state: tests/test_pvg_mapper_state.c devices/pvg_lite.c devices/frame_pace.c tests/pvg_metal_standin.h $(PVG_H) | $(B)
+	$(CC) $(CFLAGS) $< devices/frame_pace.c -framework CoreFoundation -o $@
 
 $(B)/test_pvg_present: tests/test_pvg_present.m devices/pvg_metal.m devices/frame_pace.c devices/frame_pace.h $(PVG_H) | $(B)
 	$(CC) $(CFLAGS) -DHV_PVG_TEST_HOOKS -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations $< devices/frame_pace.c $(METAL_LIBS) -o $@

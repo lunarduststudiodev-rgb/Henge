@@ -3410,7 +3410,8 @@ static void test_guest_stale_writes(void) {
     memcpy(b300 + 0x10, &row, 8); memcpy(b300 + 0x18, &img, 8);
     memcpy(b300 + 0x20, &sz, sizeof sz); memcpy(b300 + 0x38, &orig, sizeof orig);
     StaleBlit *be = [StaleBlit new];
-    dispatch_sync(r->worker, ^{ [r blit:(id<MTLBlitCommandEncoder>)be tag:300 rec:(Rec){b300, sizeof b300} task:1]; });
+    Rec rec300 = {b300, sizeof b300};
+    dispatch_sync(r->worker, ^{ [r blit:(id<MTLBlitCommandEncoder>)be tag:300 rec:rec300 task:1]; });
     CHECK(view->guest_stale && tex->guest_stale && heap->guest_stale, "blit 300: view, base texture, and heap marked guest_stale");
 
     /* blit 303: texture to texture marks destination guest_stale (and not source) */
@@ -3419,14 +3420,16 @@ static void test_guest_stale_writes(void) {
     uint32_t sref = 14, dref = 12;
     memcpy(b303 + 0, &sref, 4); memcpy(b303 + 4, &dref, 4);
     memcpy(b303 + 0x20, &sz, sizeof sz);
-    dispatch_sync(r->worker, ^{ [r blit:(id<MTLBlitCommandEncoder>)be tag:303 rec:(Rec){b303, sizeof b303} task:1]; });
+    Rec rec303 = {b303, sizeof b303};
+    dispatch_sync(r->worker, ^{ [r blit:(id<MTLBlitCommandEncoder>)be tag:303 rec:rec303 task:1]; });
     CHECK(view->guest_stale && tex->guest_stale && heap->guest_stale && !ro->guest_stale,
           "blit 303: destination chain marked guest_stale, source unchanged");
 
     /* blit 307: generateMipmaps marks texture and parent guest_stale */
     heap->guest_stale = NO, tex->guest_stale = NO, view->guest_stale = NO;
     uint32_t b307[2] = {12, 0};
-    dispatch_sync(r->worker, ^{ [r blit:(id<MTLBlitCommandEncoder>)be tag:307 rec:(Rec){(const uint8_t *)b307, sizeof b307} task:1]; });
+    Rec rec307 = {(const uint8_t *)b307, sizeof b307};
+    dispatch_sync(r->worker, ^{ [r blit:(id<MTLBlitCommandEncoder>)be tag:307 rec:rec307 task:1]; });
     CHECK(view->guest_stale && tex->guest_stale && heap->guest_stale, "blit 307: mipmap target and parents marked guest_stale");
 
     /* compute 206: ShaderWrite marks guest_stale; ShaderRead-only does not */
@@ -3435,7 +3438,8 @@ static void test_guest_stale_writes(void) {
     ((StaleTex *)ro->object).usage = MTLTextureUsageShaderRead;
     uint32_t c206[4] = {0, 2, 12, 14};
     StaleCompute *ce = [StaleCompute new];
-    dispatch_sync(r->worker, ^{ [r compute:(id<MTLComputeCommandEncoder>)ce tag:206 rec:(Rec){(const uint8_t *)c206, sizeof c206} task:1]; });
+    Rec rec206 = {(const uint8_t *)c206, sizeof c206};
+    dispatch_sync(r->worker, ^{ [r compute:(id<MTLComputeCommandEncoder>)ce tag:206 rec:rec206 task:1]; });
     CHECK(view->guest_stale && tex->guest_stale && heap->guest_stale && !ro->guest_stale,
           "compute 206: ShaderWrite texture marked guest_stale, read-only not");
 
@@ -3444,9 +3448,11 @@ static void test_guest_stale_writes(void) {
     StaleRender *re = [StaleRender new];
     uint32_t r135_w[3] = {1, MTLResourceUsageWrite, 12};
     uint32_t r135_r[3] = {1, MTLResourceUsageRead, 14};
+    Rec rec135_w = {(const uint8_t *)r135_w, sizeof r135_w};
+    Rec rec135_r = {(const uint8_t *)r135_r, sizeof r135_r};
     dispatch_sync(r->worker, ^{
-        [r render:(id<MTLRenderCommandEncoder>)re tag:135 rec:(Rec){(const uint8_t *)r135_w, sizeof r135_w} task:1];
-        [r render:(id<MTLRenderCommandEncoder>)re tag:135 rec:(Rec){(const uint8_t *)r135_r, sizeof r135_r} task:1];
+        [r render:(id<MTLRenderCommandEncoder>)re tag:135 rec:rec135_w task:1];
+        [r render:(id<MTLRenderCommandEncoder>)re tag:135 rec:rec135_r task:1];
     });
     CHECK(view->guest_stale && tex->guest_stale && heap->guest_stale && !ro->guest_stale,
           "render 135: write resource marked guest_stale, read-only not");
@@ -3506,7 +3512,8 @@ static void test_guest_stale_render_pass(void) {
 
     StaleCB *cb = [StaleCB new];
     __block id<MTLRenderCommandEncoder> enc = nil;
-    dispatch_sync(r->worker, ^{ enc = [r beginPass:(Rec){pass, sizeof pass} task:1 commandBuffer:(id<MTLCommandBuffer>)cb]; });
+    Rec rpass = {pass, sizeof pass};
+    dispatch_sync(r->worker, ^{ enc = [r beginPass:rpass task:1 commandBuffer:(id<MTLCommandBuffer>)cb]; });
     CHECK(enc != nil, "MSAA render pass begun");
     CHECK(view->guest_stale && tex->guest_stale && heap->guest_stale && res->guest_stale,
           "beginPass: stored/resolved attachments and parents marked guest_stale");
@@ -3517,7 +3524,8 @@ static void test_guest_stale_render_pass(void) {
     memcpy(pass_dc + 0x4c + 22, &store_dc, 2);
     memcpy(pass_dc + 0x230, &layers, 8); memcpy(pass_dc + 0x238, &pw, 8); memcpy(pass_dc + 0x240, &ph, 8);
     __block id<MTLRenderCommandEncoder> enc_dc = nil;
-    dispatch_sync(r->worker, ^{ enc_dc = [r beginPass:(Rec){pass_dc, sizeof pass_dc} task:1 commandBuffer:(id<MTLCommandBuffer>)cb]; });
+    Rec rpass_dc = {pass_dc, sizeof pass_dc};
+    dispatch_sync(r->worker, ^{ enc_dc = [r beginPass:rpass_dc task:1 commandBuffer:(id<MTLCommandBuffer>)cb]; });
     CHECK(enc_dc != nil && !dc->guest_stale, "beginPass: load+DontCare pass leaves attachment guest_stale NO");
 
     r->caps = saved_caps;
