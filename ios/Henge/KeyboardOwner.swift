@@ -156,9 +156,10 @@ final class KeyboardOwner: ObservableObject {
         heardOnce = true
         let was = last
         last = f
+        let sameField = f.id == was.id && f.generation == was.generation
         // For the password button: unknown while no helper of this version is linked; a linked helper's "can't tell"
-        // leaves it as it was.
-        let shownFocus: Int32 = !live ? -1 : f.state == -1 ? focus : f.state
+        // leaves it as it was only for the same field.
+        let shownFocus: Int32 = !live ? -1 : f.state == -1 ? (sameField ? focus : -1) : f.state
         if shownFocus != focus { focus = shownFocus }
         if live && f.state != -1 {
             let frame = f.width > 0 ? CGRect(x: CGFloat(f.x), y: CGFloat(f.y), width: CGFloat(f.width), height: CGFloat(f.height)) : nil
@@ -169,8 +170,9 @@ final class KeyboardOwner: ObservableObject {
         // No helper of this version (one linked that is older, or none): nothing says a password field has the
         // focus, so the password key types the password without Return.
         let password = KeyboardIntent.passwordField(live: live, focus: KeyboardIntent.Focus(rawValue: f.state) ?? .unknown,
-                                                    was: RowPlacement.shared.passwordField)
+                                                    was: sameField ? RowPlacement.shared.passwordField : false)
         if RowPlacement.shared.passwordField != password { RowPlacement.shared.passwordField = password }
+        if live && !sameField && f.state == -1 { catcher?.setSecure(false) }
         if live, f.state != -1, f.state != was.state || f.id != was.id {
             HengeLog.log("input", "Mac's focus: \(KeyboardIntent.Focus(rawValue: f.state)?.said ?? "?") (field \(f.id))")
         }
@@ -291,6 +293,7 @@ final class KeyboardOwner: ObservableObject {
             let tap = KeyboardIntent.Tap(rawValue: answer) ?? .unknown
             if tap == .unknown && roleName == "AXWebArea" && (focus == 2 || RowPlacement.shared.passwordField) {
                 focus = 1
+                last.state = 1
                 RowPlacement.shared.passwordField = false
                 catcher?.setSecure(false)
             }
@@ -318,8 +321,8 @@ final class KeyboardOwner: ObservableObject {
     /// The keyboard suits the field (a password's, code's, an address bar's) as the focus moves to it, not a moment
     /// later; not while iOS is composing a word, which a new keyboard would lose (it waits for the word).
     private func applyTraits() {
-        guard let catcher, last.state != -1 else { return }
-        catcher.setSecure(last.state == 2)
+        guard let catcher, focus != -1 else { return }
+        catcher.setSecure(focus == 2)
         catcher.typer.setField(KeyboardCatcher.CatcherView.Field(rawValue: last.kind) ?? .prose)
     }
 }

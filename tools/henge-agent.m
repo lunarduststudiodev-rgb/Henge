@@ -1308,6 +1308,7 @@ static int lookNow(NSString **why, NSString **appName) {
     }
     setField((AXUIElementRef)focused, pid);
     CFRelease(focused);
+    static unsigned chromeHeldFieldID;
     if (fieldEdit == EDIT_UNKNOWN) {
         AXUIElementSetMessagingTimeout(fieldElement, 0.04f);
         BOOL secure = NO;
@@ -1315,17 +1316,23 @@ static int lookNow(NSString **why, NSString **appName) {
         int edit = editability(fieldElement, &secure, &role, &whyNot);
         fieldRole = role;
         if (edit == EDIT_UNKNOWN) {
-            if ([role isEqualToString:@"AXWebArea"] && builtOnChrome(front) &&
-                !held.held_here && !held.held_by_prompt && [stateSent isEqualToString:@"secure"]) {
-                fieldEdit = EDIT_YES;
-                fieldSecure = NO;
-                fieldKindSaid = "prose";
-                fieldFrame = CGRectNull;
-                return focus_said(FOCUS_FIELD, NO, held);
+            if ([role isEqualToString:@"AXWebArea"] && builtOnChrome(front)) {
+                if (held.held_here && !held.held_by_prompt) {
+                    chromeHeldFieldID = fieldID;
+                } else if (!held.held_here && !held.held_by_prompt && chromeHeldFieldID == fieldID) {
+                    // Same Chromium AXWebArea just released Secure Input: emit one non-secure text transition
+                    // without permanently marking AXWebArea as EDIT_YES.
+                    chromeHeldFieldID = 0;
+                    fieldSecure = NO;
+                    fieldKindSaid = "prose";
+                    fieldFrame = CGRectNull;
+                    return focus_said(FOCUS_FIELD, NO, held);
+                }
             }
             *why = whyNot;
             return focus_said(FOCUS_CANT_TELL, NO, held);
         }
+        chromeHeldFieldID = 0;
         fieldEdit = edit;
         fieldSecure = secure;
         if (edit == EDIT_YES) {
