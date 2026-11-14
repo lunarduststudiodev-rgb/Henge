@@ -4533,7 +4533,7 @@ int main(int argc, char **argv) {
             if (!CGRectIsNull(fieldFrame)) printf("at %s (fractions of the screen)\n", NSStringFromRect(NSRectFromCGRect(fieldFrame)).UTF8String);
             if (why) printf("%s: %s\n", !strcmp(state, "unknown") ? "can't tell" : "focus on", why.UTF8String);
             if (fieldElement && fieldEdit == EDIT_YES && !fieldSecure) {
-                NSString *context = caretContext(fieldElement);
+                NSString *context = caretContext(fieldElement, NULL);
                 if (context) printf("ctx %u %s\n", fieldID, context.UTF8String);
             }
             return 0;
