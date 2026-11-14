@@ -137,7 +137,7 @@ static void test_partial_invalidation(void) {
 
     free(c);
     free(ram);
-    hv_machine_destroy(&m);
+    hv_machine_free(&m);
 }
 
 /* ---- Test 2 & 3: concurrent writes hitting HV_CODE_RETIRING & lookup/ijc_resolve ordering ---- */
@@ -207,7 +207,7 @@ static void test_concurrent_retiring_and_ordering(void) {
     lp[i++] = 0x91000718u; /* add x24, x24, #1 (stale) */
     lp[i++] = 0xf10006b5u; /* subs x21, x21, #1 */
     lp[i] = 0x54000001u | ((uint32_t)((int32_t)(loop - i) & 0x7ffff) << 5); i++;
-    lp[i++] = branch(CALLS + 4ull * i, STOP);
+    lp[i] = branch(CALLS + 4ull * i, STOP); i++;
     m.stop_pc = STOP;
 
     HvCpu *cpus[2];
@@ -245,7 +245,7 @@ static void test_concurrent_retiring_and_ordering(void) {
 
     for (int c = 0; c < 2; c++) free(cpus[c]);
     free(ram);
-    hv_machine_destroy(&m);
+    hv_machine_free(&m);
 }
 
 int main(void) {
