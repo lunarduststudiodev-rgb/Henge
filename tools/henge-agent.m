@@ -645,19 +645,34 @@ static void watchToolsDisk(void) {
 // same kind". KIND is the field's (fieldKind) and X Y W H where it is, as fractions of the screen. macOS turns on
 // secure input for any password field (a web page's, an app's, an authentication dialog, sudo in Terminal) and no app
 // can read keys then; that needs no permission. Which field has the focus needs Accessibility.
-static NSString *rangeText(AXUIElementRef e, CFIndex at, CFIndex length) {
-    if (length <= 0) return @"";
+static _Thread_local BOOL axTimedOut; // forward declaration for rangeText/caretContext
+
+static NSString *rangeText(AXUIElementRef e, CFIndex at, CFIndex length, BOOL allowValueFallback) {
+    if (length <= 0 || axTimedOut) return @"";
     CFRange r = CFRangeMake(at, length);
     AXValueRef param = AXValueCreate(kAXValueTypeCFRange, &r);
     CFTypeRef v = NULL;
+    AXUIElementSetMessagingTimeout(e, 0.04f);
     AXError error = param ? AXUIElementCopyParameterizedAttributeValue(e, kAXStringForRangeParameterizedAttribute, param, &v) : kAXErrorFailure;
     if (param) CFRelease(param);
+    if (error == kAXErrorCannotComplete || error == kAXErrorAPIDisabled) {
+        axTimedOut = YES;
+        if (v) CFRelease(v);
+        return nil;
+    }
     if (error == kAXErrorSuccess && v && CFGetTypeID(v) == CFStringGetTypeID()) return CFBridgingRelease(v);
     if (v) CFRelease(v);
-    v = NULL; // apps without the range question: the whole text, if it is short
-    if (AXUIElementCopyAttributeValue(e, kAXValueAttribute, &v) != kAXErrorSuccess || !v) return nil;
+    if (!allowValueFallback || axTimedOut) return nil;
+    v = NULL; // apps without the range question: the whole text, only when already known to be short
+    AXUIElementSetMessagingTimeout(e, 0.04f);
+    error = AXUIElementCopyAttributeValue(e, kAXValueAttribute, &v);
+    if (error == kAXErrorCannotComplete || error == kAXErrorAPIDisabled) axTimedOut = YES;
+    if (error != kAXErrorSuccess || !v) {
+        if (v) CFRelease(v);
+        return nil;
+    }
     NSString *s = CFBridgingRelease(v);
-    if (![s isKindOfClass:NSString.class] || s.length > 20000 || at < 0 || at + length > (CFIndex)s.length) return nil;
+    if (![s isKindOfClass:NSString.class] || s.length > 4000 || at < 0 || at + length > (CFIndex)s.length) return nil;
     return [s substringWithRange:NSMakeRange((NSUInteger)at, (NSUInteger)length)];
 }
 
@@ -665,29 +680,48 @@ static NSString *rangeText(AXUIElementRef e, CFIndex at, CFIndex length) {
 // "SELECTED BEFORE AFTER", with up to 120 characters before the caret, and from the caret what is selected (a selected
 // word gets the keyboard's corrections) and 40 more, each base64 (UTF-8) or "-". Sent as "ctx ID ..." with the field's
 // ID, so the device drops what is left over from another field. Only ever for a text field, never a password's; nil
-// if the field won't say.
-static NSString *caretContext(AXUIElementRef e) {
+// if the field won't say or is too large.
+static NSString *caretContext(AXUIElementRef e, BOOL *tooLarge) {
+    if (tooLarge) *tooLarge = NO;
     CFTypeRef v = NULL;
-    if (AXUIElementCopyAttributeValue(e, kAXSelectedTextRangeAttribute, &v) != kAXErrorSuccess || !v) return nil;
+    AXUIElementSetMessagingTimeout(e, 0.04f);
+    AXError err = AXUIElementCopyAttributeValue(e, kAXSelectedTextRangeAttribute, &v);
+    if (err == kAXErrorCannotComplete || err == kAXErrorAPIDisabled) axTimedOut = YES;
+    if (err != kAXErrorSuccess || !v) {
+        if (v) CFRelease(v);
+        return nil;
+    }
     CFRange sel = {0, 0};
     BOOL ok = CFGetTypeID(v) == AXValueGetTypeID() && AXValueGetType(v) == kAXValueTypeCFRange && AXValueGetValue(v, kAXValueTypeCFRange, &sel);
     CFRelease(v);
-    if (!ok || sel.location < 0 || sel.length < 0) return nil;
+    if (!ok || sel.location < 0 || sel.length < 0 || axTimedOut) return nil;
     CFIndex total = -1;
     v = NULL;
-    if (AXUIElementCopyAttributeValue(e, kAXNumberOfCharactersAttribute, &v) == kAXErrorSuccess && v) {
+    AXUIElementSetMessagingTimeout(e, 0.04f);
+    err = AXUIElementCopyAttributeValue(e, kAXNumberOfCharactersAttribute, &v);
+    if (err == kAXErrorCannotComplete || err == kAXErrorAPIDisabled) axTimedOut = YES;
+    if (err == kAXErrorSuccess && v) {
         if (CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue(v, kCFNumberCFIndexType, &total);
         CFRelease(v);
+    } else if (v) {
+        CFRelease(v);
     }
+    if (axTimedOut) return nil;
+    if (total > 20000) {
+        if (tooLarge) *tooLarge = YES;
+        return nil;
+    }
+    BOOL allowFallback = (total >= 0 && total <= 4000);
     CFIndex start = MAX(0, sel.location - 120);
-    NSString *before = rangeText(e, start, sel.location - start);
-    if (!before) return nil;
+    NSString *before = rangeText(e, start, sel.location - start, allowFallback);
+    if (!before || axTimedOut) return nil;
     // A long selection's text isn't sent (the device only follows one on the caret's line): the 40 after it then
     // start inside it, and the device sees it doesn't reach.
     CFIndex reach = MIN(sel.length, 200) + 40;
     if (total >= 0) reach = MIN(reach, MAX(0, total - sel.location));
-    NSString *after = rangeText(e, sel.location, reach);
-    if (!after && total < 0 && sel.length > 0 && sel.length <= 200) after = rangeText(e, sel.location, sel.length);
+    NSString *after = rangeText(e, sel.location, reach, allowFallback);
+    if (!after && !axTimedOut && total < 0 && sel.length > 0 && sel.length <= 200)
+        after = rangeText(e, sel.location, sel.length, NO);
     if (!after) after = @"";
     NSString *(^b64)(NSString *) = ^NSString *(NSString *t) {
         return t.length ? [[t dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0] : @"-";
@@ -731,27 +765,54 @@ static BOOL isCodeEditorElement(AXUIElementRef e) {
     return isCodeEditorApp([NSRunningApplication runningApplicationWithProcessIdentifier:pid]);
 }
 
-// Apps built on Chrome (Chrome, Edge, Brave, Arc, and Electron's Slack, Discord...) carry its page renderer
-// as "NAME Helper (Renderer).app" among their frameworks, whatever they are called.
+// Apps built on Chrome (Chrome, Edge, Brave, Arc, and Electron's Slack, Discord, Teams...) carry its page renderer
+// as "NAME Helper (Renderer).app" among their frameworks, whatever they are called. Cached per bundle path.
 static BOOL builtOnChrome(NSRunningApplication *app) {
-    if (isCodeEditorApp(app)) return NO;
-    NSURL *frameworks = [app.bundleURL URLByAppendingPathComponent:@"Contents/Frameworks" isDirectory:YES];
-    if (!frameworks) return NO;
-    NSDirectoryEnumerator<NSURL *> *walk = [NSFileManager.defaultManager enumeratorAtURL:frameworks
-                                                              includingPropertiesForKeys:@[ NSURLIsDirectoryKey, NSURLIsSymbolicLinkKey ]
-                                                                                 options:NSDirectoryEnumerationSkipsHiddenFiles errorHandler:nil];
-    for (NSURL *u in walk) {
-        NSString *name = u.lastPathComponent;
-        if ([name hasSuffix:@" Helper (Renderer).app"]) return YES;
-        // Skipping is only asked of a real folder: of a link (a framework's Resources) it skipped the rest of its folder.
-        NSNumber *folder = nil, *link = nil;
-        [u getResourceValue:&folder forKey:NSURLIsDirectoryKey error:NULL];
-        [u getResourceValue:&link forKey:NSURLIsSymbolicLinkKey error:NULL];
-        if (!folder.boolValue || link.boolValue) continue;
-        if (walk.level >= 5 || [name hasSuffix:@".app"] || [name isEqualToString:@"Resources"] || [name hasSuffix:@".lproj"] ||
-            [name isEqualToString:@"Libraries"]) [walk skipDescendants];
+    if (!app || isCodeEditorApp(app)) return NO;
+    NSString *key = app.bundleIdentifier ?: app.bundleURL.path;
+    static NSMutableDictionary<NSString *, NSNumber *> *cache;
+    static pthread_mutex_t cacheLock = PTHREAD_MUTEX_INITIALIZER;
+    if (key.length) {
+        pthread_mutex_lock(&cacheLock);
+        NSNumber *cached = cache[key];
+        pthread_mutex_unlock(&cacheLock);
+        if (cached) return cached.boolValue;
     }
-    return NO;
+    BOOL found = NO;
+    NSURL *frameworks = [app.bundleURL URLByAppendingPathComponent:@"Contents/Frameworks" isDirectory:YES];
+    if (frameworks) {
+        NSDirectoryEnumerator<NSURL *> *walk = [NSFileManager.defaultManager enumeratorAtURL:frameworks
+                                                                  includingPropertiesForKeys:@[ NSURLIsDirectoryKey, NSURLIsSymbolicLinkKey ]
+                                                                                     options:NSDirectoryEnumerationSkipsHiddenFiles errorHandler:nil];
+        for (NSURL *u in walk) {
+            NSString *name = u.lastPathComponent;
+            if ([name hasSuffix:@" Helper (Renderer).app"]) {
+                found = YES;
+                break;
+            }
+            // Skipping is only asked of a real folder: of a link (a framework's Resources) it skipped the rest of its folder.
+            NSNumber *folder = nil, *link = nil;
+            [u getResourceValue:&folder forKey:NSURLIsDirectoryKey error:NULL];
+            [u getResourceValue:&link forKey:NSURLIsSymbolicLinkKey error:NULL];
+            if (!folder.boolValue || link.boolValue) continue;
+            if (walk.level >= 5 || [name hasSuffix:@".app"] || [name isEqualToString:@"Resources"] || [name hasSuffix:@".lproj"] ||
+                [name isEqualToString:@"Libraries"]) [walk skipDescendants];
+        }
+    }
+    if (key.length) {
+        pthread_mutex_lock(&cacheLock);
+        if (!cache) cache = [NSMutableDictionary dictionary];
+        cache[key] = @(found);
+        pthread_mutex_unlock(&cacheLock);
+    }
+    return found;
+}
+
+static BOOL isChromeElement(AXUIElementRef e) {
+    if (!e) return NO;
+    pid_t pid = 0;
+    if (AXUIElementGetPid(e, &pid) != kAXErrorSuccess || pid <= 0) return NO;
+    return builtOnChrome([NSRunningApplication runningApplicationWithProcessIdentifier:pid]);
 }
 
 static CFTypeRef copyAttribute(AXUIElementRef element, CFStringRef attr); // below
@@ -874,8 +935,6 @@ static pid_t panelWithField(pid_t front) {
 
 enum { EDIT_UNKNOWN = -1, EDIT_NO = 0, EDIT_YES = 1 };
 
-static _Thread_local BOOL axTimedOut;
-
 static AXError copyAttributeError(AXUIElementRef element, CFStringRef attr, CFTypeRef *outValue) {
     *outValue = NULL;
     if (!element || axTimedOut) return kAXErrorCannotComplete;
@@ -970,6 +1029,24 @@ static int editability(AXUIElementRef e, BOOL *secure, NSString **role, NSString
         *why = [NSString stringWithFormat:@"%@ timed out", r];
         return EDIT_UNKNOWN;
     }
+    if ([r isEqualToString:@"AXWebArea"]) {
+        // An AXWebArea is the web document container; on Chromium apps where AX screen-reader mode is kept off,
+        // web content isn't exposed, so return EDIT_UNKNOWN to avoid hiding the keyboard while typing in web apps.
+        if (isChromeElement(e)) {
+            *why = @"Chromium web area (AX off)";
+            return EDIT_UNKNOWN;
+        }
+        CFTypeRef editable = NULL;
+        error = copyAttributeError(e, CFSTR("AXEditableAncestor"), &editable);
+        BOOL yes = error == kAXErrorSuccess && editable;
+        if (editable) CFRelease(editable);
+        if (yes) return EDIT_YES;
+        if (unsure(error)) {
+            *why = [NSString stringWithFormat:@"whether %@ is editable %@", r, axSaid(error)];
+            return EDIT_UNKNOWN;
+        }
+        return EDIT_NO;
+    }
     AXUIElementSetMessagingTimeout(e, 0.04f);
     Boolean settable = false;
     error = AXUIElementIsAttributeSettable(e, kAXValueAttribute, &settable);
@@ -988,16 +1065,6 @@ static int editability(AXUIElementRef e, BOOL *secure, NSString **role, NSString
             *why = [NSString stringWithFormat:@"%@'s caret %@", r, axSaid(error)];
             return EDIT_UNKNOWN;
         }
-    }
-    if ([r isEqualToString:@"AXWebArea"]) {
-        // An AXWebArea is the web document container; only check editable ancestor if fast.
-        // If it times out or returns error, it's not a text field (EDIT_NO).
-        CFTypeRef editable = NULL;
-        error = copyAttributeError(e, CFSTR("AXEditableAncestor"), &editable);
-        BOOL yes = error == kAXErrorSuccess && editable;
-        if (editable) CFRelease(editable);
-        if (yes) return EDIT_YES;
-        return EDIT_NO;
     }
     if ([r isEqualToString:(__bridge NSString *)kAXGroupRole] ||
         [r isEqualToString:(__bridge NSString *)kAXStaticTextRole]) {
@@ -1098,6 +1165,8 @@ static void requestLook(void) {
 
 // The element that has the focus now, or nothing. Another one than at the last look gets a new ID.
 static BOOL fieldIsCodeEditor;
+static BOOL fieldLargeValue;
+static _Atomic uint64_t lastCaretNotifyNs;
 
 static void setField(AXUIElementRef element, pid_t pid) {
     BOOL same = element ? fieldElement && CFEqual(fieldElement, element) : !fieldElement && fieldApp == pid && !fieldIsCodeEditor;
@@ -1106,6 +1175,7 @@ static void setField(AXUIElementRef element, pid_t pid) {
     fieldElement = element ? (AXUIElementRef)CFRetain(element) : NULL;
     fieldApp = pid;
     fieldIsCodeEditor = NO;
+    fieldLargeValue = NO;
     fieldID++;
     fieldEdit = element ? EDIT_UNKNOWN : EDIT_NO;
     fieldSecure = NO;
@@ -1203,18 +1273,18 @@ static int lookNow(NSString **why, NSString **appName) {
         return focus_said(FOCUS_CANT_TELL, NO, held);
     }
     AXUIElementSetMessagingTimeout(app, 0.05f);
-    // Apps built on Chrome show their pages' fields to Accessibility only once asked, as a screen reader does:
-    // Electron's (Slack, Discord...) take AXManualAccessibility, and browsers (Edge, Chrome, Brave, Arc...)
-    // AXEnhancedUserInterface (YouTube's search box got no keyboard). Asked once for each app, and the second only of
-    // apps built on Chrome, as others can slow their windows for it. Chrome takes it even as it answers with an error.
-    static NSMutableSet<NSNumber *> *asked;
-    if (!asked) asked = [NSMutableSet set];
-    if (![asked containsObject:@(pid)]) {
-        [asked addObject:@(pid)];
-        AXError manual = AXUIElementSetAttributeValue(app, CFSTR("AXManualAccessibility"), kCFBooleanTrue);
-        if (manual != kAXErrorSuccess && builtOnChrome(front)) {
-            AXError enhanced = AXUIElementSetAttributeValue(app, CFSTR("AXEnhancedUserInterface"), kCFBooleanTrue);
-            note([NSString stringWithFormat:@"asked %@, built on Chrome, to show its pages' fields (it answered %d)", bundle, (int)enhanced]);
+    // Never force Chromium screen-reader accessibility (AXManualAccessibility / AXEnhancedUserInterface) on
+    // browsers or Electron/WebView2 web apps (Chrome, Edge, Brave, Arc, Teams...): doing so makes Chromium build
+    // and diff its full AX tree on every DOM mutation and freezes typing in large web apps. Explicitly clear them
+    // once per pid in case an earlier helper or snapshot enabled them.
+    if (builtOnChrome(front)) {
+        static NSMutableSet<NSNumber *> *cleared;
+        if (!cleared) cleared = [NSMutableSet set];
+        if (![cleared containsObject:@(pid)]) {
+            [cleared addObject:@(pid)];
+            AXUIElementSetAttributeValue(app, CFSTR("AXManualAccessibility"), kCFBooleanFalse);
+            AXUIElementSetAttributeValue(app, CFSTR("AXEnhancedUserInterface"), kCFBooleanFalse);
+            note([NSString stringWithFormat:@"kept Chromium AX off for %@ to avoid DOM freeze", bundle]);
         }
     }
     CFTypeRef focused = NULL;
@@ -1287,16 +1357,35 @@ static BOOL focusMovedQuietly(void) {
     return moved;
 }
 
-// The text around the caret of the field with the focus ("ctx ID ..."), when it changed. check: first make sure the
-// focus is still there (the caret moved: some apps move the focus without a word).
-static void readContext(BOOL check) {
+// The text around the caret of the field with the focus ("ctx ID ..."), when it changed. Throttled to at most once
+// every 400 ms per field and never while keys are still arriving; skipped completely for AXWebArea or huge values.
+static const uint64_t contextThrottleNs = 400 * NSEC_PER_MSEC;
+
+static void readContext(BOOL fromTimer) {
     @autoreleasepool {
         axTimedOut = NO;
+        static unsigned lastReadFieldID;
+        static uint64_t lastReadAtNs;
+        BOOL isWebArea = [fieldRole isEqualToString:@"AXWebArea"] || [fieldRole hasPrefix:@"AXWebArea/"];
         NSString *line;
-        if (fieldElement && fieldEdit == EDIT_YES && !fieldSecure && !IsSecureEventInputEnabled()) {
-            if (check && focusMovedQuietly()) return requestLook();
+        if (fieldElement && fieldEdit == EDIT_YES && !fieldSecure && !IsSecureEventInputEnabled() && !isWebArea && !fieldLargeValue) {
+            uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            if (fromTimer) {
+                uint64_t notifyAge = now - atomic_load(&lastCaretNotifyNs);
+                uint64_t readAge = (lastReadFieldID == fieldID) ? (now - lastReadAtNs) : contextThrottleNs;
+                if (notifyAge < 350 * NSEC_PER_MSEC || readAge < contextThrottleNs) {
+                    if (contextTimer)
+                        dispatch_source_set_timer(contextTimer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)contextThrottleNs),
+                                                  DISPATCH_TIME_FOREVER, 50 * NSEC_PER_MSEC);
+                    return;
+                }
+            }
+            lastReadFieldID = fieldID;
+            lastReadAtNs = now;
             AXUIElementSetMessagingTimeout(fieldElement, 0.04f);
-            NSString *context = caretContext(fieldElement);
+            BOOL tooLarge = NO;
+            NSString *context = caretContext(fieldElement, &tooLarge);
+            if (tooLarge) fieldLargeValue = YES;
             line = [NSString stringWithFormat:@"ctx %u %@\n", fieldID, context ?: @"none"];
         } else {
             line = [NSString stringWithFormat:@"ctx %u none\n", fieldID];
@@ -1352,7 +1441,11 @@ static void lookAtFocus(void) {
             sentField = body;
             linkSend([NSString stringWithFormat:@"field %u %@\n", ++fieldSerial, body]);
         }
-        if (![now isEqualToString:@"unknown"]) readContext(NO);
+        static unsigned contextForFieldID;
+        if (![now isEqualToString:@"unknown"] && (fieldID != contextForFieldID || !sentContext)) {
+            contextForFieldID = fieldID;
+            readContext(NO);
+        }
     }
 }
 
@@ -1405,15 +1498,16 @@ static void safetyTick(void) {
 }
 
 // Told by the app with the keyboard the moment its focus moves, so the device's keyboard needn't wait. The caret
-// moving (every key typed) only reads the text around it again, once typing has paused for 150 ms.
+// moving (every key typed) only reads the text around it again, once typing has paused for 400 ms.
 static AXObserverRef focusObserver;
 
 static void focusMoved(AXObserverRef observer, AXUIElementRef element, CFStringRef notification, void *context) {
     (void)observer; (void)element; (void)context;
     if (CFEqual(notification, kAXSelectedTextChangedNotification)) {
+        atomic_store(&lastCaretNotifyNs, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
         if (contextTimer)
-            dispatch_source_set_timer(contextTimer, dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), DISPATCH_TIME_FOREVER,
-                                      20 * NSEC_PER_MSEC);
+            dispatch_source_set_timer(contextTimer, dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC), DISPATCH_TIME_FOREVER,
+                                      50 * NSEC_PER_MSEC);
     } else {
         requestLook();
     }
