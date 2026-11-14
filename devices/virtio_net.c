@@ -63,6 +63,26 @@ static void notify(HvVirtio *v, int q) {
     if (any) hv_virtio_interrupt(v);
 }
 
+static int rx_csum_valid(const uint8_t *frame, uint32_t len) {
+    if (len < 14) return 0;
+    uint16_t et = (uint16_t)(frame[12] << 8 | frame[13]);
+    if (et == 0x0800) {
+        if (len < 34) return 0;
+        const uint8_t *ip = frame + 14;
+        unsigned ihl = (ip[0] & 0x0f) * 4u;
+        if ((ip[0] >> 4) != 4 || ihl < 20 || len < 14 + ihl) return 0;
+        if ((ip[6] & 0x3f) != 0 || ip[7] != 0) return 0; /* IPv4 fragment */
+        return ip[9] == 6 || ip[9] == 17;
+    }
+    if (et == 0x86dd) {
+        if (len < 54) return 0;
+        const uint8_t *ip6 = frame + 14;
+        if ((ip6[0] >> 4) != 6) return 0;
+        return ip6[6] == 6 || ip6[6] == 17;
+    }
+    return 0;
+}
+
 static int receive_one(HvVirtioNet *n, const uint8_t *frame, uint32_t len, int irq) {
     HvVirtio *v = &n->vio;
     static HvVirtqElem e;
@@ -78,7 +98,7 @@ static int receive_one(HvVirtioNet *n, const uint8_t *frame, uint32_t len, int i
         return 1;
     }
     uint8_t hdr[HDR_LEN] = {0};
-    if (v->driver_features & F_GUEST_CSUM) hdr[0] = HDR_F_DATA_VALID;
+    if ((v->driver_features & F_GUEST_CSUM) && rx_csum_valid(frame, len)) hdr[0] = HDR_F_DATA_VALID;
     hdr[10] = 1; /* num_buffers */
     hv_virtq_write(v, &e, 0, hdr, HDR_LEN);
     hv_virtq_write(v, &e, HDR_LEN, frame, len);

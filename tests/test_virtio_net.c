@@ -236,9 +236,18 @@ int main(void) {
     n->vio.driver_features |= 3;
     n->vio.isr = 0;
     post(RXQ, 2, 0x800);
-    check("noirq rx: frame delivered", hv_virtio_net_receive_noirq(n, frame, sizeof frame), 1);
+    check("noirq rx: non-IP frame delivered", hv_virtio_net_receive_noirq(n, frame, sizeof frame), 1);
     check("noirq rx: ISR still 0 before flush", n->vio.isr & 1, 0);
-    check("noirq rx: DATA_VALID set in hdr", *(uint8_t *)at(buf(RXQ, 2)), 2);
+    check("noirq rx: DATA_VALID not set for non-IP frame", *(uint8_t *)at(buf(RXQ, 2)), 0);
+    uint8_t tcp_rx[54] = {0};
+    tcp_rx[12] = 0x08, tcp_rx[13] = 0x00, tcp_rx[14] = 0x45, tcp_rx[23] = 6;
+    post(RXQ, 3, 0x800);
+    check("noirq rx: IPv4 TCP frame delivered", hv_virtio_net_receive_noirq(n, tcp_rx, sizeof tcp_rx), 1);
+    check("noirq rx: DATA_VALID set for IPv4 TCP", *(uint8_t *)at(buf(RXQ, 3)), 2);
+    tcp_rx[20] = 0x20; /* MF fragment flag */
+    post(RXQ, 4, 0x800);
+    check("noirq rx: IPv4 fragment delivered", hv_virtio_net_receive_noirq(n, tcp_rx, sizeof tcp_rx), 1);
+    check("noirq rx: DATA_VALID not set for IPv4 fragment", *(uint8_t *)at(buf(RXQ, 4)), 0);
     hv_virtio_net_flush_irq(n);
     check("noirq rx: ISR set after flush", n->vio.isr & 1, 1);
 

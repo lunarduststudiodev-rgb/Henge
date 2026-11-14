@@ -522,7 +522,7 @@ static void send_next(Pending *p, int64_t now) {
 }
 
 #define DNS_CACHE_SIZE 256
-#define DNS_CACHE_KEY_MAX 264
+#define DNS_CACHE_KEY_MAX 300
 #define DNS_CACHE_MIN_TTL_S 5
 #define DNS_CACHE_MAX_TTL_S 300
 #define DNS_CACHE_NEG_MAX_TTL_S 30
@@ -549,23 +549,17 @@ static void dns_cache_clear(void) {
     }
 }
 
-/* Normalized question key (lowercase QNAME + QTYPE + QCLASS) for single-question standard queries. */
-static uint16_t dns_cache_key(const uint8_t *msg, uint32_t qend, uint8_t out[DNS_CACHE_KEY_MAX]) {
-    if (qend <= 16 || qend - 12 > DNS_CACHE_KEY_MAX || get16(msg + 4) != 1 || (msg[2] & 0x78) != 0) return 0;
-    uint32_t off = 12, k = 0;
-    while (off < qend - 4) {
-        uint8_t l = msg[off++];
-        out[k++] = l;
-        if (l == 0) break;
-        if (l > 63 || off + l > qend - 4) return 0;
-        for (uint8_t i = 0; i < l; i++) {
-            uint8_t c = msg[off++];
-            out[k++] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c + ('a' - 'A')) : c;
-        }
-    }
-    if (off + 4 != qend) return 0;
-    memcpy(out + k, msg + off, 4);
-    return (uint16_t)(k + 4);
+/* Exact query key: RD/CD/AD flags + wire question [12..qend) + trailing EDNS/additional bytes [qend..len). */
+static uint16_t dns_cache_key(const uint8_t *msg, uint32_t len, uint32_t qend, uint8_t out[DNS_CACHE_KEY_MAX]) {
+    if (qend <= 16 || qend > len || get16(msg + 4) != 1 || get16(msg + 6) != 0 || get16(msg + 8) != 0 ||
+        (msg[2] & 0x78) != 0)
+        return 0;
+    uint32_t tail = len - qend;
+    if (2 + (qend - 12) + tail > DNS_CACHE_KEY_MAX) return 0;
+    out[0] = msg[2] & 0x01; /* RD */
+    out[1] = msg[3] & 0x30; /* AD | CD */
+    memcpy(out + 2, msg + 12, len - 12);
+    return (uint16_t)(2 + (len - 12));
 }
 
 static uint32_t dns_response_ttl_ms(const uint8_t *m, uint32_t len, uint32_t qend) {
@@ -624,12 +618,12 @@ static DnsCacheEntry *dns_cache_find(const uint8_t *key, uint16_t klen, int64_t 
     return NULL;
 }
 
-static void dns_cache_put(const uint8_t *msg, uint32_t qend, const uint8_t *resp, uint32_t resp_len, int64_t now) {
+static void dns_cache_put(const uint8_t *msg, uint32_t msg_len, uint32_t qend, const uint8_t *resp, uint32_t resp_len, int64_t now) {
     if (resp_len < 12 || (resp[2] & 0x02)) return; /* don't cache truncated (TC=1) responses */
     unsigned rcode = resp[3] & 15;
     if (rcode != 0 && rcode != 3) return; /* only NOERROR and NXDOMAIN */
     uint8_t key[DNS_CACHE_KEY_MAX];
-    uint16_t klen = dns_cache_key(msg, qend, key);
+    uint16_t klen = dns_cache_key(msg, msg_len, qend, key);
     if (!klen) return;
     uint32_t ttl_ms = dns_response_ttl_ms(resp, resp_len, qend);
     DnsCacheEntry *slot = dns_cache_find(key, klen, now), *lru = NULL;
@@ -682,11 +676,11 @@ static void new_query(Query q, int64_t now) {
         dns_cache_clear();
     }
     if (changed || now - servers_time > SERVERS_FRESH_MS || nservers == 0) load_servers();
-    char qname[256];
+    char qname[256] = "";
     uint32_t qend = question_end(q.msg, q.len, qname, sizeof qname);
     if (qend) {
         uint8_t key[DNS_CACHE_KEY_MAX];
-        uint16_t klen = dns_cache_key(q.msg, qend, key);
+        uint16_t klen = dns_cache_key(q.msg, q.len, qend, key);
         DnsCacheEntry *hit = klen ? dns_cache_find(key, klen, now) : NULL;
         if (hit) {
             hit->last_used_ms = now;
@@ -752,7 +746,7 @@ static void got_reply(Pending *p, const uint8_t *m, uint32_t len, const struct s
     if (!copy) return;
     memcpy(copy, m, len);
     put16(copy, p->guest_id);
-    dns_cache_put(p->q.msg, p->qend, copy, len, now_ms());
+    dns_cache_put(p->q.msg, p->q.len, p->qend, copy, len, now_ms());
     send_to_guest(&p->q, copy, len);
     free(copy);
     finish(p);
@@ -773,7 +767,7 @@ static void gai_finished(GaiJob *j) {
         told_gai = 1;
         uint8_t out[ANSWER_MAX];
         size_t alen = make_answer(out, p->guest_id, p->q.msg, p->qend, p->gai_type, 0, j->addrs, j->n, j->family == AF_INET ? 4 : 16);
-        dns_cache_put(p->q.msg, p->qend, out, (uint32_t)alen, now_ms());
+        dns_cache_put(p->q.msg, p->q.len, p->qend, out, (uint32_t)alen, now_ms());
         send_to_guest(&p->q, out, alen);
         finish(p);
     }

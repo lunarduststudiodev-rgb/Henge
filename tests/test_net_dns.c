@@ -291,12 +291,12 @@ int main(void) {
     check("without the refusing server", refuser.queries, 1);
     check("second query served from cache", answerer.queries, 1);
 
-    /* Case-insensitive cache hit. */
+    /* Different QNAME casing (0x20) must not hit stale-cased cache entry. */
     len = make_query(f, 0x2223, 40001, "EXAMPLE.test", 1);
     hv_dns_take(f, len);
     n = await_answer(40001, msg, 4000, NULL);
-    check("case-insensitive cache hit answered", n > 0 && get16(msg) == 0x2223 && get16(msg + 6) == 1, 1);
-    check("case-insensitive cache hit skipped upstream", answerer.queries, 1);
+    check("0x20 casing answered", n > 0 && get16(msg) == 0x2223 && get16(msg + 6) == 1, 1);
+    check("0x20 casing queried upstream", answerer.queries, 2);
 
     /* An answer longer than a frame: IPv4 fragments. */
     len = make_query(f, 0x3333, 40002, "big.test", 16);
