@@ -820,29 +820,37 @@ static NSMutableSet<NSNumber *> *chromeAXEnabled;
 static pthread_mutex_t chromeAXLock = PTHREAD_MUTEX_INITIALIZER;
 
 // Enables Chromium AX on demand (on tap/click/focus-probe) so web text fields and <input type="password"> are
-// detected, unless suppressed while actively typing in a confirmed field.
-static void ensureChromeAX(NSRunningApplication *app, BOOL forceReenable) {
-    if (!builtOnChrome(app)) return;
+// detected, unless suppressed while actively typing in a confirmed field. Returns YES if it was suppressed and just re-enabled.
+static BOOL ensureChromeAX(NSRunningApplication *app, BOOL forceReenable) {
+    if (!builtOnChrome(app)) return NO;
     pid_t pid = app.processIdentifier;
-    if (pid <= 0) return;
-    if (forceReenable) {
-        if (atomic_load(&chromeAXSuppressedPid) == pid) atomic_store(&chromeAXSuppressedPid, 0);
-    } else if (atomic_load(&chromeAXSuppressedPid) == pid) {
-        return;
-    }
+    if (pid <= 0) return NO;
+    BOOL wasSuppressed = NO;
     pthread_mutex_lock(&chromeAXLock);
     if (!chromeAXEnabled) chromeAXEnabled = [NSMutableSet set];
+    if (forceReenable) {
+        if (atomic_load(&chromeAXSuppressedPid) == pid) {
+            atomic_store(&chromeAXSuppressedPid, 0);
+            wasSuppressed = YES;
+        }
+    } else if (atomic_load(&chromeAXSuppressedPid) == pid) {
+        pthread_mutex_unlock(&chromeAXLock);
+        return NO;
+    }
     BOOL already = [chromeAXEnabled containsObject:@(pid)];
-    if (!already) [chromeAXEnabled addObject:@(pid)];
+    if (!already) {
+        [chromeAXEnabled addObject:@(pid)];
+        AXUIElementRef axApp = AXUIElementCreateApplication(pid);
+        if (axApp) {
+            AXUIElementSetMessagingTimeout(axApp, 0.05f);
+            AXError manual = AXUIElementSetAttributeValue(axApp, CFSTR("AXManualAccessibility"), kCFBooleanTrue);
+            if (manual != kAXErrorSuccess)
+                AXUIElementSetAttributeValue(axApp, CFSTR("AXEnhancedUserInterface"), kCFBooleanTrue);
+            CFRelease(axApp);
+        }
+    }
     pthread_mutex_unlock(&chromeAXLock);
-    if (already) return;
-    AXUIElementRef axApp = AXUIElementCreateApplication(pid);
-    if (!axApp) return;
-    AXUIElementSetMessagingTimeout(axApp, 0.05f);
-    AXError manual = AXUIElementSetAttributeValue(axApp, CFSTR("AXManualAccessibility"), kCFBooleanTrue);
-    if (manual != kAXErrorSuccess)
-        AXUIElementSetAttributeValue(axApp, CFSTR("AXEnhancedUserInterface"), kCFBooleanTrue);
-    CFRelease(axApp);
+    return wasSuppressed;
 }
 
 // Turns Chromium AX off while typing so Blink does not build/diff its full AX tree on every keystroke.
@@ -850,16 +858,20 @@ static void suppressChromeAX(pid_t pid) {
     if (pid <= 0) return;
     NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
     if (!builtOnChrome(app)) return;
-    if (atomic_exchange(&chromeAXSuppressedPid, pid) == pid) return;
     pthread_mutex_lock(&chromeAXLock);
+    if (atomic_exchange(&chromeAXSuppressedPid, pid) == pid) {
+        pthread_mutex_unlock(&chromeAXLock);
+        return;
+    }
     [chromeAXEnabled removeObject:@(pid)];
-    pthread_mutex_unlock(&chromeAXLock);
     AXUIElementRef axApp = AXUIElementCreateApplication(pid);
-    if (!axApp) return;
-    AXUIElementSetMessagingTimeout(axApp, 0.04f);
-    AXUIElementSetAttributeValue(axApp, CFSTR("AXManualAccessibility"), kCFBooleanFalse);
-    AXUIElementSetAttributeValue(axApp, CFSTR("AXEnhancedUserInterface"), kCFBooleanFalse);
-    CFRelease(axApp);
+    if (axApp) {
+        AXUIElementSetMessagingTimeout(axApp, 0.04f);
+        AXUIElementSetAttributeValue(axApp, CFSTR("AXManualAccessibility"), kCFBooleanFalse);
+        AXUIElementSetAttributeValue(axApp, CFSTR("AXEnhancedUserInterface"), kCFBooleanFalse);
+        CFRelease(axApp);
+    }
+    pthread_mutex_unlock(&chromeAXLock);
 }
 
 static CFTypeRef copyAttribute(AXUIElementRef element, CFStringRef attr); // below
@@ -1077,12 +1089,7 @@ static int editability(AXUIElementRef e, BOOL *secure, NSString **role, NSString
         return EDIT_UNKNOWN;
     }
     if ([r isEqualToString:@"AXWebArea"]) {
-        // An AXWebArea is the web document container; on Chromium apps where AX screen-reader mode is kept off,
-        // web content isn't exposed, so return EDIT_UNKNOWN to avoid hiding the keyboard while typing in web apps.
-        if (isChromeElement(e)) {
-            *why = @"Chromium web area (AX off)";
-            return EDIT_UNKNOWN;
-        }
+        // An AXWebArea is the web document container; check editable ancestor directly.
         CFTypeRef editable = NULL;
         error = copyAttributeError(e, CFSTR("AXEditableAncestor"), &editable);
         BOOL yes = error == kAXErrorSuccess && editable;
@@ -1315,7 +1322,8 @@ static int lookNow(NSString **why, NSString **appName) {
         dispatch_async(dispatch_get_main_queue(), ^{ observeApp(pid); });
     }
     // Enable Chromium AX on demand for browsers/web apps so taps and initial focus see web inputs and password
-    // fields, unless suppressed while actively typing in a confirmed field.
+    // fields, unless suppressed while actively typing in a confirmed field. Clear suppression on app switch or secure input.
+    if (pid != fieldApp || IsSecureEventInputEnabled()) atomic_store(&chromeAXSuppressedPid, 0);
     ensureChromeAX(front, NO);
     AXUIElementRef app = AXUIElementCreateApplication(pid);
     if (!app) {
@@ -1507,7 +1515,10 @@ static void safetyTick(void) {
         ticks++;
         // Another app taking it over counts too (a password manager's left on, then Terminal's sudo).
         pid_t holder = secureInputHolder();
-        if ((holder != 0) != secureSeen || holder != secureHolderSeen) return lookAtFocus();
+        if ((holder != 0) != secureSeen || holder != secureHolderSeen) {
+            atomic_store(&chromeAXSuppressedPid, 0);
+            return lookAtFocus();
+        }
         // The screen unlocking (or locking) while something holds it: loginwindow keeping it is a prompt no longer (or
         // again), as is loginwindow asked while macOS doesn't say who holds it.
         if ((holder < 0 || [secureHolder isEqualToString:@"loginwindow"]) && screenLockedNow() != lockedSeen) return lookAtFocus();
@@ -1516,6 +1527,17 @@ static void safetyTick(void) {
         pid_t frontPid = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
         BOOL appChanged = (frontPid != lastFrontPid);
         lastFrontPid = frontPid;
+        if (appChanged) atomic_store(&chromeAXSuppressedPid, 0);
+        // Re-enable Chromium AX once typing has been idle for >1.5 s so Tab/Enter/focus changes are detected.
+        pid_t suppressed = atomic_load(&chromeAXSuppressedPid);
+        if (suppressed && suppressed == frontPid) {
+            uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            uint64_t lastNotify = atomic_load(&lastCaretNotifyNs);
+            if (now >= lastNotify && now - lastNotify > 1500 * NSEC_PER_MSEC) {
+                atomic_store(&chromeAXSuppressedPid, 0);
+                return lookAtFocus();
+            }
+        }
         BOOL settling = (!panelSeen && overlaysCount && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - overlaysSeenAt < panelSettles);
         if (appChanged || settling || (ticks % 4 == 0)) {
             NSString *signature = overlayWindows(frontPid, nil);
@@ -1552,6 +1574,7 @@ static void focusMoved(AXObserverRef observer, AXUIElementRef element, CFStringR
             dispatch_source_set_timer(contextTimer, dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC), DISPATCH_TIME_FOREVER,
                                       50 * NSEC_PER_MSEC);
     } else {
+        atomic_store(&chromeAXSuppressedPid, 0);
         requestLook();
     }
 }
@@ -1927,7 +1950,7 @@ static NSString *tapAnswer(unsigned id, CGPoint at, AXUIElementRef under) {
 static void answerTap(unsigned id, double x, double y) {
     dispatch_async(tapQueue, ^{
         @autoreleasepool {
-            ensureChromeAX(NSWorkspace.sharedWorkspace.frontmostApplication, YES);
+            if (ensureChromeAX(NSWorkspace.sharedWorkspace.frontmostApplication, YES)) usleep(30000);
             linkSend(tapAnswer(id, onScreen(x, y), NULL));
         }
     });
@@ -1945,7 +1968,7 @@ static void answerHit(unsigned id, double x, double y) {
             AXUIElementRef hit = NULL;
             NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
             if (trusted() && !isCodeEditorApp(front)) {
-                ensureChromeAX(front, YES);
+                if (ensureChromeAX(front, YES)) usleep(30000);
                 AXError err = AXUIElementCopyElementAtPosition(systemWide(), (float)at.x, (float)at.y, &hit);
                 if (err == kAXErrorCannotComplete) axTimedOut = YES;
                 if (err == kAXErrorSuccess && hit) {
