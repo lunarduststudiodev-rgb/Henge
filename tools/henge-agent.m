@@ -1315,6 +1315,14 @@ static int lookNow(NSString **why, NSString **appName) {
         int edit = editability(fieldElement, &secure, &role, &whyNot);
         fieldRole = role;
         if (edit == EDIT_UNKNOWN) {
+            if ([role isEqualToString:@"AXWebArea"] && builtOnChrome(front) &&
+                !held.held_here && !held.held_by_prompt && [stateSent isEqualToString:@"secure"]) {
+                fieldEdit = EDIT_YES;
+                fieldSecure = NO;
+                fieldKindSaid = "prose";
+                fieldFrame = CGRectNull;
+                return focus_said(FOCUS_FIELD, NO, held);
+            }
             *why = whyNot;
             return focus_said(FOCUS_CANT_TELL, NO, held);
         }
