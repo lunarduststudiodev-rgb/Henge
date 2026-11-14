@@ -29,6 +29,9 @@ typedef struct HvVirtioNet {
 HvVirtioNet *hv_virtio_net_create(HvMachine *m, HvPcie *bus, const uint8_t mac[6]);
 /* Returns 0 if the guest had no receive buffer posted (the caller keeps the frame for later). */
 int hv_virtio_net_receive(HvVirtioNet *n, const uint8_t *frame, uint32_t len);
+/* Same as hv_virtio_net_receive, without raising the RX interrupt; call hv_virtio_net_flush_irq after a batch. */
+int hv_virtio_net_receive_noirq(HvVirtioNet *n, const uint8_t *frame, uint32_t len);
+void hv_virtio_net_flush_irq(HvVirtioNet *n);
 /* The cable out for `ms`, then back in (each a config change the driver sees): after Suspend the
    network behind the device is a new one, and a Mac that saw its link drop asks it for an address again
    and gives up its old connections at once instead of waiting for them to time out. */

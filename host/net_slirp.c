@@ -134,8 +134,11 @@ static int push(Queue *q, const uint8_t *data, uint32_t len) {
             atomic_store_explicit(&st.peak, depth + 1, memory_order_relaxed);
     }
     pthread_mutex_unlock(&q->mu);
-    if (!ok) atomic_fetch_add_explicit(q == &to_guest ? &st.in_dropped : &st.out_dropped, 1, memory_order_relaxed);
-    return ok;
+    if (!ok) {
+        atomic_fetch_add_explicit(q == &to_guest ? &st.in_dropped : &st.out_dropped, 1, memory_order_relaxed);
+        return 0;
+    }
+    return depth == 0 ? 2 : 1;
 }
 
 /* How quickly the guest's TCP answers: for one segment at a time per connection, the time from the card
@@ -381,6 +384,8 @@ void hv_net_losses(uint64_t *dropped_to_guest, uint64_t *dropped_from_guest, uin
     *resets = atomic_load_explicit(&st.resets, memory_order_relaxed);
 }
 
+static int net_wake_pending;
+
 static slirp_ssize_t send_packet(const void *buf, size_t len, void *opaque) {
     (void)opaque;
     if (len > MAX_FRAME) {
@@ -392,7 +397,7 @@ static slirp_ssize_t send_packet(const void *buf, size_t len, void *opaque) {
     slirp_henge_reset_why = NULL;
     log_frame("rx", buf, (uint32_t)len);
     if (hv_net_watch) hv_net_watch(buf, (uint32_t)len, 1);
-    if (push(&to_guest, buf, (uint32_t)len)) hv_machine_wake(machine);
+    if (push(&to_guest, buf, (uint32_t)len)) net_wake_pending = 1;
     return (slirp_ssize_t)len;
 }
 
@@ -587,6 +592,10 @@ static void *net_thread(void *unused) {
                 slirp_henge_reset_why = NULL;
                 slirp_handle_timer(slirp, timers[i].id, timers[i].cb_opaque);
             }
+        if (net_wake_pending) {
+            net_wake_pending = 0;
+            hv_machine_wake(machine);
+        }
         /* What the guest sent since: batch dequeue up to 32 frames under one lock */
         for (;;) {
             Frame batch[32];
@@ -613,6 +622,10 @@ static void *net_thread(void *unused) {
                 free(batch[i].data);
             }
         }
+        if (net_wake_pending) {
+            net_wake_pending = 0;
+            hv_machine_wake(machine);
+        }
     }
     return NULL;
 }
@@ -625,7 +638,7 @@ static void transmit(void *opaque, const uint8_t *frame, uint32_t len) {
     log_frame("tx", frame, len);
     if (hv_net_watch) hv_net_watch(frame, len, 0);
     if (hv_dns_take(frame, len)) return;
-    if (push(&to_host, frame, len)) {
+    if (push(&to_host, frame, len) == 2) {
         char c = 0;
         (void)!write(wake_pipe[1], &c, 1);
     }
@@ -633,6 +646,7 @@ static void transmit(void *opaque, const uint8_t *frame, uint32_t len) {
 
 void hv_net_poll(void) {
     if (!net || to_guest.head == to_guest.tail) return;
+    int any_irq = 0;
     for (;;) {
         Frame batch[32];
         uint32_t count = 0;
@@ -640,7 +654,7 @@ void hv_net_poll(void) {
         uint32_t depth = to_guest.tail - to_guest.head;
         if (!depth) {
             pthread_mutex_unlock(&to_guest.mu);
-            return;
+            break;
         }
         if (depth > 32) depth = 32;
         for (uint32_t i = 0; i < depth; i++) {
@@ -652,10 +666,11 @@ void hv_net_poll(void) {
         uint32_t delivered_count = 0;
         uint64_t freed_bytes = 0;
         for (uint32_t i = 0; i < count; i++) {
-            if (!hv_virtio_net_receive(net, batch[i].data, batch[i].len)) {
+            if (!hv_virtio_net_receive_noirq(net, batch[i].data, batch[i].len)) {
                 atomic_fetch_add_explicit(&st.no_buffer, 1, memory_order_relaxed);
                 break;
             }
+            any_irq = 1;
             hv_net_rx_frames++;
             delivered(batch[i].data, batch[i].len, batch[i].queued_ns);
             freed_bytes += batch[i].len;
@@ -670,8 +685,9 @@ void hv_net_poll(void) {
             pthread_mutex_unlock(&to_guest.mu);
         }
 
-        if (delivered_count < count) return;
+        if (delivered_count < count) break;
     }
+    if (any_irq) hv_virtio_net_flush_irq(net);
 }
 
 int hv_net_mtu(void) {

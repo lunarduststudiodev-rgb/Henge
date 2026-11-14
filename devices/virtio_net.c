@@ -4,8 +4,12 @@
 #include <string.h>
 #include <time.h>
 
+#define F_CSUM (1ull << 0)
+#define F_GUEST_CSUM (1ull << 1)
 #define F_MAC (1ull << 5)
 #define F_STATUS (1ull << 16)
+#define HDR_F_NEEDS_CSUM 1
+#define HDR_F_DATA_VALID 2
 #define RXQ 0
 #define TXQ 1
 #define HDR_LEN 12 /* virtio_net_hdr with num_buffers (VERSION_1) */
@@ -13,6 +17,23 @@
 #define CARRIER_UP (1ull << 63)
 #define CARRIER_DOWN_NS 3000000000ull /* the host's network gone this long: the cable is out */
 #define CARRIER_UP_NS 1000000000ull   /* and back this long: in again */
+
+static void finish_tx_csum(const uint8_t *hdr, uint8_t *frame, uint32_t len) {
+    uint16_t start, offset;
+    memcpy(&start, hdr + 6, 2);
+    memcpy(&offset, hdr + 8, 2);
+    if ((uint32_t)start + offset + 2 > len) return;
+    uint32_t sum = 0;
+    const uint8_t *p = frame + start;
+    uint32_t n = len - start;
+    for (uint32_t i = 0; i + 1 < n; i += 2) sum += ((uint32_t)p[i] << 8) | p[i + 1];
+    if (n & 1) sum += (uint32_t)p[n - 1] << 8;
+    while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+    uint16_t csum = (uint16_t)~sum;
+    if (csum == 0 && offset == 6) csum = 0xffff; /* UDP checksum 0 is transmitted as 0xffff */
+    frame[start + offset] = (uint8_t)(csum >> 8);
+    frame[start + offset + 1] = (uint8_t)(csum & 0xff);
+}
 
 static void notify(HvVirtio *v, int q) {
     HvVirtioNet *n = v->dev;
@@ -22,14 +43,19 @@ static void notify(HvVirtio *v, int q) {
     }
     if (q != TXQ) return; /* new receive buffers: nothing waiting to deliver */
     static HvVirtqElem e;
-    static uint8_t frame[MAX_FRAME];
+    static uint8_t buf[HDR_LEN + MAX_FRAME];
     int any = 0;
     while (hv_virtq_pop(v, q, &e) > 0) {
-        uint32_t len = hv_virtq_read(v, &e, HDR_LEN, frame, sizeof frame);
-        if (!n->carrier) n->tx_dropped++; /* the cable is out: it goes nowhere */
-        else {
-            if (n->transmit) n->transmit(n->opaque, frame, len);
-            n->tx_frames++;
+        uint32_t total = hv_virtq_read(v, &e, 0, buf, sizeof buf);
+        if (total >= HDR_LEN) {
+            uint32_t len = total - HDR_LEN;
+            if ((v->driver_features & F_CSUM) && (buf[0] & HDR_F_NEEDS_CSUM))
+                finish_tx_csum(buf, buf + HDR_LEN, len);
+            if (!n->carrier) n->tx_dropped++; /* the cable is out: it goes nowhere */
+            else {
+                if (n->transmit) n->transmit(n->opaque, buf + HDR_LEN, len);
+                n->tx_frames++;
+            }
         }
         hv_virtq_push(v, q, &e, 0);
         any = 1;
@@ -37,7 +63,7 @@ static void notify(HvVirtio *v, int q) {
     if (any) hv_virtio_interrupt(v);
 }
 
-int hv_virtio_net_receive(HvVirtioNet *n, const uint8_t *frame, uint32_t len) {
+static int receive_one(HvVirtioNet *n, const uint8_t *frame, uint32_t len, int irq) {
     HvVirtio *v = &n->vio;
     static HvVirtqElem e;
     if (!n->carrier) { /* the cable is out: nothing arrives (taken, so nothing stale waits for it to go back in) */
@@ -47,18 +73,31 @@ int hv_virtio_net_receive(HvVirtioNet *n, const uint8_t *frame, uint32_t len) {
     if (!(v->status & 4) || !v->q[RXQ].enabled || hv_virtq_pop(v, RXQ, &e) <= 0) return 0;
     if (hv_virtq_writable(&e) < HDR_LEN + len) { /* too small for it: drop the frame, return the buffer */
         hv_virtq_push(v, RXQ, &e, 0);
-        hv_virtio_interrupt(v);
+        if (irq) hv_virtio_interrupt(v);
         n->rx_dropped++;
         return 1;
     }
     uint8_t hdr[HDR_LEN] = {0};
+    if (v->driver_features & F_GUEST_CSUM) hdr[0] = HDR_F_DATA_VALID;
     hdr[10] = 1; /* num_buffers */
     hv_virtq_write(v, &e, 0, hdr, HDR_LEN);
     hv_virtq_write(v, &e, HDR_LEN, frame, len);
     hv_virtq_push(v, RXQ, &e, HDR_LEN + len);
-    hv_virtio_interrupt(v);
+    if (irq) hv_virtio_interrupt(v);
     n->rx_frames++;
     return 1;
+}
+
+int hv_virtio_net_receive(HvVirtioNet *n, const uint8_t *frame, uint32_t len) {
+    return receive_one(n, frame, len, 1);
+}
+
+int hv_virtio_net_receive_noirq(HvVirtioNet *n, const uint8_t *frame, uint32_t len) {
+    return receive_one(n, frame, len, 0);
+}
+
+void hv_virtio_net_flush_irq(HvVirtioNet *n) {
+    hv_virtio_interrupt(&n->vio);
 }
 
 uint64_t hv_virtio_net_now(void) {
@@ -119,7 +158,7 @@ void hv_virtio_net_poll(HvVirtioNet *n) {
 HvVirtioNet *hv_virtio_net_create(HvMachine *m, HvPcie *bus, const uint8_t mac[6]) {
     HvVirtioNet *n = calloc(1, sizeof *n);
     HvVirtio *v = &n->vio;
-    hv_virtio_init(v, m, 1, 0x020000, 2, F_MAC | F_STATUS);
+    hv_virtio_init(v, m, 1, 0x020000, 2, F_CSUM | F_GUEST_CSUM | F_MAC | F_STATUS);
     v->dev = n;
     v->notify = notify;
     memcpy(v->config, mac, 6);

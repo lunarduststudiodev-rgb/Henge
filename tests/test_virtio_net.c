@@ -71,8 +71,14 @@ static void post(int q, int i, uint32_t len) {
 }
 
 static int sent, changed_to = -1, changes;
+static uint8_t last_tx[128];
+static uint32_t last_tx_len;
 static void transmit(void *opaque, const uint8_t *frame, uint32_t len) {
-    (void)opaque, (void)frame, (void)len;
+    (void)opaque;
+    if (len <= sizeof last_tx) {
+        memcpy(last_tx, frame, len);
+        last_tx_len = len;
+    }
     sent++;
 }
 static void carrier_changed(void *opaque, int up) {
@@ -222,6 +228,33 @@ int main(void) {
     hv_virtio_net_poll(n);
     check("from another thread: the last report wins", status(), 0);
     check("from another thread: the backend's last word is out", changed_to, 0);
+
+    /* Checksum offload (F_CSUM, F_GUEST_CSUM) and batched RX interrupt */
+    check("offers checksum offloads (F_CSUM | F_GUEST_CSUM)", n->vio.features & 3, 3);
+    hv_virtio_net_set_carrier(n, 1, hv_virtio_net_now() - 2 * SEC);
+    hv_virtio_net_poll(n);
+    n->vio.driver_features |= 3;
+    n->vio.isr = 0;
+    post(RXQ, 2, 0x800);
+    check("noirq rx: frame delivered", hv_virtio_net_receive_noirq(n, frame, sizeof frame), 1);
+    check("noirq rx: ISR still 0 before flush", n->vio.isr & 1, 0);
+    check("noirq rx: DATA_VALID set in hdr", *(uint8_t *)at(buf(RXQ, 2)), 2);
+    hv_virtio_net_flush_irq(n);
+    check("noirq rx: ISR set after flush", n->vio.isr & 1, 1);
+
+    uint8_t *txbuf = at(buf(TXQ, 2));
+    memset(txbuf, 0, 12 + 24);
+    txbuf[0] = 1; /* VIRTIO_NET_HDR_F_NEEDS_CSUM */
+    uint16_t cstart = 14, coff = 6;
+    memcpy(txbuf + 6, &cstart, 2);
+    memcpy(txbuf + 8, &coff, 2);
+    txbuf[12 + 14] = 0x12, txbuf[12 + 15] = 0x34;
+    txbuf[12 + 16] = 0x56, txbuf[12 + 17] = 0x78;
+    post(TXQ, 2, 12 + 24);
+    n->vio.notify(&n->vio, TXQ);
+    check("tx csum: frame sent", last_tx_len, 24);
+    uint16_t got_csum = (uint16_t)(last_tx[14 + 6] << 8 | last_tx[14 + 7]);
+    check("tx csum: ~((0x1234 + 0x5678)) == 0x9753", got_csum, 0x9753);
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;

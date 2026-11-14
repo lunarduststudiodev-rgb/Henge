@@ -521,6 +521,138 @@ static void send_next(Pending *p, int64_t now) {
     p->next_send = INT64_MAX;
 }
 
+#define DNS_CACHE_SIZE 256
+#define DNS_CACHE_KEY_MAX 264
+#define DNS_CACHE_MIN_TTL_S 5
+#define DNS_CACHE_MAX_TTL_S 300
+#define DNS_CACHE_NEG_MAX_TTL_S 30
+
+typedef struct DnsCacheEntry {
+    int used;
+    uint8_t key[DNS_CACHE_KEY_MAX];
+    uint16_t key_len;
+    uint8_t *resp;
+    uint32_t resp_len;
+    int64_t expires_ms;
+    int64_t last_used_ms;
+} DnsCacheEntry;
+
+static DnsCacheEntry dns_cache[DNS_CACHE_SIZE];
+
+static void dns_cache_clear(void) {
+    for (int i = 0; i < DNS_CACHE_SIZE; i++) {
+        if (dns_cache[i].used) {
+            free(dns_cache[i].resp);
+            dns_cache[i].resp = NULL;
+            dns_cache[i].used = 0;
+        }
+    }
+}
+
+/* Normalized question key (lowercase QNAME + QTYPE + QCLASS) for single-question standard queries. */
+static uint16_t dns_cache_key(const uint8_t *msg, uint32_t qend, uint8_t out[DNS_CACHE_KEY_MAX]) {
+    if (qend <= 16 || qend - 12 > DNS_CACHE_KEY_MAX || get16(msg + 4) != 1 || (msg[2] & 0x78) != 0) return 0;
+    uint32_t off = 12, k = 0;
+    while (off < qend - 4) {
+        uint8_t l = msg[off++];
+        out[k++] = l;
+        if (l == 0) break;
+        if (l > 63 || off + l > qend - 4) return 0;
+        for (uint8_t i = 0; i < l; i++) {
+            uint8_t c = msg[off++];
+            out[k++] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c + ('a' - 'A')) : c;
+        }
+    }
+    if (off + 4 != qend) return 0;
+    memcpy(out + k, msg + off, 4);
+    return (uint16_t)(k + 4);
+}
+
+static uint32_t dns_response_ttl_ms(const uint8_t *m, uint32_t len, uint32_t qend) {
+    unsigned rcode = m[3] & 15;
+    unsigned an = get16(m + 6), ns = get16(m + 8), ar = get16(m + 10);
+    unsigned total = an + ns + ar;
+    uint32_t off = qend, min_ttl = UINT32_MAX;
+    int found = 0;
+    for (unsigned i = 0; i < total && off < len; i++) {
+        while (off < len) {
+            uint8_t c = m[off];
+            if ((c & 0xc0) == 0xc0) {
+                if (off + 2 > len) { off = len; break; }
+                off += 2;
+                break;
+            }
+            if (c == 0) {
+                off++;
+                break;
+            }
+            if (c > 63 || off + 1 + c > len) { off = len; break; }
+            off += 1 + c;
+        }
+        if (off + 10 > len) break;
+        uint16_t type = get16(m + off);
+        uint32_t ttl = ((uint32_t)get16(m + off + 4) << 16) | get16(m + off + 6);
+        uint16_t rdlen = get16(m + off + 8);
+        off += 10;
+        if (off + rdlen > len) break;
+        off += rdlen;
+        if (type != 41 && ttl < min_ttl) { /* skip EDNS OPT */
+            min_ttl = ttl;
+            found = 1;
+        }
+    }
+    int neg = (rcode == 3 || an == 0);
+    uint32_t secs = found ? min_ttl : (neg ? 15u : 60u);
+    if (secs < DNS_CACHE_MIN_TTL_S) secs = DNS_CACHE_MIN_TTL_S;
+    uint32_t max_s = neg ? DNS_CACHE_NEG_MAX_TTL_S : DNS_CACHE_MAX_TTL_S;
+    if (secs > max_s) secs = max_s;
+    return secs * 1000u;
+}
+
+static DnsCacheEntry *dns_cache_find(const uint8_t *key, uint16_t klen, int64_t now) {
+    for (int i = 0; i < DNS_CACHE_SIZE; i++) {
+        DnsCacheEntry *e = &dns_cache[i];
+        if (!e->used) continue;
+        if (e->expires_ms <= now) {
+            free(e->resp);
+            e->resp = NULL;
+            e->used = 0;
+            continue;
+        }
+        if (e->key_len == klen && memcmp(e->key, key, klen) == 0) return e;
+    }
+    return NULL;
+}
+
+static void dns_cache_put(const uint8_t *msg, uint32_t qend, const uint8_t *resp, uint32_t resp_len, int64_t now) {
+    if (resp_len < 12 || (resp[2] & 0x02)) return; /* don't cache truncated (TC=1) responses */
+    unsigned rcode = resp[3] & 15;
+    if (rcode != 0 && rcode != 3) return; /* only NOERROR and NXDOMAIN */
+    uint8_t key[DNS_CACHE_KEY_MAX];
+    uint16_t klen = dns_cache_key(msg, qend, key);
+    if (!klen) return;
+    uint32_t ttl_ms = dns_response_ttl_ms(resp, resp_len, qend);
+    DnsCacheEntry *slot = dns_cache_find(key, klen, now), *lru = NULL;
+    if (!slot) {
+        for (int i = 0; i < DNS_CACHE_SIZE; i++) {
+            if (!dns_cache[i].used) { slot = &dns_cache[i]; break; }
+            if (!lru || dns_cache[i].last_used_ms < lru->last_used_ms) lru = &dns_cache[i];
+        }
+        if (!slot) slot = lru;
+    }
+    uint8_t *copy = malloc(resp_len);
+    if (!copy) return;
+    memcpy(copy, resp, resp_len);
+    free(slot->resp);
+    slot->used = 1;
+    memcpy(slot->key, key, klen);
+    slot->key_len = klen;
+    slot->resp = copy;
+    slot->resp_len = resp_len;
+    slot->expires_ms = now + (int64_t)ttl_ms;
+    slot->last_used_ms = now;
+}
+
 static void new_query(Query q, int64_t now) {
     if (q.len < 12 || (q.msg[2] & 0x80)) { /* not a question */
         free(q.msg);
@@ -541,18 +673,33 @@ static void new_query(Query q, int64_t now) {
         }
         if (!oldest || e->t0 < oldest->t0) oldest = e;
     }
-    if (!p) {
-        finish(oldest); /* the guest has long asked again */
-        p = oldest;
-    }
     int changed = atomic_exchange(&servers_stale, 0);
     if (changed) { /* another network: whoever answered on the last one may not */
         pthread_mutex_lock(&best_mu);
         have_best = 0;
         pthread_mutex_unlock(&best_mu);
         told_gai = 0;
+        dns_cache_clear();
     }
     if (changed || now - servers_time > SERVERS_FRESH_MS || nservers == 0) load_servers();
+    char qname[256];
+    uint32_t qend = question_end(q.msg, q.len, qname, sizeof qname);
+    if (qend) {
+        uint8_t key[DNS_CACHE_KEY_MAX];
+        uint16_t klen = dns_cache_key(q.msg, qend, key);
+        DnsCacheEntry *hit = klen ? dns_cache_find(key, klen, now) : NULL;
+        if (hit) {
+            hit->last_used_ms = now;
+            put16(hit->resp, id);
+            send_to_guest(&q, hit->resp, hit->resp_len);
+            free(q.msg);
+            return;
+        }
+    }
+    if (!p) {
+        finish(oldest); /* the guest has long asked again */
+        p = oldest;
+    }
     memset(p, 0, sizeof *p);
     p->used = 1;
     p->q = q;
@@ -560,8 +707,8 @@ static void new_query(Query q, int64_t now) {
     p->guest_id = id;
     p->t0 = now;
     p->token = next_token++;
-    uint32_t qend = question_end(q.msg, q.len, p->name, sizeof p->name);
     p->qend = qend ? qend : 12;
+    snprintf(p->name, sizeof p->name, "%s", qname);
     p->gai_type = gai_type_of(q.msg, qend, p->name);
     /* the one that answered last first, then the rest in order */
     if (have_best)
@@ -605,6 +752,7 @@ static void got_reply(Pending *p, const uint8_t *m, uint32_t len, const struct s
     if (!copy) return;
     memcpy(copy, m, len);
     put16(copy, p->guest_id);
+    dns_cache_put(p->q.msg, p->qend, copy, len, now_ms());
     send_to_guest(&p->q, copy, len);
     free(copy);
     finish(p);
@@ -623,7 +771,10 @@ static void gai_finished(GaiJob *j) {
            such name", so the other kind still works. */
         if (!told_gai) fprintf(stderr, "hengevm: dns: no DNS server answers; asking the host's own resolver\n");
         told_gai = 1;
-        answer_here(p, 0, j->addrs, j->n, j->family == AF_INET ? 4 : 16);
+        uint8_t out[ANSWER_MAX];
+        size_t alen = make_answer(out, p->guest_id, p->q.msg, p->qend, p->gai_type, 0, j->addrs, j->n, j->family == AF_INET ? 4 : 16);
+        dns_cache_put(p->q.msg, p->qend, out, (uint32_t)alen, now_ms());
+        send_to_guest(&p->q, out, alen);
         finish(p);
     }
     free(j);
