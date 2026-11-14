@@ -41,7 +41,7 @@ TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit
         $(B)/test_device_snap $(B)/test_cpu_reset_mem $(B)/test_off_giveback $(B)/test_off_giveback_race $(B)/test_pvg_snap $(B)/test_usb_snap $(B)/test_usb_touch $(B)/test_power_source $(B)/test_gpu_switch \
         $(B)/test_virtio_net $(B)/test_net_link $(B)/test_net_forward $(B)/test_mdns $(B)/test_mdns_fuzz $(B)/test_agent_ports $(B)/test_net_dns $(B)/test_usb_audio \
         $(B)/test_usb_video $(B)/test_virtio_snd_mic $(B)/test_fuzz $(B)/test_code_links $(B)/test_code_evict $(B)/test_evict_lists $(B)/test_retrans_counters $(B)/test_ghost $(B)/test_code_evict_mt $(B)/test_evict_reclaim $(B)/test_evict_concurrent_mt $(B)/test_code_writes $(B)/test_mem_giveback $(B)/test_ijc_giveback_race $(B)/test_code_store \
-        $(B)/test_smc_race $(B)/test_smc_store $(B)/test_classify_host $(B)/test_shutdown $(B)/test_rosetta_snap $(B)/test_metallib $(B)/test_ramfile $(B)/test_save_guard $(B)/test_save_guard_read $(B)/test_snap_ramfile $(B)/test_autosave_ram $(B)/test_autosave $(B)/test_vm_pause $(B)/test_disk_guard \
+        $(B)/test_smc_race $(B)/test_smc_store $(B)/test_smc_pieces $(B)/test_classify_host $(B)/test_shutdown $(B)/test_rosetta_snap $(B)/test_metallib $(B)/test_ramfile $(B)/test_save_guard $(B)/test_save_guard_read $(B)/test_snap_ramfile $(B)/test_autosave_ram $(B)/test_autosave $(B)/test_vm_pause $(B)/test_disk_guard \
         $(B)/test_protect_remark $(B)/test_protect_stash $(B)/test_protect_tlbi $(B)/test_switch_flush \
         $(B)/test_pvg_fuzz $(B)/test_pvg_queue $(B)/test_pvg_mapper_state $(B)/test_pvg_present $(B)/test_pvg_present_nogpu $(B)/test_pvg_present_nometal $(B)/test_pvg_present_app $(B)/test_pvg_video $(B)/test_pvg_validate \
         $(B)/test_keyboard_layout $(B)/test_keyboard_intent $(B)/test_save_ahead $(B)/test_typing_queue $(B)/test_focus_said $(B)/test_share_field $(B)/test_share_versions $(B)/test_share_link_auth $(B)/test_input_fence $(B)/test_stallmon $(B)/test_stallmon_live $(B)/test_stallmon_exit $(B)/test_stallmon_starved $(B)/test_stallmon_kinds $(B)/test_stallmon_wake $(B)/test_stallmon_quiet $(B)/test_trim \
@@ -219,6 +219,8 @@ $(B)/test_pause_say: tests/test_pause_say.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_pause_say.c $(ENGINE) -o $@
 $(B)/test_smc_race: tests/test_smc_race.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_smc_race.c $(ENGINE) -lpthread -o $@
+$(B)/test_smc_pieces: tests/test_smc_pieces.c $(ENGINE)
+	$(CC) $(CFLAGS) tests/test_smc_pieces.c $(ENGINE) -lpthread -o $@
 $(B)/test_code_evict_mt: tests/test_code_evict_mt.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_code_evict_mt.c $(ENGINE) -lpthread -o $@
 $(B)/test_retrans_counters: tests/test_retrans_counters.c $(ENGINE)
