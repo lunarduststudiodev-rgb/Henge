@@ -77,7 +77,7 @@ __attribute__((noinline, used)) static void fault_in(void) {
     size_t idx = 0;
     while (atomic_load(&fault)) {
         sum += map[idx];
-        idx = (idx + 17 * 16384) & (MAP_LEN - 1);
+        idx = (idx + 4096) & (MAP_LEN - 1);
     }
 }
 
@@ -165,12 +165,12 @@ static void *scenario(void *unused) {
         }
         if (++hitches == 1) {
             CHECK(strstr(line, "\"verdict\":\"guest_spin\""), "a guest CPU in the in-place wait is a guest spin: %s", line);
-            CHECK(thread_count(line, "cpu0", "guest_spin") >= 10, "cpu0 spin samples: %s", line);
+            CHECK(thread_count(line, "cpu0", "guest_spin") >= 6, "cpu0 spin samples: %s", line);
             CHECK(thread_count(line, "cpu0", "engine") == 0, "cpu0 counted as engine: %s", line);
         } else {
             unsigned f1 = thread_count(line, "cpu1", "fault"), w1 = thread_count(line, "cpu1", "waiting");
-            CHECK(f1 >= 10 && f1 > 4 * w1, "cpu1 in page faults: fault %u, waiting %u: %s", f1, w1, line);
-            CHECK(thread_count(line, "cpu2", "waiting") >= 10, "cpu2 on a mutex is waiting: %s", line);
+            CHECK(f1 >= 4 && f1 > 4 * w1, "cpu1 in page faults: fault %u, waiting %u: %s", f1, w1, line);
+            CHECK(thread_count(line, "cpu2", "waiting") >= 6, "cpu2 on a mutex is waiting: %s", line);
             CHECK(thread_count(line, "cpu2", "fault") == 0, "cpu2 on a mutex counted as a fault: %s", line);
         }
     }

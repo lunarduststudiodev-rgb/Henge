@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -108,7 +109,7 @@ static void *server_thread(void *arg) {
         size_t len = q;
         if (s->kind == REFUSER) {
             out[3] = 0x85;
-        } else if (!strcmp(name, "example.test") && type == 1) {
+        } else if (!strcasecmp(name, "example.test") && type == 1) {
             put16(out + 6, 1);
             static const uint8_t rr[] = {0xc0, 12, 0, 1, 0, 1, 0, 0, 1, 44, 0, 4, 192, 0, 2, 7};
             memcpy(out + len, rr, sizeof rr), len += sizeof rr;

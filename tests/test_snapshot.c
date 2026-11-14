@@ -187,7 +187,7 @@ static uint64_t split(const Took *a, const Took *e, const Took *q, uint64_t pw_e
     s->peer = sub(pw_end, a->pw);
     s->gap = sub(e->gap, a->gap);
     s->settled = sub((q ? q : e)->settled, a->settled);
-    uint64_t ex = s->queued + s->peer;
+    uint64_t ex = s->queued + s->peer + s->settled;
     s->un = sub(step, ex);
     return ex;
 }
