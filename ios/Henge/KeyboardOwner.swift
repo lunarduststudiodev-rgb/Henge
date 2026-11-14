@@ -290,14 +290,14 @@ final class KeyboardOwner: ObservableObject {
             }
             refresh()
             let roleName = String(cString: role)
-            let tap = KeyboardIntent.Tap(rawValue: answer) ?? .unknown
-            if tap == .unknown && roleName == "AXWebArea" && (focus == 2 || RowPlacement.shared.passwordField) {
+            let landed = KeyboardIntent.Tap(rawValue: answer) ?? .unknown
+            if landed == .unknown && roleName == "AXWebArea" && (focus == 2 || RowPlacement.shared.passwordField) {
                 focus = 1
                 last.state = 1
                 RowPlacement.shared.passwordField = false
                 catcher?.setSecure(false)
             }
-            apply(intent.tapped(tap, role: roleName, afterLift: t - tap.lifted))
+            apply(intent.tapped(landed, role: roleName, afterLift: t - tap.lifted))
         }
         taps = waiting
     }
