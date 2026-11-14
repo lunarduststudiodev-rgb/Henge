@@ -224,6 +224,17 @@ struct KeyboardIntent {
             return nil
         case .unknown:
             tappedOn = nil
+            if role == "AXWebArea" {
+                lastTap = nil
+                noneSince = nil
+                left = nil
+                if isShown { return nil }
+                if let why = cantShow {
+                    return Decision(show: nil, reason: "not shown (tap on \(what), \(Self.ms(afterLift)) ms after lift; \(why))")
+                }
+                state = .shownAuto(knownID ?? 0)
+                return Decision(show: true, reason: "show (tap on \(what), \(Self.ms(afterLift)) ms after lift)")
+            }
             return isShown ? nil : Decision(show: nil, reason: "kept (helper unsure what a tap landed in\(role.isEmpty ? "" : ": \(role)"))")
         }
     }
