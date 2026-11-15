@@ -1166,7 +1166,7 @@ enum MacSuspend {
         var forcedOff: Bool? = nil
     }
 
-    private static var root: URL {
+    static var root: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Suspended", isDirectory: true)
     }
     static func folder(_ id: UUID) -> URL { root.appendingPathComponent(id.uuidString, isDirectory: true) }

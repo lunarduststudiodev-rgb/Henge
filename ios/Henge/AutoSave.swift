@@ -22,11 +22,11 @@ enum MacAutoSave {
     static let spareToTake: Int64 = 4 << 30
     static let dropBelow: Int64 = 3 << 30
 
-    private static var root: URL {
+    static var root: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("AutoSaved", isDirectory: true)
     }
     static func folder(_ id: UUID) -> URL { root.appendingPathComponent(id.uuidString, isDirectory: true) }
-    private static func newFolder(_ id: UUID) -> URL { root.appendingPathComponent(id.uuidString + ".new", isDirectory: true) }
+    static func newFolder(_ id: UUID) -> URL { root.appendingPathComponent(id.uuidString + ".new", isDirectory: true) }
     private static func stateURL(_ dir: URL) -> URL { dir.appendingPathComponent("Mac.hvsnap") }
     private static func diskURL(_ dir: URL) -> URL { dir.appendingPathComponent("Disk.img") }
     private static func auxURL(_ dir: URL) -> URL { dir.appendingPathComponent("Aux.img") }

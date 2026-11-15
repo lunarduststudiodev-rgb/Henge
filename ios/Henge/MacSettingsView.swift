@@ -6,6 +6,9 @@ struct MacSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var mac: VirtualMac
     @State private var confirmDelete = false
+    @State private var confirmClearSession = false
+    @State private var sessionBytes: Int64 = 0
+    @State private var clearingSession = false
     @State private var movingExport = false
     @AppStorage("henge.cpus") private var cpus = 4
     private let rosettaSupported = henge_vm_rosetta_supported() != 0
@@ -127,6 +130,30 @@ struct MacSettingsView: View {
                         Text("of \(ByteText.string(UInt64(max(mac.diskBytes, 0))))").font(.system(size: 16)).foregroundStyle(Desk.dim)
                     }
                     DeskBar(fraction: Double(mac.bytesUsed) / Double(max(mac.diskBytes, 1)))
+                    divider
+                    HStack {
+                        Text("Suspend & session data").font(.system(size: 15))
+                        Spacer()
+                        Text(sessionBytes > 0 ? ByteText.string(UInt64(sessionBytes)) : "None")
+                            .font(.system(size: 15))
+                            .foregroundStyle(Desk.dim)
+                    }
+                    if sessionBytes > 0 {
+                        Button(role: .destructive) {
+                            confirmClearSession = true
+                        } label: {
+                            HStack {
+                                if clearingSession {
+                                    ProgressView().controlSize(.small)
+                                }
+                                Text(clearingSession ? "Removing…" : "Remove Suspend & Session Data")
+                                    .font(.system(size: 15, weight: .semibold))
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .disabled(clearingSession)
+                        .buttonStyle(.borderless)
+                    }
                 }
                 .padding(17)
                 .deskCard()
@@ -144,6 +171,7 @@ struct MacSettingsView: View {
         .navigationTitle(mac.name)
         .navigationBarTitleDisplayMode(.inline)
         .onDisappear(perform: save)
+        .task { await loadSessionBytes() }
         .fileMover(isPresented: $movingExport, file: machines.lastExport) { result in
             switch result {
             case .success: machines.lastExport = nil
@@ -157,6 +185,13 @@ struct MacSettingsView: View {
             }
         } message: {
             Text("Its disk is removed from this \(Device.name).")
+        }
+        .confirmationDialog("Remove suspend & session data?", isPresented: $confirmClearSession, titleVisibility: .visible) {
+            Button("Remove \(ByteText.string(UInt64(max(sessionBytes, 0))))", role: .destructive) {
+                clearSessionData()
+            }
+        } message: {
+            Text("Removes \(mac.name)'s suspended state, auto-save, and temporary memory files. Its macOS disk and files are not affected, and it will start from a cold boot next time.")
         }
     }
 
@@ -206,6 +241,22 @@ struct MacSettingsView: View {
     private func save() {
         if mac.name.isEmpty { mac.name = "Mac" }
         machines.update(mac)
+    }
+
+    private func loadSessionBytes() async {
+        let id = mac.id
+        sessionBytes = await Task.detached(priority: .utility) { SessionStorage.bytes(for: id) }.value
+    }
+
+    private func clearSessionData() {
+        guard !clearingSession else { return }
+        clearingSession = true
+        let id = mac.id
+        Task {
+            await Task.detached(priority: .userInitiated) { SessionStorage.clear(for: id) }.value
+            sessionBytes = await Task.detached(priority: .utility) { SessionStorage.bytes(for: id) }.value
+            clearingSession = false
+        }
     }
 }
 

@@ -24,6 +24,9 @@ struct SettingsView: View {
     @State private var quickSuspendFromFile: Bool?
     @ObservedObject private var images = RestoreImages.shared
     @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
+    @State private var sessionBytes: Int64 = 0
+    @State private var clearingSession = false
+    @State private var confirmClearSession = false
 
     var body: some View {
         if inSession {
@@ -146,10 +149,30 @@ struct SettingsView: View {
                         Label("macOS Downloads", systemImage: "arrow.down.circle")
                     }
                 }
+                LabeledContent {
+                    Text(sessionBytes > 0 ? ByteText.string(UInt64(sessionBytes)) : "None")
+                } label: {
+                    Label("Suspend & Session Data", systemImage: "internaldrive")
+                }
+                if sessionBytes > 0 {
+                    Button(role: .destructive) {
+                        confirmClearSession = true
+                    } label: {
+                        HStack {
+                            if clearingSession {
+                                ProgressView().controlSize(.small)
+                            }
+                            Text(clearingSession ? "Removing…" : "Remove Suspend & Session Data")
+                        }
+                    }
+                    .disabled(inSession || clearingSession)
+                }
             } header: {
                 Text("Storage")
             } footer: {
-                Text("The macOS downloads on this \(Device.name). Delete the ones you no longer need to free space; your Macs aren't affected.")
+                Text(inSession && sessionBytes > 0
+                     ? "Close the running Mac first to remove suspend and session data. Removing suspend & session data frees saved memory and snapshots without affecting any Mac's disk or files."
+                     : "The macOS downloads and saved suspend/auto-save session data on this \(Device.name). Removing them frees space without affecting your Macs' disks or files.")
             }
             .listRowBackground(Desk.card)
             Section {
@@ -169,12 +192,39 @@ struct SettingsView: View {
         .scrollContentBackground(.hidden)
         .background(Desk.page)
         .navigationTitle(inSession ? "Henge Settings" : "Settings")
-        .onAppear { images.refresh(); freezes = FreezeLog.count() }
+        .onAppear {
+            images.refresh()
+            freezes = FreezeLog.count()
+            refreshSessionBytes()
+        }
+        .confirmationDialog("Remove all suspend & session data?", isPresented: $confirmClearSession, titleVisibility: .visible) {
+            Button("Remove \(ByteText.string(UInt64(max(sessionBytes, 0))))", role: .destructive) {
+                clearAllSessionData()
+            }
+        } message: {
+            Text("Removes all suspended states, auto-saves, and temporary memory files across all Macs. Your Macs' disks and files are not affected, and they will start from a cold boot next time.")
+        }
         .task {
             while !Task.isCancelled {
                 jitReady = JITBootstrap.ready
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
+        }
+    }
+
+    private func refreshSessionBytes() {
+        Task {
+            sessionBytes = await Task.detached(priority: .utility) { SessionStorage.totalBytes() }.value
+        }
+    }
+
+    private func clearAllSessionData() {
+        guard !inSession, !clearingSession else { return }
+        clearingSession = true
+        Task {
+            await Task.detached(priority: .userInitiated) { SessionStorage.clearAll() }.value
+            sessionBytes = await Task.detached(priority: .utility) { SessionStorage.totalBytes() }.value
+            clearingSession = false
         }
     }
 
