@@ -11,6 +11,8 @@ import UIKit
 struct Trackpad: UIViewRepresentable {
     /// Three fingers tapped together: the session shows its hidden controls.
     static let threeFingerTap = Notification.Name("henge.trackpad.threeFingerTap")
+    /// Two fingers double-tapped together: smart zoom.
+    static let smartZoom = Notification.Name("henge.trackpad.smartZoom")
 
     /// A finger is the Mac's own touch or its pointer here now, and when one last was (system uptime): the zoomed view
     /// holds still under it, rather than follow the pointer it moves (macOS moves its pointer to a touch, too).

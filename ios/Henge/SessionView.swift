@@ -355,6 +355,7 @@ struct SessionView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: HardwareKeyboard.changed)) { _ in hardwareKeyboardChanged() }
             .onReceive(NotificationCenter.default.publisher(for: Trackpad.threeFingerTap)) { _ in showControls() }
+            .onReceive(NotificationCenter.default.publisher(for: Trackpad.smartZoom)) { _ in zoomed.toggle() }
             .onAppear {
                 shown = layout.shown
                 // Opened with the controls hidden and no handle: say once more how to get them back.
